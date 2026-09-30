@@ -38,6 +38,17 @@ fn main() -> glib::ExitCode {
     }
 
     let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| {
+        // Carry the Android-derived icon inside the executable, including for
+        // source launches whose cwd/icon theme has no installed Extraspace icon.
+        gtk::gio::resources_register_include!("extraspace.gresource")
+            .expect("valid bundled icon resource");
+        gtk::Window::set_default_icon_name(APP_ID);
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::IconTheme::for_display(&display)
+                .add_resource_path("/io/github/tymonoman/Extraspace/icons");
+        }
+    });
     app.connect_activate(|app| {
         if let Some(window) = app.windows().first() {
             window.present();

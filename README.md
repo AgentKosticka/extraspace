@@ -505,7 +505,10 @@ changing the Android implementation so the desktop app upgrades it automatically
 
 The desktop icon is generated from Android's adaptive-icon vector and background
 color. After changing those resources, run `python3 scripts/sync-icon.py` and
-commit the SVG. CI checks that the two stay in sync.
+commit the SVG. CI checks that the two stay in sync. The same SVG is also embedded
+in the desktop executable as a GTK icon resource, so the app's window/About icon
+does not depend on its working directory. Installation registers that artwork
+in the desktop icon theme for the launcher and tray.
 
 ## Contributing
 

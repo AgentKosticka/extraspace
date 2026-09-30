@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/tymonoman/Extraspace">
+    <file alias="icons/scalable/apps/io.github.tymonoman.Extraspace.svg">io.github.tymonoman.Extraspace.svg</file>
+  </gresource>
+</gresources>

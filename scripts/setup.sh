@@ -17,7 +17,7 @@ source "$OS_RELEASE"
 case "${ID:-} ${ID_LIKE:-}" in
   *ubuntu*|*debian*)
     MANAGER=apt
-    PACKAGES=(build-essential pkg-config curl ca-certificates libgtk-4-dev libadwaita-1-dev
+    PACKAGES=(build-essential pkg-config curl ca-certificates libglib2.0-dev-bin libgtk-4-dev libadwaita-1-dev
       libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libpipewire-0.3-dev
       libclang-dev gstreamer1.0-tools gstreamer1.0-plugins-base
       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad

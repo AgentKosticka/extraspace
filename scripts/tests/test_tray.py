@@ -70,7 +70,8 @@ def test(binary):
         config.mkdir(parents=True)
         (config / "config.json").write_text(json.dumps({"auto_connect": False, "keep_running_in_tray": True}))
         env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"),
-                   XDG_STATE_HOME=str(root / "state"), RUST_LOG="info")
+                   XDG_STATE_HOME=str(root / "state"),
+                   XDG_DATA_HOME=str(root / "data"), RUST_LOG="info")
         log = root / "app.log"
         host = subprocess.Popen([sys.executable, __file__, "--watcher"])
         app = None
