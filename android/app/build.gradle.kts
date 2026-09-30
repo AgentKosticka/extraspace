@@ -19,13 +19,22 @@ android {
         targetSdk = 35
     }
 
+    // CI restores a persistent key from a repository secret. Local source builds
+    // keep using the developer's debug key unless an explicit key is supplied.
+    val releaseKeystore = System.getenv("EXTRASPACE_KEYSTORE")
+    if (releaseKeystore != null) {
+        signingConfigs.create("published") {
+            storeFile = file(releaseKeystore)
+            storePassword = System.getenv("EXTRASPACE_KEYSTORE_PASSWORD") ?: "android"
+            keyAlias = System.getenv("EXTRASPACE_KEY_ALIAS") ?: "androiddebugkey"
+            keyPassword = System.getenv("EXTRASPACE_KEY_PASSWORD") ?: "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Debug-signed on purpose: the APK is sideloaded over adb by the host,
-            // never published to a store, and a real signing key would be one more
-            // thing standing between a user and a working setup.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (releaseKeystore != null) "published" else "debug")
         }
     }
 

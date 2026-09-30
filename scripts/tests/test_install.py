@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise installation/upgrade/removal in isolated XDG directories."""
 import os
+import hashlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -67,6 +68,44 @@ class Installation(unittest.TestCase):
         self.run_install("--no-build", "--apk", str(self.root / "missing.apk"), success=False)
         self.run_install("--apk", success=False)
         self.run_install("--unknown", success=False)
+        self.run_install("--download-apk", "--build-apk", success=False)
+        self.run_install("--download-apk", "--apk", str(self.apk), success=False)
+        self.assertFalse(self.bin_dir.exists())
+
+    def mock_release(self):
+        assets = self.root / "release"
+        assets.mkdir()
+        (assets / "extraspace.apk").write_bytes(self.apk.read_bytes())
+        digest = hashlib.sha256(self.apk.read_bytes()).hexdigest()
+        (assets / "extraspace.apk.sha256").write_text(digest + "  extraspace.apk\n")
+        (assets / "companion-version").write_text((REPO / "companion-version").read_text())
+        mocks = self.root / "download-mocks"
+        mocks.mkdir()
+        curl = mocks / "curl"
+        curl.write_text("#!/usr/bin/env python3\n" +
+                        "import os, sys, shutil\nfrom pathlib import Path\n" +
+                        "shutil.copyfile(Path(os.environ['TEST_RELEASE']) / sys.argv[-3].rsplit('/', 1)[-1], sys.argv[-1])\n")
+        curl.chmod(0o755)
+        self.env.update(TEST_RELEASE=str(assets),
+                        PATH=str(mocks) + ":" + os.environ["PATH"],
+                        EXTRASPACE_RELEASE_URL="https://example.invalid/continuous")
+        return assets
+
+    def test_download_verifies_release_before_installing(self):
+        assets = self.mock_release()
+        self.run_install("--download-apk", "--no-build")
+        self.assertEqual((self.root / "data/extraspace/extraspace.apk").read_bytes(), self.apk.read_bytes())
+        self.run_install("--uninstall")
+        (assets / "extraspace.apk").write_bytes(b"tampered")
+        result = self.run_install("--download-apk", "--no-build", success=False)
+        self.assertIn("checksum mismatch", result.stderr)
+        self.assertFalse((self.bin_dir / "extraspace").exists())
+
+    def test_download_rejects_other_companion_version(self):
+        assets = self.mock_release()
+        (assets / "companion-version").write_text("999999\n")
+        result = self.run_install("--download-apk", "--no-build", success=False)
+        self.assertIn("version differs", result.stderr)
         self.assertFalse(self.bin_dir.exists())
 
     def test_check_detects_ubuntu_without_privileged_commands(self):

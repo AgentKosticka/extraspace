@@ -25,3 +25,4 @@ gstreamer.workspace = true
 # and the C API docs.
 gtk = { version = "0.10", package = "gtk4" }
 adw = { version = "0.8", package = "libadwaita", features = ["v1_5"] }
+ksni = "0.3.6"

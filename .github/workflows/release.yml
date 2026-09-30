@@ -1,55 +1,75 @@
 name: Release
 
+# CI calls this only after both Rust checks and Android build/lint succeed.
 on:
-  push:
-    tags: ['v*']
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   release:
-    name: Build and publish
+    name: Publish APK
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
+      - uses: actions/download-artifact@v4
         with:
-          distribution: temurin
-          java-version: '17'
+          name: extraspace-apk
+          path: dist
 
-      - uses: android-actions/setup-android@v3
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Build companion APK
-        working-directory: android
-        run: ./gradlew assembleRelease --no-daemon
-
-      # Named without a version so the download URL in the README stays valid
-      # across releases and the host's APK lookup does not need updating.
-      - name: Stage artifacts
+      - name: Verify release inputs
+        working-directory: dist
         run: |
-          mkdir -p dist
-          cp android/app/build/outputs/apk/release/*.apk dist/extraspace.apk
-          ls -la dist
+          test "$(cat commit.txt)" = "$GITHUB_SHA"
+          test -s extraspace.apk
+          sha256sum --check extraspace.apk.sha256
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/extraspace.apk
-          generate_release_notes: true
-          body: |
-            ## Installing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            # A newer push may have arrived while this run was building.
+            head=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+            if [ "$head" != "$GITHUB_SHA" ]; then
+              echo 'A newer main commit exists; leaving publication to its run.'
+              exit 0
+            fi
+            tag=continuous
+            title='Latest tested build'
+            flags=(--prerelease --latest=false)
+          else
+            tag=${GITHUB_REF#refs/tags/}
+            title="Extraspace $tag"
+            flags=(--latest)
+          fi
+          cat > notes.md <<EOF
+          APK built, linted and signature-verified by CI for commit $GITHUB_SHA.
+          Companion version: $(cat dist/companion-version).
+          Both the Rust and Android jobs passed before publication.
 
-            1. Download `extraspace.apk` below.
-            2. Build and run the desktop app:
+          ## Ubuntu installation
 
-               ```bash
-               ./scripts/setup.sh
-               cargo build --release
-               EXTRASPACE_APK=~/Downloads/extraspace.apk ./target/release/extraspace
-               ```
+          Clone https://github.com/$GH_REPO, then run:
 
-            The host installs and upgrades the companion app over adb from then on.
+              ./scripts/install-ubuntu.sh
+
+          This installs dependencies, builds the desktop app and downloads the
+          checksum-verified APK. No Android SDK is needed. Open Extraspace from
+          the GNOME applications grid. Re-run the installer after updating sources
+          to upgrade. See the README for USB debugging setup and other distributions.
+
+          CI run: https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [ "$tag" = continuous ]; then
+              gh api "repos/$GH_REPO/git/refs/tags/$tag" -X PATCH -f sha="$GITHUB_SHA" -F force=true
+            fi
+            gh release edit "$tag" --title "$title" --notes-file notes.md "${flags[@]}"
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "$title" \
+              --notes-file notes.md "${flags[@]}"
+          fi

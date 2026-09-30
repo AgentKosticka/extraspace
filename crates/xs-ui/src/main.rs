@@ -9,6 +9,7 @@ use gtk::glib;
 
 mod config;
 mod diagnostics;
+mod tray;
 mod window;
 
 use config::Config;
@@ -38,7 +39,7 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
-        if let Some(window) = app.active_window() {
+        if let Some(window) = app.windows().first() {
             window.present();
             return;
         }

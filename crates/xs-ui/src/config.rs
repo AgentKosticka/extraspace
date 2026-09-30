@@ -27,6 +27,8 @@ pub struct Config {
     pub camera_id: String,
     /// Start streaming as soon as a tablet is detected.
     pub auto_connect: bool,
+    /// Closing the window keeps the display running when a tray is available.
+    pub keep_running_in_tray: bool,
 }
 
 impl Default for Config {
@@ -42,6 +44,7 @@ impl Default for Config {
             camera_enabled: false,
             camera_id: "0".into(),
             auto_connect: true,
+            keep_running_in_tray: false,
         }
     }
 }
@@ -184,6 +187,7 @@ mod tests {
             scale: 1.75,
             mode: "mirror".into(),
             camera_enabled: true,
+            keep_running_in_tray: true,
             ..Default::default()
         };
         let text = serde_json::to_string(&c).unwrap();
@@ -191,6 +195,7 @@ mod tests {
         assert_eq!(back.scale, 1.75);
         assert_eq!(back.display_mode(), DisplayMode::Mirror);
         assert!(back.camera_enabled);
+        assert!(back.keep_running_in_tray);
     }
 
     #[test]
@@ -199,5 +204,6 @@ mod tests {
         let back: Config = serde_json::from_str(r#"{"scale": 2.0}"#).unwrap();
         assert_eq!(back.scale, 2.0);
         assert_eq!(back.framerate, 60);
+        assert!(!back.keep_running_in_tray);
     }
 }

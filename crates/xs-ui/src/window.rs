@@ -19,6 +19,7 @@ use gtk::glib;
 use xs_core::{Command, DisplayMode, EngineHandle, Event, State, Stats};
 
 use crate::config::{scale_index, Config, SCALE_OPTIONS};
+use crate::tray;
 
 pub const APP_ID: &str = "io.github.tymonoman.Extraspace";
 
@@ -76,24 +77,95 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     window.set_content(Some(&toolbar));
 
     let widgets = Rc::new(widgets);
-    wire_actions(app, &window);
+    let quitting = Rc::new(Cell::new(false));
+    let tray_available = Rc::new(Cell::new(false));
+    let (tray_controller, mut tray_actions) = tray::start(engine.clone());
+    let tray_controller = Rc::new(RefCell::new(tray_controller));
+    wire_actions(
+        app,
+        &window,
+        &quitting,
+        &tray_available,
+        &config,
+        &widgets.toasts,
+    );
     wire_controls(&widgets, &engine, &config);
     listen_to_engine(&widgets, &engine, &config);
 
     let engine_on_close = engine.clone();
     let closing = Rc::new(Cell::new(false));
+    let config_on_close = config.clone();
+    let available_on_close = tray_available.clone();
+    let quitting_on_close = quitting.clone();
+    let toasts = widgets.toasts.clone();
     window.connect_close_request(move |window| {
-        if closing.replace(true) {
+        if closing.get() {
             return glib::Propagation::Proceed;
         }
+        if !quitting_on_close.get() && config_on_close.borrow().keep_running_in_tray {
+            if available_on_close.get() {
+                tracing::info!("window closed to tray; session continues");
+                window.set_visible(false);
+            } else {
+                toasts.add_toast(adw::Toast::new(
+                    "Tray unavailable. Enable GNOME’s AppIndicator extension, or use Quit.",
+                ));
+            }
+            return glib::Propagation::Stop;
+        }
+        quitting_on_close.set(true);
+        closing.set(true);
         let window = window.clone();
         let engine = engine_on_close.clone();
+        let tray_controller = tray_controller.clone();
         glib::spawn_future_local(async move {
             engine.shutdown().await;
+            tray_controller.borrow_mut().shutdown();
             window.close();
         });
         glib::Propagation::Stop
     });
+
+    {
+        let window = window.clone();
+        let app = app.clone();
+        let engine = engine.clone();
+        let toasts = widgets.toasts.clone();
+        glib::spawn_future_local(async move {
+            while let Some(action) = tray_actions.recv().await {
+                match action {
+                    tray::Action::Open => {
+                        tracing::info!("window restored from tray");
+                        window.present();
+                    }
+                    tray::Action::Connect => engine.send(Command::Connect),
+                    tray::Action::Disconnect => engine.send(Command::Disconnect),
+                    tray::Action::Quit => app.activate_action("quit", None),
+                    tray::Action::Available(available) => {
+                        tray_available.set(available);
+                        if let Some(action) = app.lookup_action("hide-window") {
+                            if let Some(action) = action.downcast_ref::<gtk::gio::SimpleAction>() {
+                                action.set_enabled(available);
+                            }
+                        }
+                        if !available && !window.is_visible() && !quitting.get() {
+                            window.present();
+                            toasts.add_toast(adw::Toast::new(
+                                "Tray support disappeared; Extraspace is still running.",
+                            ));
+                        }
+                    }
+                }
+            }
+            tray_available.set(false);
+            if !quitting.get() && !window.is_visible() {
+                window.present();
+                toasts.add_toast(adw::Toast::new(
+                    "Tray stopped; Extraspace is still running.",
+                ));
+            }
+        });
+    }
 
     // Look for a tablet straight away; the user opened the app to use it.
     if config.borrow().auto_connect {
@@ -236,12 +308,64 @@ fn stat_row(title: &str, icon: &str) -> adw::ActionRow {
 
 fn gio_menu() -> gtk::gio::Menu {
     let menu = gtk::gio::Menu::new();
+    menu.append(
+        Some("Keep Running in _Tray"),
+        Some("app.keep-running-in-tray"),
+    );
+    menu.append(Some("_Hide Window"), Some("app.hide-window"));
     menu.append(Some("_About Extraspace"), Some("app.about"));
     menu.append(Some("_Quit"), Some("app.quit"));
     menu
 }
 
-fn wire_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
+fn wire_actions(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    quitting: &Rc<Cell<bool>>,
+    available: &Rc<Cell<bool>>,
+    config: &Rc<RefCell<Config>>,
+    toasts: &adw::ToastOverlay,
+) {
+    let background = gtk::gio::SimpleAction::new_stateful(
+        "keep-running-in-tray",
+        None,
+        &config.borrow().keep_running_in_tray.to_variant(),
+    );
+    let settings = config.clone();
+    let tray_available = available.clone();
+    let messages = toasts.clone();
+    background.connect_change_state(move |action, value| {
+        let Some(enabled) = value.and_then(|v| v.get::<bool>()) else {
+            return;
+        };
+        settings.borrow_mut().keep_running_in_tray = enabled;
+        settings.borrow().save();
+        action.set_state(&enabled.to_variant());
+        if enabled && !tray_available.get() {
+            messages.add_toast(adw::Toast::new(
+                "Enable GNOME’s AppIndicator extension to use the tray.",
+            ));
+        }
+    });
+    // Menu activation toggles a stateful boolean action.
+    background.connect_activate(|action, _| {
+        if let Some(current) = action.state().and_then(|v| v.get::<bool>()) {
+            action.change_state(&(!current).to_variant());
+        }
+    });
+    app.add_action(&background);
+
+    let hide = gtk::gio::SimpleAction::new("hide-window", None);
+    hide.set_enabled(false);
+    let parent = window.clone();
+    let tray_available = available.clone();
+    hide.connect_activate(move |_, _| {
+        if tray_available.get() {
+            tracing::info!("window hidden to tray; session continues");
+            parent.set_visible(false);
+        }
+    });
+    app.add_action(&hide);
     let about = gtk::gio::SimpleAction::new("about", None);
     let parent = window.clone();
     about.connect_activate(move |_, _| {
@@ -261,7 +385,11 @@ fn wire_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
 
     let quit = gtk::gio::SimpleAction::new("quit", None);
     let window = window.clone();
-    quit.connect_activate(move |_, _| window.close());
+    let quitting = quitting.clone();
+    quit.connect_activate(move |_, _| {
+        quitting.set(true);
+        window.close();
+    });
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &["<primary>q"]);
 }

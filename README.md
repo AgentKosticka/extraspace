@@ -153,51 +153,78 @@ failing with something cryptic.
 > A surprising number of USB cables are charge-only and carry no data. If your
 > tablet charges but never appears, try a different cable before anything else.
 
-### 2. Set up the computer
+### 2. Install on Ubuntu (recommended)
+
+On **Ubuntu 24.04 or newer with GNOME on Wayland**, run:
 
 ```bash
 git clone https://github.com/AgentKosticka/extraspace
 cd extraspace
-./scripts/setup.sh --check
-./scripts/setup.sh
+./scripts/install-ubuntu.sh
 ```
 
-The script detects Ubuntu/Debian, Fedora, and Arch package names. It installs
-GTK, libadwaita, PipeWire/GStreamer development headers, encoder plugins and ADB.
-Install a Rust toolchain with Cargo if you do not have one. The GUI requires
-libadwaita 1.5 or newer and GNOME 46+ on Wayland.
+If `git` is missing, install it first with `sudo apt install git`.
+The installer asks for sudo to install Ubuntu dependencies, installs a user Rust
+compiler if needed, builds the desktop app, and downloads the published companion
+APK with a SHA-256 check. **No Android SDK or JDK is needed.** The application,
+APK, matching Android/desktop icon, and launcher are installed in your user
+account. Do not run the installer with sudo.
 
-Display-only setup does not install or unload camera kernel modules. To also
-prepare `/dev/video10`, run `./scripts/setup.sh --camera`. On Ubuntu this installs
-v4l2loopback DKMS and headers for the running kernel. Secure Boot may require MOK
-enrollment. Existing modules and devices are left alone. Fedora may need RPM
-Fusion for x264; Arch DKMS users must install headers for their actual kernel.
+After installation, press **Super**, type **Extraspace**, and click its icon.
+You can also find it in GNOME's applications grid. No terminal or repository
+working directory is needed after installation. Opening it again presents the
+existing window. It does not autostart at login.
 
-### 3. Build and install
+For an upgrade, close Extraspace, then run:
 
-With JDK 17 and an Android SDK containing platform/build tools 35 installed:
+```bash
+git pull --ff-only
+./scripts/install-ubuntu.sh
+```
+
+To include the optional tablet webcam, add `--camera`. This installs v4l2loopback
+DKMS and headers for your running kernel. Secure Boot may require MOK enrollment.
+Display-only installation leaves camera modules alone.
+
+The [latest tested APK](https://github.com/AgentKosticka/extraspace/releases/download/continuous/extraspace.apk)
+is also available separately. Pushes to `main` run Rust checks and an Android
+release build, lint and signature verification. Only after both jobs pass does
+CI publish the APK, checksum, companion version and source commit to the
+[continuous release](https://github.com/AgentKosticka/extraspace/releases/tag/continuous).
+This is a development prerelease; `v*` tag pushes produce versioned releases.
+If the published companion version differs from your checkout, installation
+stops and asks you to update sources or build the APK locally.
+
+### 3. Other distributions and source APK builds
+
+For Fedora/Arch, or to manage setup separately:
+
+```bash
+./scripts/setup.sh --check
+./scripts/setup.sh
+./scripts/install.sh --download-apk
+```
+
+Setup detects Ubuntu/Debian, Fedora and Arch package names and installs GTK,
+libadwaita, PipeWire/GStreamer headers, encoder plugins and ADB. Outside the Ubuntu
+installer, install Rust/Cargo yourself. The GUI requires libadwaita 1.5+ and
+GNOME 46+ on Wayland. Fedora may need RPM Fusion for x264. For camera support,
+add `--camera` to setup; Arch DKMS users need headers for their actual kernel.
+
+To build the companion yourself, install JDK 17 and an Android SDK containing
+platform/build tools 35, then run:
 
 ```bash
 export ANDROID_HOME="$HOME/Android/Sdk" # adjust to your SDK location
 ./scripts/install.sh --build-apk
 ```
 
-The Gradle wrapper builds the companion, then the installer builds the Rust
-release and copies the binary, APK, icon, and application launcher into your XDG
-user directories. Launch **Extraspace** from the applications grid; no terminal
-or repository working directory is needed. Launching it again focuses the existing
-window. It does not autostart at login.
-
-If you already have the corresponding companion APK:
-
-```bash
-./scripts/install.sh --apk /path/to/extraspace.apk
-```
-
-Running the installer again rebuilds the host and upgrades the installed files
-by rename, so it does not truncate a running executable. Close and reopen the app
-to use the new host. `--no-build` explicitly installs an existing release binary;
-normal installs always build with `Cargo.lock`. A previously installed APK is
+Or use a specific APK with `./scripts/install.sh --apk /path/to/extraspace.apk`.
+The Ubuntu installer accepts `--apk PATH` and `--build-apk` as alternatives to
+its default download. `--download-apk`, `--build-apk` and `--apk` are mutually
+exclusive. The normal installer always rebuilds with `Cargo.lock`; `--no-build`
+explicitly uses an existing release binary. Files are replaced by rename, so an
+upgrade does not truncate a running executable. A previously installed APK is
 retained when no new APK is supplied. `EXTRASPACE_APK=/path/to/app.apk` also works
 for a source launch; an invalid override is reported instead of silently ignored.
 
@@ -236,6 +263,22 @@ rewritten. GNOME also keeps configurations in memory, so editing the file is not
 a complete compositor fix. The existing scaled-mode/patched-Mutter gate and
 fixed PipeWire negotiation remain in place. See
 [the monitor investigation](docs/monitor-persistence.md).
+
+### Running in the tray
+
+Open the main menu (**☰**) and enable **Keep Running in Tray**. Closing the
+window then hides it while the display and reconnect handling continue running.
+The tray menu has **Open Extraspace**, **Connect**, **Disconnect** and **Quit**.
+**Hide Window** hides it immediately; opening Extraspace from the applications
+grid also restores the existing window. **Quit** or **Ctrl+Q** always stops the
+session and removes the virtual monitor, even with tray mode enabled.
+The preference is saved and is off by default.
+
+GNOME needs the **AppIndicator and KStatusNotifierItem Support** extension.
+Ubuntu normally includes it; enable **Ubuntu AppIndicators** in the Extensions
+app if necessary. On other GNOME installations, install the extension supported
+by your distribution. If there is no tray, the window stays accessible. If tray
+support disappears while the window is hidden, Extraspace presents it again.
 
 ## Usage
 
@@ -436,6 +479,32 @@ cd android && ./gradlew assembleRelease lintRelease # companion build + lint
 
 `xs-mutter` is the only crate that touches mutter's private D-Bus API, so if a
 future GNOME release changes it, the damage is contained to one file.
+
+### APK releases and signing
+
+`.github/workflows/ci.yml` builds and verifies `extraspace.apk`, then calls the
+reusable release workflow with that same artifact. Failed Rust/Android checks or
+pull requests cannot publish releases. Each release includes `extraspace.apk`,
+`extraspace.apk.sha256`, `companion-version` and `commit.txt`.
+
+Maintainers must configure the encrypted repository secret
+`EXTRASPACE_KEYSTORE_BASE64` with a persistent base64-encoded Android keystore
+(alias `androiddebugkey`, key/store password `android`). This fork is configured
+with the key matching the tested tablet installation. The workflow fails rather
+than publishing an APK with a fresh random debug key. The key is restored only
+for trusted main/tag builds, kept outside the checkout, and removed afterward.
+Never commit a keystore. Android updates require the same signing certificate.
+
+Local builds use your Android debug key by default. For another signing key,
+Gradle accepts `EXTRASPACE_KEYSTORE`, `EXTRASPACE_KEYSTORE_PASSWORD`,
+`EXTRASPACE_KEY_ALIAS` and `EXTRASPACE_KEY_PASSWORD`. A local APK with a different
+certificate cannot replace an installed published APK without intentionally
+uninstalling the old app and losing its data. Increment `companion-version` when
+changing the Android implementation so the desktop app upgrades it automatically.
+
+The desktop icon is generated from Android's adaptive-icon vector and background
+color. After changing those resources, run `python3 scripts/sync-icon.py` and
+commit the SVG. CI checks that the two stay in sync.
 
 ## Contributing
 
