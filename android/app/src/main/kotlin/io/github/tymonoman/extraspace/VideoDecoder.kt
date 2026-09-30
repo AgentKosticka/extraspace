@@ -20,7 +20,7 @@ import kotlin.concurrent.thread
  * starts to grow.
  */
 class VideoDecoder(private val surface: Surface) {
-    private var codec: MediaCodec? = null
+    @Volatile private var codec: MediaCodec? = null
     @Volatile private var running = false
     private var drainThread: Thread? = null
 
@@ -37,6 +37,7 @@ class VideoDecoder(private val surface: Surface) {
     private val inputPace = PaceWatch("decode_in")
     private val outputPace = PaceWatch("decode_out")
 
+    @Synchronized
     fun start(width: Int, height: Int, csd: ByteArray?) {
         stop()
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
@@ -71,6 +72,8 @@ class VideoDecoder(private val surface: Surface) {
             configure(format, surface, null, 0)
             start()
         }
+        framesDecoded.set(0)
+        framesDropped.set(0)
         running = true
         // Output is drained on its own thread rather than piggybacking on input.
         // Draining only when a new frame arrives means that when the desktop goes
@@ -84,6 +87,7 @@ class VideoDecoder(private val surface: Surface) {
      * Submits one access unit. Returns false if the codec could not accept it,
      * which means we are behind and the frame is discarded.
      */
+    @Synchronized
     fun decode(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean): Boolean {
         val mc = codec ?: return false
         return try {
@@ -104,8 +108,16 @@ class VideoDecoder(private val surface: Surface) {
             val flags = if (isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
             // Do not pass the host GStreamer PTS through: it is a different
             // clock and Samsung MediaCodec will pace to it. 0 = "show now".
-            mc.queueInputBuffer(index, 0, length, 0, flags)
-            pendingInputs.incrementAndGet()
+            // Increment before submission: the independent drain thread can
+            // release an output before queueInputBuffer returns. Config buffers
+            // do not produce a corresponding picture and must not inflate depth.
+            if (!isConfig) pendingInputs.incrementAndGet()
+            try {
+                mc.queueInputBuffer(index, 0, length, 0, flags)
+            } catch (e: IllegalStateException) {
+                if (!isConfig) pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
+                throw e
+            }
             lastFramePtsUs.set(ptsUs)
             inputPace.observe("bytes=$length pts_us=$ptsUs wait_ms=$waitMs")
             true
@@ -131,8 +143,10 @@ class VideoDecoder(private val surface: Surface) {
                         // 0 ns = present immediately; the boolean overload lets
                         // SurfaceFlinger keep the (zero/host) PTS and hitch.
                         mc.releaseOutputBuffer(index, 0L)
-                        pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
-                        framesDecoded.incrementAndGet()
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                            pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
+                            framesDecoded.incrementAndGet()
+                        }
                         renderedAtUs.set(System.nanoTime() / 1000)
                         outputPace.observe("pts_us=${info.presentationTimeUs} size=${info.size}")
                     }
@@ -147,6 +161,7 @@ class VideoDecoder(private val surface: Surface) {
         }
     }
 
+    @Synchronized
     fun stop() {
         running = false
         drainThread?.join(500)

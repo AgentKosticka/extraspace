@@ -8,18 +8,26 @@ use adw::prelude::*;
 use gtk::glib;
 
 mod config;
+mod diagnostics;
 mod window;
 
 use config::Config;
 use window::APP_ID;
 
 fn main() -> glib::ExitCode {
+    let log_writer = diagnostics::LogWriter::new();
     tracing_subscriber::fmt()
+        .with_writer(move || log_writer.clone())
+        .with_ansi(false)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,xs_core=debug,xs_mutter=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    if std::env::args().any(|arg| arg == "--diagnostics") {
+        diagnostics::print();
+        return glib::ExitCode::SUCCESS;
+    }
 
     // Fail here with something readable rather than deep inside the pipeline.
     if let Err(e) = gstreamer::init() {
@@ -30,6 +38,10 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
+        if let Some(window) = app.active_window() {
+            window.present();
+            return;
+        }
         let config = Rc::new(RefCell::new(Config::load()));
         let engine = xs_core::spawn(session_config(&config.borrow()));
         window::build(app, engine, config);
@@ -46,15 +58,19 @@ fn session_config(config: &Config) -> xs_core::SessionConfig {
         bounds: config.bounds(),
         mirror_source: config.mirror_source.clone(),
         apk_path: bundled_apk(),
-        apk_version: APK_VERSION,
+        apk_version: apk_version(),
         camera_enabled: config.camera_enabled,
         camera_id: config.camera_id.clone(),
     }
 }
 
-/// Must match `versionCode` in `android/app/build.gradle.kts`; the host pushes a
-/// new APK whenever the tablet has an older one.
-const APK_VERSION: u32 = 8;
+/// Android and the host read one version source, eliminating manual drift.
+fn apk_version() -> u32 {
+    include_str!("../../../companion-version")
+        .trim()
+        .parse()
+        .expect("valid companion-version")
+}
 
 /// Finds the companion APK.
 ///
@@ -64,7 +80,7 @@ const APK_VERSION: u32 = 8;
 fn bundled_apk() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("EXTRASPACE_APK") {
         let path = PathBuf::from(path);
-        return path.exists().then_some(path);
+        return Some(path);
     }
 
     let mut candidates = vec![
@@ -76,6 +92,7 @@ fn bundled_apk() -> Option<PathBuf> {
     // `./scripts/install.sh` copies the APK here so a desktop/PATH launch, whose
     // cwd is not the repo, can still upgrade the tablet.
     let data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|p| !p.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
     if let Some(data_home) = data_home {
@@ -85,5 +102,5 @@ fn bundled_apk() -> Option<PathBuf> {
         PathBuf::from("/usr/share/extraspace/extraspace.apk"),
         PathBuf::from("/usr/local/share/extraspace/extraspace.apk"),
     ]);
-    candidates.into_iter().find(|p| p.exists())
+    candidates.into_iter().find(|p| p.is_file())
 }

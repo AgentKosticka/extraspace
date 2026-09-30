@@ -46,6 +46,9 @@ pub enum Error {
     #[error(transparent)]
     Frame(#[from] frame::Error),
 
+    #[error("{0}")]
+    Companion(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -73,6 +76,7 @@ pub struct Transport {
 ///
 /// Splitting these apart lets the caller move each socket into its own task
 /// while still holding something that can undo the adb forwards afterwards.
+#[derive(Clone)]
 pub struct TransportHandle {
     pub device: Device,
     adb: Adb,
@@ -122,38 +126,61 @@ impl Transport {
         info!(device = %device.display_name(), serial = %device.serial, "tablet found");
 
         if let Some(apk) = apk {
+            if !apk.is_file() {
+                return Err(Error::Companion(format!(
+                    "APK does not exist: {}",
+                    apk.display()
+                )));
+            }
             ensure_app_installed(&adb, &device.serial, apk, apk_version).await?;
+        } else if adb
+            .package_version(&device.serial, PACKAGE)
+            .await?
+            .is_none()
+        {
+            return Err(Error::Companion("Companion app is not installed. Build it with scripts/install.sh --build-apk, or bundle an APK with --apk PATH.".into()));
         }
-
-        // Forward first: the app needs somewhere to be reached even though it is
-        // the one listening.
-        adb.forward(&device.serial, ports::CONTROL, sockets::CONTROL)
-            .await?;
-        adb.forward(&device.serial, ports::VIDEO, sockets::VIDEO)
-            .await?;
-        adb.forward(&device.serial, ports::CAMERA, sockets::CAMERA)
-            .await?;
-
-        // Restart the activity so we always talk to a fresh instance rather than
-        // one left over from a previous run with stale sockets.
-        adb.force_stop(&device.serial, PACKAGE).await;
-        adb.start_activity(&device.serial, ACTIVITY).await?;
-
-        // Control first, and only once it has actually spoken -- see
-        // `connect_once_listening` for why connecting is not enough.
-        let control = connect_once_listening(ports::CONTROL).await?;
-        let video = connect_with_retry(ports::VIDEO).await?;
-        let camera = connect_with_retry(ports::CAMERA).await?;
-        info!("all three channels connected");
-
-        Ok(Self {
-            device,
-            control,
-            video,
-            camera,
-            adb,
+        let cleanup = TransportHandle {
+            device: device.clone(),
+            adb: adb.clone(),
             simulated: false,
-        })
+        };
+        let result = async {
+            // Forward first: the app needs somewhere to be reached even though it is
+            // the one listening.
+            adb.forward(&device.serial, ports::CONTROL, sockets::CONTROL)
+                .await?;
+            adb.forward(&device.serial, ports::VIDEO, sockets::VIDEO)
+                .await?;
+            adb.forward(&device.serial, ports::CAMERA, sockets::CAMERA)
+                .await?;
+
+            // Restart the activity so we always talk to a fresh instance rather than
+            // one left over from a previous run with stale sockets.
+            adb.force_stop(&device.serial, PACKAGE).await;
+            adb.start_activity(&device.serial, ACTIVITY).await?;
+
+            // Control first, and only once it has actually spoken -- see
+            // `connect_once_listening` for why connecting is not enough.
+            let control = connect_once_listening(ports::CONTROL).await?;
+            let video = connect_with_retry(ports::VIDEO).await?;
+            let camera = connect_with_retry(ports::CAMERA).await?;
+            info!("all three channels connected");
+
+            Ok(Self {
+                device,
+                control,
+                video,
+                camera,
+                adb,
+                simulated: false,
+            })
+        }
+        .await;
+        if result.is_err() {
+            cleanup.disconnect().await;
+        }
+        result
     }
 
     /// Connects to a stand-in tablet already listening on the three ports.
@@ -177,6 +204,15 @@ impl Transport {
             adb: Adb::find().unwrap_or_else(|_| Adb::none()),
             simulated: true,
         })
+    }
+
+    /// A cleanup handle usable if host setup fails after transport connection.
+    pub fn teardown_handle(&self) -> TransportHandle {
+        TransportHandle {
+            device: self.device.clone(),
+            adb: self.adb.clone(),
+            simulated: self.simulated,
+        }
     }
 
     /// Splits into a teardown handle and the three sockets, so each can be moved

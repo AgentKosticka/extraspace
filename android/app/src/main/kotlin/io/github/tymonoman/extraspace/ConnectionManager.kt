@@ -42,8 +42,9 @@ class ConnectionManager(
     private var videoServer: LocalServerSocket? = null
     private var cameraServer: LocalServerSocket? = null
 
-    private var controlSocket: LocalSocket? = null
-    private var cameraSocket: LocalSocket? = null
+    @Volatile private var controlSocket: LocalSocket? = null
+    @Volatile private var videoSocket: LocalSocket? = null
+    @Volatile private var cameraSocket: LocalSocket? = null
 
     @Volatile private var controlWriter: FrameWriter? = null
     @Volatile private var cameraWriter: FrameWriter? = null
@@ -186,6 +187,7 @@ class ConnectionManager(
     private fun runVideo() {
         try {
             val socket = videoServer!!.accept()
+            videoSocket = socket
             val reader = FrameReader(socket.inputStream)
             // One reusable buffer: at 60fps, allocating per frame would keep the
             // GC busy for no reason.
@@ -238,7 +240,7 @@ class ConnectionManager(
 
     override fun close() {
         running.set(false)
-        listOf<Closeable?>(controlServer, videoServer, cameraServer, controlSocket, cameraSocket)
+        listOf<Closeable?>(controlServer, videoServer, cameraServer, controlSocket, videoSocket, cameraSocket)
             .forEach { runCatching { it?.close() } }
         controlWriter = null
         cameraWriter = null

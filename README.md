@@ -4,7 +4,7 @@
 
 **Turn an Android tablet into a real second monitor for GNOME — over USB, with touch.**
 
-[![CI](https://github.com/Tymonoman/extraspace/actions/workflows/ci.yml/badge.svg)](https://github.com/Tymonoman/extraspace/actions/workflows/ci.yml)
+[![CI](https://github.com/AgentKosticka/extraspace/actions/workflows/ci.yml/badge.svg)](https://github.com/AgentKosticka/extraspace/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![GNOME](https://img.shields.io/badge/GNOME-46%2B-4A86CF.svg)](https://www.gnome.org)
@@ -13,7 +13,7 @@
 ![Extraspace running on an Android tablet](assets/demo.gif)
 
 <sub>Recorded on the tablet itself. That is a GNOME monitor, not a screenshot —
-running over a USB cable, at ~1 ms round trip.</sub>
+running over a USB cable. Control round trip is separate from visual latency.</sub>
 
 </div>
 
@@ -59,25 +59,28 @@ maths at all. Extraspace is a well-behaved GNOME app wrapped around those two AP
 
 ## Status
 
-Everything below has been run end to end on real hardware — GNOME Shell 50.3
-driving a Telekom T Tablet (Wingtech, Android 15) over USB.
+This fork builds on [sal0-h/extraspace](https://github.com/sal0-h/extraspace),
+including its low-latency frame pacing, independent decoder drain, cursor overlay,
+and GPU capture/encoding path. The original implementation is
+[Tymonoman/extraspace](https://github.com/Tymonoman/extraspace).
 
-| Piece | State |
-|---|---|
-| Virtual monitor creation, teardown | **Working** — appears alongside physical outputs |
-| Capture → H.264 encode | **Working** — 55 fps at 1332×800 via `x264enc` |
-| USB transport, handshake, APK auto-push | **Working** |
-| Tablet-side decode and display | **Working** — MediaCodec, `low-latency=true` |
-| Touch → cursor on the virtual monitor | **Working** — coordinates map exactly |
-| Adaptive bitrate control | **Working** — queue 0, RTT ~1 ms, probes upward |
-| Camera → `/dev/video10` | **Working** — 1920×1080 in any V4L2 app |
-| Keyboard, stylus, audio, Wi-Fi | Not started — see [Roadmap](#roadmap) |
+The current validation environment is Ubuntu 26.04.1, GNOME Shell 50.1 / Mutter
+50.1-0ubuntu2.4, Wayland, and a Samsung SM-X620 running Android 16 over USB 2.0
+High Speed, with a 2880×1800 panel. The default 1.5× setting sends 1920×1200
+pixels through x264 on this machine. Native GNOME scaling requires a verified
+patched Mutter; it is deliberately not enabled on stock Ubuntu.
 
-Measured on that setup: first frame **47 ms** after start, round trip **~1 ms**
-over USB, decoder input queue steady at **0**.
+Display streaming, touch, repeated connection cycles, and conservative monitor
+placement restoration are supported. Camera passthrough is optional and requires
+v4l2loopback; see the hardware test report for the exact coverage and limitations.
+Other hardware and distributions still need validation.
 
-This is a v0.1 that has been made to work on exactly one tablet and one GNOME
-version. Reports from other hardware are the most useful thing you can send.
+The statistics panel reports **Control RTT**, **Decoded Frame Rate**, bitrate,
+and encoder. Control RTT includes the USB/control path, but excludes capture,
+encoding, decoding and display presentation. It is **not visual latency**.
+Decoded FPS counts frames released by MediaCodec; a still desktop can correctly
+show 0 fps. An external camera / timer experiment is needed for actual
+motion-to-photon latency; the app does not claim to measure it.
 
 ### Verifying it without a tablet
 
@@ -153,60 +156,93 @@ failing with something cryptic.
 ### 2. Set up the computer
 
 ```bash
-git clone https://github.com/Tymonoman/extraspace
+git clone https://github.com/AgentKosticka/extraspace
 cd extraspace
+./scripts/setup.sh --check
 ./scripts/setup.sh
 ```
 
-This is the only step that needs `sudo`. It installs the GStreamer and GTK
-packages, creates `/dev/video10` for the camera so it survives reboots, and
-reports whether your tablet is visible. Run `./scripts/setup.sh --check` first if
-you would rather see what it intends to do — that needs no privileges at all.
+The script detects Ubuntu/Debian, Fedora, and Arch package names. It installs
+GTK, libadwaita, PipeWire/GStreamer development headers, encoder plugins and ADB.
+Install a Rust toolchain with Cargo if you do not have one. The GUI requires
+libadwaita 1.5 or newer and GNOME 46+ on Wayland.
 
-### 3. Get the companion app onto the tablet
+Display-only setup does not install or unload camera kernel modules. To also
+prepare `/dev/video10`, run `./scripts/setup.sh --camera`. On Ubuntu this installs
+v4l2loopback DKMS and headers for the running kernel. Secure Boot may require MOK
+enrollment. Existing modules and devices are left alone. Fedora may need RPM
+Fusion for x264; Arch DKMS users must install headers for their actual kernel.
 
-Download `extraspace.apk` from the
-[latest release](https://github.com/Tymonoman/extraspace/releases), then point
-Extraspace at it once:
+### 3. Build and install
 
-```bash
-EXTRASPACE_APK=~/Downloads/extraspace.apk cargo run --release
-```
-
-It installs the app over USB for you — you never touch the tablet. From then on
-the host checks the installed version on every connect and upgrades it silently,
-so the two halves cannot drift apart, and you can drop the variable:
+With JDK 17 and an Android SDK containing platform/build tools 35 installed:
 
 ```bash
-cargo build --release
-./target/release/extraspace
+export ANDROID_HOME="$HOME/Android/Sdk" # adjust to your SDK location
+./scripts/install.sh --build-apk
 ```
 
-### 4. Add it to your applications
+The Gradle wrapper builds the companion, then the installer builds the Rust
+release and copies the binary, APK, icon, and application launcher into your XDG
+user directories. Launch **Extraspace** from the applications grid; no terminal
+or repository working directory is needed. Launching it again focuses the existing
+window. It does not autostart at login.
 
-Optional, but you probably want it:
+If you already have the corresponding companion APK:
 
 ```bash
-./scripts/install.sh
+./scripts/install.sh --apk /path/to/extraspace.apk
 ```
 
-Installs the binary, icon and desktop entry under `~/.local`, so Extraspace
-appears in your app grid and runs from anywhere as `extraspace`. No root needed
-— unlike `setup.sh`, this touches nothing system-wide. Undo it with
-`./scripts/install.sh --uninstall`.
+Running the installer again rebuilds the host and upgrades the installed files
+by rename, so it does not truncate a running executable. Close and reopen the app
+to use the new host. `--no-build` explicitly installs an existing release binary;
+normal installs always build with `Cargo.lock`. A previously installed APK is
+retained when no new APK is supplied. `EXTRASPACE_APK=/path/to/app.apk` also works
+for a source launch; an invalid override is reported instead of silently ignored.
 
-### 5. Use it
+The host installs a missing companion or replaces an older version while
+preserving its data. It never silently uninstalls an app to bypass a signing-key
+mismatch and does not downgrade a newer app. Host and Gradle read the same
+`companion-version` file. Developer changes to the companion should increment
+that number, or be installed explicitly with `adb install -r -g PATH.apk`.
 
-Open Extraspace and turn on **Extra Display**. The tablet switches to your
-desktop within about a second, and a new monitor appears in
-**Settings → Displays** that you can drag into position like any other.
+Remove the user installation with `./scripts/install.sh --uninstall`. Your
+settings, placement profiles, and logs remain. No system packages are removed.
+
+### 4. Use it
+
+Connect the USB cable, accept Android's USB debugging prompt, and open Extraspace.
+It waits for an authorized tablet, creates the virtual display, and starts
+streaming. Use **Settings → Displays** to arrange the tablet. If the connection
+is lost, the app tears down the display and tries to reconnect. Turning Extra
+Display off stops reconnecting; use **Connect** to start again.
+
+Placement is stored under `$XDG_CONFIG_HOME/extraspace/monitor-layouts.json`
+(default `~/.config/extraspace`). Profiles are separated by tablet identity,
+physical outputs and active monitor geometry. Once capture produces a real
+frame, an exact match can restore positions and primary display. On stock Mutter
+this does not change resolution, scale, orientation or enabled outputs. A changed
+monitor set or mode falls back to GNOME's layout rather than forcing an old one.
+Arrange that configuration once to create its own profile. Clone groups and
+multiple simultaneous virtual monitors are currently excluded.
+
+GNOME's `monitors.xml` is still checked for incompatible virtual-monitor modes,
+scales, rotations or disabled virtual outputs. These can leave a virtual CRTC
+unconfigured and crash stock Mutter. Compatible configurations and physical-only
+layouts are retained; before incompatible entries are removed, the original file
+is backed up as `monitors.xml.extraspace-bak`. Malformed or unknown XML is never
+rewritten. GNOME also keeps configurations in memory, so editing the file is not
+a complete compositor fix. The existing scaled-mode/patched-Mutter gate and
+fixed PipeWire negotiation remain in place. See
+[the monitor investigation](docs/monitor-persistence.md).
 
 ## Usage
 
 | Setting | What it does |
 |---|---|
 | **Mode** | *Extend* adds a new monitor. *Mirror* copies an existing one. |
-| **Scale** | How large the desktop is drawn on the tablet. See below. |
+| **Scale** | How large the desktop is drawn on the tablet. Stock Mutter uses a smaller framebuffer; patched Mutter can use native GNOME scaling. |
 | **Tablet Camera** | Feeds the tablet camera into `/dev/video10`. |
 
 The camera appears as **“Extraspace Tablet Camera”** in Firefox, Zoom, OBS,
@@ -337,15 +373,34 @@ Things that cost time, recorded so they cost you less:
 charge-only; many are. If it says `unauthorized`, accept the prompt on the tablet.
 
 **"Something went wrong: no usable H.264 encoder"** — run
-`./scripts/setup.sh`, or install `gstreamer1-plugins-ugly` (x264) or
-`gstreamer1-plugin-openh264`.
+`./scripts/setup.sh`. Ubuntu uses `gstreamer1.0-plugins-ugly` for x264; Fedora uses
+`gstreamer1-plugins-ugly` from RPM Fusion.
 
-**The virtual camera does not appear** — run `./scripts/setup.sh` to create
+**The virtual camera does not appear** — run `./scripts/setup.sh --camera` to create
 `/dev/video10`. Note that `exclusive_caps=1` deliberately hides it from
 applications while nothing is feeding it, so it only shows up once streaming starts.
 
 **The tablet shows a black screen** — check `adb logcat -s extraspace`. A protocol
 mismatch is reported explicitly on both sides.
+
+Desktop launches retain logs in `$XDG_STATE_HOME/extraspace/extraspace.log`
+(default `~/.local/state/extraspace/extraspace.log`), with one previous log and a
+5 MiB limit for each. `RUST_LOG=debug` enables detailed pacing/health logs. Logs
+can contain device identities and touch coordinates; review them before sharing.
+
+For a diagnostic report without a window:
+
+```bash
+extraspace --diagnostics
+# or from a source build:
+./target/release/extraspace --diagnostics
+```
+
+This reports session type, GNOME and ADB versions, encoder availability, companion
+path, settings/log locations and optional camera status. The device list omits
+serial numbers. Detailed Android errors are available with `adb logcat -s extraspace`.
+A signing-key mismatch requires choosing a matching APK or intentionally removing
+the old companion yourself (which deletes its app data).
 
 ## Roadmap
 
@@ -363,7 +418,10 @@ mismatch is reported explicitly on both sides.
 cargo test                                          # unit tests, no hardware needed
 cargo run -p xs-mutter --example virtual_monitor    # create a monitor for 5 seconds
 RUST_LOG=debug cargo run                            # verbose
-cd android && ./gradlew assembleRelease             # build the companion app
+python3 scripts/tests/test_install.py               # isolated installer/setup checks
+cargo run --release -p xs-core --example device_cycle -- 3 10  # real-device cycles
+XS_TEST_LOSS=1 cargo run --release -p xs-core --example device_cycle -- 2 20
+cd android && ./gradlew assembleRelease lintRelease # companion build + lint
 ```
 
 | Crate | Responsibility |

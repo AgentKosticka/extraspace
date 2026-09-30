@@ -28,13 +28,18 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly gstreamer1.0-pipewire \
-            libpipewire-0.3-dev
+            libpipewire-0.3-dev libclang-dev desktop-file-utils
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Installer and setup checks
+        run: |
+          bash -n scripts/*.sh
+          python3 scripts/tests/test_install.py
 
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -67,7 +72,7 @@ jobs:
 
       - name: Build APK
         working-directory: android
-        run: ./gradlew assembleRelease --no-daemon
+        run: ./gradlew assembleRelease lintRelease --no-daemon
 
       - uses: actions/upload-artifact@v4
         with:

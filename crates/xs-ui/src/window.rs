@@ -40,6 +40,7 @@ struct Widgets {
     stat_fps: adw::ActionRow,
     stat_latency: adw::ActionRow,
     stat_encoder: adw::ActionRow,
+    updating_display: Cell<bool>,
 }
 
 pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Config>>) {
@@ -184,8 +185,12 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
     let stats_group = adw::PreferencesGroup::builder().title("Statistics").build();
     let stat_resolution = stat_row("Resolution", "video-display-symbolic");
     let stat_bitrate = stat_row("Bitrate", "network-transmit-symbolic");
-    let stat_fps = stat_row("Frame Rate", "preferences-system-time-symbolic");
-    let stat_latency = stat_row("Latency", "network-wireless-symbolic");
+    let stat_fps = stat_row("Decoded Frame Rate", "preferences-system-time-symbolic");
+    stat_fps.set_tooltip_text(Some(
+        "Frames released by the tablet decoder. An idle desktop can produce zero frames.",
+    ));
+    let stat_latency = stat_row("Control RTT", "network-wireless-symbolic");
+    stat_latency.set_tooltip_text(Some("USB control-message round trip. Capture, encoding, decoding and display delay are not included; visual latency is not measured."));
     let stat_encoder = stat_row("Encoder", "applications-multimedia-symbolic");
     for row in [
         &stat_resolution,
@@ -217,6 +222,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         stat_fps,
         stat_latency,
         stat_encoder,
+        updating_display: Cell::new(false),
     };
     (stack.upcast(), widgets)
 }
@@ -230,8 +236,8 @@ fn stat_row(title: &str, icon: &str) -> adw::ActionRow {
 
 fn gio_menu() -> gtk::gio::Menu {
     let menu = gtk::gio::Menu::new();
-    menu.append(Some("_Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append(Some("_About Extraspace"), Some("app.about"));
+    menu.append(Some("_Quit"), Some("app.quit"));
     menu
 }
 
@@ -244,14 +250,20 @@ fn wire_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
             .application_icon(APP_ID)
             .developer_name("Tymonoman")
             .version(env!("CARGO_PKG_VERSION"))
-            .website("https://github.com/Tymonoman/extraspace")
-            .issue_url("https://github.com/Tymonoman/extraspace/issues")
+            .website("https://github.com/AgentKosticka/extraspace")
+            .issue_url("https://github.com/AgentKosticka/extraspace/issues")
             .license_type(gtk::License::Gpl30)
             .comments("Use an Android tablet as an extra display and webcam, over USB.")
             .build()
             .present(Some(&parent));
     });
     app.add_action(&about);
+
+    let quit = gtk::gio::SimpleAction::new("quit", None);
+    let window = window.clone();
+    quit.connect_activate(move |_, _| window.close());
+    app.add_action(&quit);
+    app.set_accels_for_action("app.quit", &["<primary>q"]);
 }
 
 fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCell<Config>>) {
@@ -274,7 +286,11 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
 
     {
         let engine = engine.clone();
+        let widgets_ref = Rc::clone(widgets);
         widgets.display_switch.connect_active_notify(move |row| {
+            if widgets_ref.updating_display.get() {
+                return;
+            }
             engine.send(if row.is_active() {
                 Command::Connect
             } else {
@@ -343,9 +359,14 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
 
 fn update_scale_subtitle(widgets: &Rc<Widgets>, config: &Rc<RefCell<Config>>) {
     let scale = config.borrow().scale;
-    widgets.scale_row.set_subtitle(&format!(
-        "{scale}× — how big the desktop looks, not how many pixels are sent"
-    ));
+    let description = if xs_core::modes_enabled() {
+        "GNOME scale on panel pixels"
+    } else {
+        "smaller framebuffer, upscaled on the tablet"
+    };
+    widgets
+        .scale_row
+        .set_subtitle(&format!("{scale}× — {description}"));
 }
 
 fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCell<Config>>) {
@@ -371,6 +392,13 @@ fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<Re
 }
 
 fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>>) {
+    if matches!(state, State::Idle | State::Streaming { .. }) {
+        widgets.updating_display.set(true);
+        widgets
+            .display_switch
+            .set_active(matches!(state, State::Streaming { .. }));
+        widgets.updating_display.set(false);
+    }
     let show_status = |icon: &str, title: &str, description: &str, button: Option<&str>| {
         widgets.status.set_icon_name(Some(icon));
         widgets.status.set_title(title);
@@ -446,11 +474,14 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>
             widgets.window_title.set_subtitle(device);
             widgets.spinner.stop();
             let scale = xs_core::clamp_ui_scale(config.borrow().scale);
-            let logical = xs_core::logical_size_for(*width, *height, scale);
-            widgets.stat_resolution.set_subtitle(&format!(
-                "{width} × {height} native — {}× UI ({} × {})",
-                scale, logical.0, logical.1
-            ));
+            let description = if xs_core::modes_enabled() {
+                format!("{scale}× GNOME scale")
+            } else {
+                "upscaled to the tablet panel".into()
+            };
+            widgets
+                .stat_resolution
+                .set_subtitle(&format!("{width} × {height} stream — {description}"));
             widgets.stat_encoder.set_subtitle(encoder);
             widgets.stack.set_visible_child_name("running");
         }
@@ -475,8 +506,8 @@ fn apply_stats(widgets: &Rc<Widgets>, stats: &Stats) {
         .stat_fps
         .set_subtitle(&format!("{:.0} fps", stats.fps));
     // Bound to a local: a `format!` temporary inside the call would not outlive it.
-    let latency = if stats.latency_ms > 0.0 {
-        format!("{:.0} ms", stats.latency_ms)
+    let latency = if stats.control_rtt_ms > 0.0 {
+        format!("{:.1} ms", stats.control_rtt_ms)
     } else {
         "measuring…".to_owned()
     };

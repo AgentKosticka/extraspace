@@ -16,6 +16,8 @@ use zvariant::{OwnedValue, Value};
 
 use crate::{Error, Result};
 
+pub(crate) mod persistence;
+
 type MonitorSpec = (String, String, String, String);
 type Mode = (
     String,
@@ -216,10 +218,11 @@ pub struct VirtualState {
 ///
 /// `GetCurrentState` only reads, so it cannot disturb the screen-cast the way
 /// `ApplyMonitorsConfig` does.
-pub async fn virtual_monitor_state(conn: &Connection) -> Option<VirtualState> {
+pub async fn monitor_state(conn: &Connection, connector: Option<&str>) -> Option<VirtualState> {
     let (_serial, monitors, logical, _properties) = get_current_state(conn).await.ok()?;
-
-    let (spec, modes, _props) = monitors.into_iter().find(|(spec, ..)| is_virtual(spec))?;
+    let (spec, modes, _props) = monitors
+        .into_iter()
+        .find(|(spec, ..)| connector.map_or_else(|| is_virtual(spec), |c| spec.0 == c))?;
     let (_id, width, height, ..) = modes
         .into_iter()
         .find(|mode| mode_flag(mode, "is-current"))?;
@@ -228,7 +231,6 @@ pub async fn virtual_monitor_state(conn: &Connection) -> Option<VirtualState> {
         .find(|(.., specs, _)| specs.iter().any(|s| s.0 == spec.0))
         .map(|(_, _, scale, ..)| *scale)
         .unwrap_or(1.0);
-
     Some(VirtualState {
         width: width.max(0) as u32,
         height: height.max(0) as u32,
@@ -589,64 +591,124 @@ fn place_after_layout(
         .unwrap_or((0, 0))
 }
 
-/// Drops saved layouts that mention a virtual monitor, keeping a `.bak` once.
-///
-/// mutter reuses virtual-monitor serials (`0x000001` upward, per gnome-shell
-/// process), so a layout saved for an *older* Meta-0 mode matches a new one. If
-/// that pinned mode is not in the mode list we pass, the CRTC is left
-/// unconfigured and `meta_screen_cast_virtual_stream_src_get_specs` dereferences
-/// it -- gnome-shell SIGSEGVs and the user is logged out. Editing the file only
-/// touches our own leftovers; real monitors' layouts are kept.
-pub fn purge_saved_virtual_layouts() -> usize {
+/// Retain compatible virtual layouts; remove only ones that can leave a CRTC
+/// unconfigured. Keep physical-only configurations and all surrounding XML.
+/// Mutter serials are ephemeral, so placement persistence lives in our own store.
+pub(crate) fn sanitize_saved_virtual_layouts(config: &crate::DisplayConfig) -> Result<usize> {
     let Some(path) = dirs_config_dir().map(|d| d.join("monitors.xml")) else {
-        return 0;
+        return Ok(0);
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return 0;
+    let io = |e| Error::DisplayLayout(format!("protecting monitors.xml: {e}"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(io(e)),
     };
-
-    let mut kept = String::with_capacity(text.len());
-    let mut removed = 0;
-    let mut rest = text.as_str();
-    while let Some(start) = rest.find("<configuration>") {
-        let Some(end_rel) = rest[start..].find("</configuration>") else {
-            break;
-        };
-        let end = start + end_rel + "</configuration>".len();
-        let block = &rest[start..end];
-        if block.contains("MetaVendor") || block.contains("Virtual remote monitor") {
-            // Drop the block and the blank line it sat on.
-            kept.push_str(rest[..start].trim_end_matches([' ', '\t']));
-            removed += 1;
-            rest = rest[end..].strip_prefix('\n').unwrap_or(&rest[end..]);
-        } else {
-            kept.push_str(&rest[..end]);
-            rest = &rest[end..];
-        }
-    }
-    kept.push_str(rest);
-
+    let scale = if crate::scaled_modes_allowed() {
+        config.scale
+    } else {
+        1.0
+    };
+    let (kept, removed) = filter_virtual_layouts(
+        &text,
+        config.width,
+        config.height,
+        config.refresh_rate,
+        scale,
+    )?;
     if removed == 0 {
-        return 0;
+        return Ok(0);
     }
     let backup = path.with_extension("xml.extraspace-bak");
     if !backup.exists() {
-        let _ = std::fs::copy(&path, &backup);
+        std::fs::copy(&path, &backup).map_err(io)?;
     }
-    match std::fs::write(&path, kept) {
-        Ok(()) => {
-            warn!(
-                removed,
-                path = %path.display(),
-                "removed saved virtual-monitor layouts; they crash mutter 50.4 when the mode no longer exists"
-            );
-            removed
-        }
-        Err(e) => {
-            warn!(error = %e, "could not rewrite monitors.xml");
-            0
+    // Do not clobber a display-settings save that occurred while parsing.
+    if std::fs::read_to_string(&path).map_err(io)? != text {
+        return Err(Error::DisplayLayout(
+            "monitors.xml changed during startup; try again".into(),
+        ));
+    }
+    let temp = path.with_extension(format!("xml.{}.tmp", std::process::id()));
+    std::fs::write(&temp, kept).map_err(io)?;
+    std::fs::set_permissions(&temp, std::fs::metadata(&path).map_err(io)?.permissions())
+        .map_err(io)?;
+    std::fs::rename(&temp, &path).map_err(io)?;
+    warn!(removed, path = %path.display(), "removed incompatible saved virtual layouts (backup retained)");
+    Ok(removed)
+}
+
+fn filter_virtual_layouts(
+    text: &str,
+    width: u32,
+    height: u32,
+    refresh: f64,
+    scale: f64,
+) -> Result<(String, usize)> {
+    let doc = roxmltree::Document::parse(text)
+        .map_err(|e| Error::DisplayLayout(format!("invalid monitors.xml: {e}")))?;
+    let root = doc.root_element();
+    if !root.has_tag_name("monitors") || root.attribute("version") != Some("2") {
+        return Err(Error::DisplayLayout(
+            "unsupported monitors.xml format; refusing to rewrite it".into(),
+        ));
+    }
+    let child_text = |node: roxmltree::Node<'_, '_>, tag: &str| -> Option<String> {
+        node.children()
+            .find(|n| n.has_tag_name(tag))?
+            .text()
+            .map(|s| s.trim().to_owned())
+    };
+    let is_virtual_spec = |node: roxmltree::Node<'_, '_>| {
+        node.has_tag_name("monitorspec")
+            && child_text(node, "vendor").as_deref() == Some("MetaVendor")
+    };
+    let mut kept = String::with_capacity(text.len());
+    let mut offset = 0;
+    let mut removed = 0;
+    for block in root.children().filter(|n| n.has_tag_name("configuration")) {
+        let virtual_specs: Vec<_> = block
+            .descendants()
+            .filter(|n| is_virtual_spec(*n))
+            .collect();
+        let compatible = virtual_specs.iter().all(|spec| {
+            let Some(monitor) = spec.parent().filter(|n| n.has_tag_name("monitor")) else {
+                return false;
+            };
+            let Some(logical) = monitor
+                .parent()
+                .filter(|n| n.has_tag_name("logicalmonitor"))
+            else {
+                return false;
+            };
+            let Some(mode) = monitor.children().find(|n| n.has_tag_name("mode")) else {
+                return false;
+            };
+            let number = |n, tag: &str| child_text(n, tag).and_then(|s| s.parse::<f64>().ok());
+            let rotation = logical
+                .children()
+                .find(|n| n.has_tag_name("transform"))
+                .and_then(|n| child_text(n, "rotation"));
+            let flipped = logical
+                .children()
+                .find(|n| n.has_tag_name("transform"))
+                .and_then(|n| child_text(n, "flipped"));
+            number(mode, "width") == Some(width as f64)
+                && number(mode, "height") == Some(height as f64)
+                && number(mode, "rate").is_some_and(|r| (r - refresh).abs() < 0.01)
+                && number(logical, "scale").unwrap_or(1.0) == scale
+                && rotation.as_deref().is_none_or(|r| r == "normal")
+                && flipped.as_deref().is_none_or(|r| r == "no")
+        });
+        if !compatible {
+            let range = block.range();
+            kept.push_str(&text[offset..range.start]);
+            offset = range.end;
+            removed += 1;
         }
     }
+    kept.push_str(&text[offset..]);
+    Ok((kept, removed))
 }
 
 fn dirs_config_dir() -> Option<std::path::PathBuf> {
@@ -686,7 +748,12 @@ mod tests {
         )
     }
 
-    fn active_monitor(spec: MonitorSpec, mode_id: &str, width: i32, height: i32) -> Monitor {
+    pub(super) fn active_monitor(
+        spec: MonitorSpec,
+        mode_id: &str,
+        width: i32,
+        height: i32,
+    ) -> Monitor {
         let mode_props = HashMap::from([
             ("is-current".into(), OwnedValue::from(true)),
             ("is-preferred".into(), OwnedValue::from(true)),
@@ -706,8 +773,67 @@ mod tests {
         )
     }
 
-    fn logical_monitor(x: i32, transform: u32, primary: bool, spec: MonitorSpec) -> LogicalMonitor {
+    pub(super) fn logical_monitor(
+        x: i32,
+        transform: u32,
+        primary: bool,
+        spec: MonitorSpec,
+    ) -> LogicalMonitor {
         (x, 0, 1.0, transform, primary, vec![spec], HashMap::new())
+    }
+
+    fn xml_layout(width: u32, scale: f64) -> String {
+        format!(
+            r#"<monitors version="2"><!-- MetaVendor in a comment is not a monitor -->
+<configuration><logicalmonitor><x>1920</x><y>0</y><scale>{scale}</scale>
+<monitor><monitorspec><connector>Meta-0</connector><vendor>MetaVendor</vendor>
+<product>Virtual remote monitor</product><serial>0x000001</serial></monitorspec>
+<mode><width>{width}</width><height>1200</height><rate>60.000</rate></mode></monitor>
+</logicalmonitor></configuration>
+<configuration><logicalmonitor><monitor><monitorspec><vendor>AUO</vendor></monitorspec></monitor></logicalmonitor></configuration>
+</monitors>"#
+        )
+    }
+
+    #[test]
+    fn compatible_virtual_xml_is_preserved_byte_for_byte() {
+        let text = xml_layout(1920, 1.0);
+        let (kept, count) = filter_virtual_layouts(&text, 1920, 1200, 60.0, 1.0).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(kept, text);
+    }
+
+    #[test]
+    fn incompatible_modes_or_scales_keep_physical_layouts_and_comments() {
+        for text in [xml_layout(1280, 1.0), xml_layout(1920, 1.5)] {
+            let (kept, count) = filter_virtual_layouts(&text, 1920, 1200, 60.0, 1.0).unwrap();
+            assert_eq!(count, 1);
+            assert!(kept.contains("<vendor>AUO</vendor>"));
+            assert!(kept.contains("<!-- MetaVendor"));
+            assert_eq!(
+                roxmltree::Document::parse(&kept)
+                    .unwrap()
+                    .descendants()
+                    .filter(|n| n.has_tag_name("configuration"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_virtual_xml_is_unsafe_and_malformed_xml_is_never_rewritten() {
+        let text = r#"<monitors version="2"><configuration><disabled><monitorspec><vendor>MetaVendor</vendor></monitorspec></disabled></configuration></monitors>"#;
+        assert_eq!(
+            filter_virtual_layouts(text, 1920, 1200, 60.0, 1.0)
+                .unwrap()
+                .1,
+            1
+        );
+        assert!(filter_virtual_layouts("<monitors>", 1920, 1200, 60.0, 1.0).is_err());
+        assert!(
+            filter_virtual_layouts("<monitors version=\"3\"/>", 1920, 1200, 60.0, 1.0).is_err()
+        );
     }
 
     #[test]

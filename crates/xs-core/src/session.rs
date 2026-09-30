@@ -180,14 +180,12 @@ type SharedWriter = Arc<Mutex<FrameWriter<OwnedWriteHalf>>>;
 /// Everything belonging to one live connection.
 struct Active {
     transport: TransportHandle,
-    /// Held open while the camera is off, so the channel survives until the user
-    /// enables it. Closing it would take the whole adb forward down with it.
-    _idle_camera: Option<tokio::net::TcpStream>,
     mutter: Arc<xs_mutter::Session>,
     pipeline: Arc<VideoPipeline>,
     controller: Arc<Mutex<AdaptiveController>>,
     control_writer: SharedWriter,
     tasks: Vec<JoinHandle<()>>,
+    last_contact_us: Arc<AtomicU64>,
     device_name: String,
     encoder_name: String,
     width: u32,
@@ -230,16 +228,42 @@ pub async fn run(
     };
     emit(State::Idle);
 
-    while let Some(command) = commands.recv().await {
+    let mut wanted = false;
+    let mut poll = tokio::time::interval(Duration::from_secs(2));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let command = tokio::select! {
+            command = commands.recv() => match command { Some(c) => c, None => break },
+            _ = poll.tick() => {
+                let lost = active.as_ref().is_some_and(|session| {
+                    session.tasks.iter().take(4).any(JoinHandle::is_finished)
+                        || monotonic_us().saturating_sub(session.last_contact_us.load(Ordering::Relaxed)) > 5_000_000
+                });
+                if lost {
+                    warn!("tablet connection lost; removing display and waiting for reconnect");
+                    if let Some(session) = active.take() { session.shutdown().await; }
+                    emit(State::NoTablet);
+                    tokio::time::sleep(TEARDOWN_SETTLE).await;
+                }
+                if let Some(session) = &active { session.mutter.remember_display_layout().await; }
+                if wanted && active.is_none() { Command::Connect } else { continue; }
+            }
+        };
         match command {
             Command::Connect => {
+                wanted = true;
                 if active.is_some() {
                     continue;
                 }
-                active = try_connect(&config, &events).await;
+                let (session, retry) = try_connect(&config, &events).await;
+                active = session;
+                if !retry {
+                    wanted = false;
+                }
             }
 
             Command::Disconnect => {
+                wanted = false;
                 if let Some(session) = active.take() {
                     session.shutdown().await;
                 }
@@ -255,7 +279,11 @@ pub async fn run(
                 if let Some(session) = active.take() {
                     session.shutdown().await;
                     tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    active = try_connect(&config, &events).await;
+                    let (session, retry) = try_connect(&config, &events).await;
+                    active = session;
+                    if !retry {
+                        wanted = false;
+                    }
                 }
             }
 
@@ -264,7 +292,11 @@ pub async fn run(
                 if let Some(session) = active.take() {
                     session.shutdown().await;
                     tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    active = try_connect(&config, &events).await;
+                    let (session, retry) = try_connect(&config, &events).await;
+                    active = session;
+                    if !retry {
+                        wanted = false;
+                    }
                 }
             }
 
@@ -298,20 +330,28 @@ pub async fn run(
             }
         }
     }
+    if let Some(session) = active.take() {
+        session.shutdown().await;
+    }
     debug!("engine loop exited");
 }
 
 /// Connects and reports the outcome, returning the session on success.
-async fn try_connect(config: &SessionConfig, events: &broadcast::Sender<Event>) -> Option<Active> {
+async fn try_connect(
+    config: &SessionConfig,
+    events: &broadcast::Sender<Event>,
+) -> (Option<Active>, bool) {
     match connect(config, events).await {
         Ok(session) => {
             let _ = events.send(Event::State(session.streaming_state()));
-            Some(session)
+            (Some(session), true)
         }
         Err(e) => {
             error!(error = %e, "connect failed");
-            let _ = events.send(Event::State(state_for_error(&e)));
-            None
+            let state = state_for_error(&e);
+            let retry = matches!(state, State::NoTablet | State::Unauthorized { .. });
+            let _ = events.send(Event::State(state));
+            (None, retry)
         }
     }
 }
@@ -319,7 +359,14 @@ async fn try_connect(config: &SessionConfig, events: &broadcast::Sender<Event>) 
 fn state_for_error(e: &anyhow::Error) -> State {
     // Surface the two failures the user can actually fix as their own states,
     // rather than burying them in a generic error string.
-    match e.downcast_ref::<xs_transport::adb::Error>() {
+    match e.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<xs_transport::adb::Error>()
+            .or_else(|| match cause.downcast_ref::<xs_transport::Error>() {
+                Some(xs_transport::Error::Adb(error)) => Some(error),
+                _ => None,
+            })
+    }) {
         Some(xs_transport::adb::Error::Unauthorized(device)) => State::Unauthorized {
             device: device.clone(),
         },
@@ -342,9 +389,24 @@ async fn connect(
 
     step("Looking for your tablet…");
     let transport = Transport::connect(config.apk_path.as_deref(), config.apk_version).await?;
+    let cleanup = transport.teardown_handle();
+    let result = connect_streams(config, events, transport).await;
+    if result.is_err() {
+        cleanup.disconnect().await;
+    }
+    result
+}
+
+async fn connect_streams(
+    config: &SessionConfig,
+    events: &broadcast::Sender<Event>,
+    transport: Transport,
+) -> anyhow::Result<Active> {
+    let step = |s: &str| {
+        let _ = events.send(Event::State(State::Connecting { step: s.into() }));
+    };
     let device_name = transport.device.display_name();
     let (handle, control, video, camera) = transport.split();
-
     // Only the control channel is bidirectional, so only it is split. This is not
     // tidiness: dropping tokio's `OwnedWriteHalf` calls shutdown(Write), and adb's
     // forwarder tears down the entire unix socket to the device when either
@@ -356,7 +418,9 @@ async fn connect(
     let control_writer: SharedWriter = Arc::new(Mutex::new(FrameWriter::new(control_tx)));
 
     step("Waiting for the tablet to introduce itself…");
-    let hello = read_hello(&mut control_reader).await?;
+    let hello = tokio::time::timeout(Duration::from_secs(5), read_hello(&mut control_reader))
+        .await
+        .map_err(|_| anyhow::anyhow!("tablet handshake timed out"))??;
     info!(
         device = %hello.device_name,
         panel = format!("{}x{}", hello.width, hello.height),
@@ -401,6 +465,7 @@ async fn connect(
             refresh_rate: config.framerate as f64,
             scale,
             fallback_sizes: fallback_sizes(hello.width, hello.height),
+            layout_key: (config.mode == DisplayMode::Extend).then(|| handle.device.serial.clone()),
             // Metadata, not Embedded: mutter only paints an embedded cursor
             // when the virtual monitor is damaged, so a still window freezes
             // the pointer. Cursor sprite/position is forwarded to the tablet.
@@ -428,7 +493,19 @@ async fn connect(
     )?;
     let encoder_name = pipeline.encoder().human_name().to_string();
     pipeline.start()?;
+    // Patched Mutter may need an inactive virtual output enabled before it can
+    // capture anything. This activation remains behind the existing patch gate.
     mutter.finalize_display_layout().await?;
+    // A PipeWire node existing is not evidence that its virtual CRTC/view exists.
+    // Wait for a real encoded frame before any placement-only ApplyMonitorsConfig.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pipeline.stats().snapshot().0 == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("capture produced no frame within 5 seconds"))?;
+    mutter.restore_display_placement().await;
     let pipeline = Arc::new(pipeline);
 
     // Tell the tablet what is coming before the first frame arrives.
@@ -469,6 +546,7 @@ async fn connect(
     // the stats handler. Atomic rather than a channel: only the freshest value
     // matters and a stale one is never worth waiting for.
     let rtt_us = Arc::new(AtomicU64::new(0));
+    let last_contact_us = Arc::new(AtomicU64::new(monotonic_us()));
     let mut tasks = Vec::new();
 
     // --- video out -------------------------------------------------------
@@ -549,11 +627,13 @@ async fn connect(
         let controller = Arc::clone(&controller);
         let rtt_us = Arc::clone(&rtt_us);
         let bitrate_tx = bitrate_tx.clone();
+        let last_contact_us = Arc::clone(&last_contact_us);
 
         tasks.push(tokio::spawn(async move {
             let mut fps = FpsCounter::new();
             let mut last_dropped = 0u64;
             let mut last_bytes = 0u64;
+            let mut first_sample = true;
             let mut last_sample_at = Instant::now();
 
             loop {
@@ -565,6 +645,7 @@ async fn connect(
                     }
                 };
 
+                last_contact_us.store(monotonic_us(), Ordering::Relaxed);
                 match frame.channel() {
                     Channel::Touch => {
                         let Some(touch) = TouchEvent::decode(&frame.payload) else {
@@ -612,7 +693,7 @@ async fn connect(
 
                         let now = Instant::now();
                         let (encoded, dropped, bytes) = stats_source.snapshot();
-                        fps.tick(now);
+                        fps.sample(now, device.frames_decoded);
 
                         let elapsed = now.duration_since(last_sample_at).as_secs_f64().max(0.001);
                         last_sample_at = now;
@@ -664,15 +745,20 @@ async fn connect(
 
                         // Bitrate measured from bytes actually produced, not the
                         // number we asked the encoder for.
-                        let bitrate_kbps = ((bytes.saturating_sub(last_bytes)) as f64 * 8.0
-                            / 1000.0
-                            / elapsed) as u32;
+                        let bitrate_kbps = if first_sample {
+                            0
+                        } else {
+                            ((bytes.saturating_sub(last_bytes)) as f64 * 8.0 / 1000.0 / elapsed)
+                                as u32
+                        };
+                        first_sample = false;
                         last_bytes = bytes;
 
                         let _ = events.send(Event::Stats(Stats {
                             bitrate_kbps,
                             fps: fps.fps(),
-                            latency_ms: rtt.as_secs_f64() * 1000.0,
+                            control_rtt_ms: rtt.as_secs_f64() * 1000.0,
+                            frames_decoded: device.frames_decoded,
                             frames_encoded: encoded,
                             frames_dropped: total_dropped,
                             decode_queue_depth: device.decode_queue_depth,
@@ -695,52 +781,55 @@ async fn connect(
         }));
     }
 
-    // --- camera in -------------------------------------------------------
-    // The socket is held either way. Letting it drop when the camera is off would
-    // close the channel, and the tablet would then fail the moment the user turns
-    // the camera on mid-session.
-    let mut idle_camera = None;
-    if config.camera_enabled {
+    // Read the camera socket even when disabled. Opening V4L2 lazily lets
+    // the camera be enabled mid-session without rebuilding the display.
+    {
         let events = events.clone();
         let mut camera_reader = FrameReader::new(camera);
         tasks.push(tokio::spawn(async move {
-            let mut writer = match xs_camera::V4l2Writer::open_default() {
-                Ok(w) => w,
-                Err(e) => {
-                    warn!(error = %e, "virtual camera unavailable");
-                    let _ = events.send(Event::Warning(format!("Camera: {e}")));
-                    return;
-                }
-            };
-            loop {
-                match camera_reader.read_frame().await {
-                    Ok(frame) => {
-                        let is_config = frame.header.flags & flags::CODEC_CONFIG != 0;
-                        if let Err(e) = writer.push(&frame.payload, frame.header.pts_us, is_config)
-                        {
-                            warn!(error = %e, "writing to the virtual camera failed");
-                            break;
+            let mut writer = None;
+            let mut warned = false;
+            while let Ok(frame) = camera_reader.read_frame().await {
+                if writer.is_none() {
+                    match xs_camera::V4l2Writer::open_default() {
+                        Ok(w) => {
+                            writer = Some(w);
+                            warned = false;
+                        }
+                        Err(e) => {
+                            if !warned {
+                                warn!(error = %e, "virtual camera unavailable");
+                                let _ = events.send(Event::Warning(format!(
+                                    "Camera: {e}. Run scripts/setup.sh --camera."
+                                )));
+                                warned = true;
+                            }
+                            continue;
                         }
                     }
-                    Err(e) => {
-                        debug!(error = %e, "camera channel closed");
-                        break;
-                    }
+                }
+                let is_config = frame.header.flags & flags::CODEC_CONFIG != 0;
+                if let Err(e) =
+                    writer
+                        .as_mut()
+                        .unwrap()
+                        .push(&frame.payload, frame.header.pts_us, is_config)
+                {
+                    warn!(error = %e, "writing to the virtual camera failed");
+                    writer = None;
                 }
             }
         }));
-    } else {
-        idle_camera = Some(camera);
     }
 
     Ok(Active {
         transport: handle,
-        _idle_camera: idle_camera,
         mutter,
         pipeline,
         controller,
         control_writer,
         tasks,
+        last_contact_us,
         device_name,
         encoder_name,
         width,
@@ -872,6 +961,22 @@ fn starting_bitrate(width: u32, height: u32, framerate: u32, bounds: BitrateBoun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_adb_discovery_errors_keep_their_actionable_states() {
+        let no_device: anyhow::Error =
+            xs_transport::Error::Adb(xs_transport::adb::Error::NoDevice).into();
+        assert_eq!(state_for_error(&no_device), State::NoTablet);
+        let unauthorized: anyhow::Error =
+            xs_transport::Error::Adb(xs_transport::adb::Error::Unauthorized("tablet".into()))
+                .into();
+        assert_eq!(
+            state_for_error(&unauthorized),
+            State::Unauthorized {
+                device: "tablet".into()
+            }
+        );
+    }
 
     #[test]
     fn native_scale_streams_the_full_panel() {

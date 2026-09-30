@@ -95,6 +95,8 @@ pub struct DisplayConfig {
     /// unconfigured, and `get_specs` then dereferences it -- see [`Session::open`]
     /// and <https://gitlab.gnome.org/GNOME/mutter/-/issues/5007>.
     pub fallback_sizes: Vec<(u32, u32)>,
+    /// Stable device identity for application-owned placement profiles.
+    pub layout_key: Option<String>,
 }
 
 impl Default for DisplayConfig {
@@ -107,6 +109,7 @@ impl Default for DisplayConfig {
             cursor_mode: CursorMode::Embedded,
             source: CaptureSource::Virtual,
             fallback_sizes: Vec::new(),
+            layout_key: None,
         }
     }
 }
@@ -168,7 +171,7 @@ impl Session {
     /// Runs the full setup and returns once the PipeWire node exists.
     pub async fn open(config: DisplayConfig) -> Result<Self> {
         if matches!(config.source, CaptureSource::Virtual) {
-            display::purge_saved_virtual_layouts();
+            display::sanitize_saved_virtual_layouts(&config)?;
         }
         let conn = Connection::session().await?;
 
@@ -293,9 +296,11 @@ impl Session {
         // What mutter actually configured. A saved layout can pin an older mode,
         // and the stream carries that size, not the one we asked for -- so read
         // it back rather than negotiating a format the node will never produce.
-        let effective = match config.source {
-            CaptureSource::Virtual if use_modes => display::virtual_monitor_state(&conn).await,
-            CaptureSource::Monitor(_) => None,
+        let effective = match &config.source {
+            CaptureSource::Virtual if use_modes => display::monitor_state(&conn, None).await,
+            CaptureSource::Monitor(connector) => {
+                display::monitor_state(&conn, Some(connector)).await
+            }
             CaptureSource::Virtual => None,
         };
         let (width, height) = effective
@@ -305,7 +310,7 @@ impl Session {
             warn!(
                 asked = format!("{}x{}", config.width, config.height),
                 got = format!("{width}x{height}"),
-                "mutter kept a saved Meta-0 mode; streaming that instead"
+                "streaming the active monitor mode instead of the requested size"
             );
         }
 
@@ -337,14 +342,30 @@ impl Session {
     /// In the mode-less path, that connection is what creates Meta-0.
     pub async fn finalize_display_layout(&self) -> Result<()> {
         if !self.use_modes {
-            let Some(before) = &self.layout_before else {
-                return Ok(());
-            };
-            // The mode-less path has already divided the framebuffer by the
-            // requested UI scale. Its GNOME monitor scale stays at 1.0.
-            display::enable_virtual_monitor(&self._conn, 1.0, before).await?;
+            if let Some(before) = &self.layout_before {
+                // Only the patched path can enable an output or change its mode.
+                display::enable_virtual_monitor(&self._conn, 1.0, before).await?;
+            }
         }
         Ok(())
+    }
+
+    /// Restore positions only after the caller has observed a real capture frame.
+    pub async fn restore_display_placement(&self) {
+        if let Some(device) = self.config.layout_key.as_deref() {
+            if let Err(e) = display::persistence::restore(&self._conn, device).await {
+                warn!(error = %e, "saved tablet placement could not be restored");
+            }
+        }
+    }
+
+    /// Read-only display query, followed by an atomic write of our own profiles.
+    pub async fn remember_display_layout(&self) {
+        if let Some(device) = self.config.layout_key.as_deref() {
+            if let Err(e) = display::persistence::remember(&self._conn, device).await {
+                warn!(error = %e, "tablet placement could not be saved");
+            }
+        }
     }
 
     /// Size mutter really gave us, which is what the stream will carry.
@@ -370,6 +391,7 @@ impl Session {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        self.remember_display_layout().await;
         // Capture the physical displays immediately before removing Meta-0.
         // The user may have changed orientation or arrangement while connected.
         let restore = if let Some(before) = &self.layout_before {

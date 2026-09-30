@@ -11,13 +11,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("adb not found. Install it with: sudo dnf install android-tools")]
+    #[error("adb not found. Run scripts/setup.sh, or install adb (Ubuntu/Debian) or android-tools (Fedora/Arch)")]
     AdbNotFound,
 
     #[error("adb {command} failed (exit {code}): {stderr}")]
@@ -93,17 +94,26 @@ impl Adb {
 
     async fn run(&self, args: &[&str]) -> Result<String> {
         debug!(args = ?args, "adb");
-        let output = Command::new(&self.binary)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .await?;
+        let timeout = if args.contains(&"install") { 120 } else { 15 };
+        let mut command = Command::new(&self.binary);
+        command.args(args).stdin(Stdio::null()).kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(timeout), command.output())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "ADB command timed out")
+            })??;
 
         if !output.status.success() {
             return Err(Error::CommandFailed {
                 command: args.join(" "),
                 code: output.status.code().unwrap_or(-1),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                stderr: format!(
+                    "{} {}",
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+                .trim()
+                .to_owned(),
             });
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -170,8 +180,7 @@ impl Adb {
             .await
         {
             Ok(o) => o,
-            // dumpsys exits non-zero for unknown packages on some builds.
-            Err(_) => return Ok(None),
+            Err(e) => return Err(e),
         };
         if !out.contains(package) {
             return Ok(None);
@@ -187,10 +196,9 @@ impl Adb {
     pub async fn install(&self, serial: &str, apk: &Path) -> Result<()> {
         let path = apk.to_string_lossy();
         info!(apk = %path, "installing companion app");
-        // -r replace, -g grant runtime permissions (camera), -d allow downgrade
-        // so a dev build can replace a newer store build.
-        self.run_on(serial, &["install", "-r", "-g", "-d", &path])
-            .await?;
+        // Preserve app data and request runtime permissions. A signing-key
+        // mismatch is reported; never uninstall silently or downgrade a newer app.
+        self.run_on(serial, &["install", "-r", "-g", &path]).await?;
         info!("companion app installed");
         Ok(())
     }

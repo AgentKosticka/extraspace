@@ -49,6 +49,7 @@ impl Default for Config {
 impl Config {
     pub fn path() -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
             .unwrap_or_else(|| PathBuf::from("."));
@@ -86,7 +87,10 @@ impl Config {
         }
         match serde_json::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(e) = std::fs::write(&path, text) {
+                let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+                if let Err(e) =
+                    std::fs::write(&temp, text).and_then(|_| std::fs::rename(&temp, &path))
+                {
                     warn!(error = %e, "could not save settings");
                 }
             }

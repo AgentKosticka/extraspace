@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         cursor_mode: CursorMode::Metadata,
         source,
         fallback_sizes: Vec::new(),
+        layout_key: None,
     })
     .await?;
     println!("  pipewire node {}", session.node_id());

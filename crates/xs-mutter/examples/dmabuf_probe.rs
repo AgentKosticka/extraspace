@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         cursor_mode: CursorMode::Metadata,
         source: CaptureSource::Monitor(connector),
         fallback_sizes: Vec::new(),
+        layout_key: None,
     })
     .await?;
 

@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         scale: 1.75,
         cursor_mode: CursorMode::Embedded,
         source: CaptureSource::Virtual,
+        layout_key: None,
         fallback_sizes: vec![(2304, 1440), (1316, 822), (1152, 720), (1536, 960)],
     })
     .await?;

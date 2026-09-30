@@ -31,7 +31,7 @@ pub enum Command {
     Connect,
     /// Tear everything down.
     Disconnect,
-    /// Change GNOME UI scale on the live virtual monitor. Does not recreate Meta-0.
+    /// Rebuild the virtual monitor with a different UI scale.
     SetScale(f64),
     /// Switch between extending and mirroring.
     SetMode(DisplayMode),
@@ -72,7 +72,10 @@ pub enum State {
 pub struct Stats {
     pub bitrate_kbps: u32,
     pub fps: f64,
-    pub latency_ms: f64,
+    /// Round trip on the control socket; does not measure visual latency.
+    pub control_rtt_ms: f64,
+    /// Frames released by the tablet decoder, distinct from encoded frames.
+    pub frames_decoded: u64,
     pub frames_encoded: u64,
     pub frames_dropped: u64,
     pub decode_queue_depth: u32,
@@ -167,10 +170,10 @@ pub fn format_bitrate(kbps: u32) -> String {
     }
 }
 
-/// Tracks frames-per-second over a short sliding window.
+/// Measures a cumulative frame counter over a short sliding window.
 pub(crate) struct FpsCounter {
     window: Duration,
-    ticks: Vec<Instant>,
+    ticks: Vec<(Instant, u64)>,
 }
 
 impl FpsCounter {
@@ -181,10 +184,13 @@ impl FpsCounter {
         }
     }
 
-    pub fn tick(&mut self, now: Instant) {
-        self.ticks.push(now);
+    pub fn sample(&mut self, now: Instant, frames: u64) {
+        if self.ticks.last().is_some_and(|(_, last)| frames < *last) {
+            self.ticks.clear();
+        }
+        self.ticks.push((now, frames));
         let cutoff = now - self.window;
-        self.ticks.retain(|t| *t >= cutoff);
+        self.ticks.retain(|(t, _)| *t >= cutoff);
     }
 
     pub fn fps(&self) -> f64 {
@@ -195,11 +201,12 @@ impl FpsCounter {
             .ticks
             .last()
             .unwrap()
-            .duration_since(*self.ticks.first().unwrap());
+            .0
+            .duration_since(self.ticks.first().unwrap().0);
         if span.is_zero() {
             return 0.0;
         }
-        (self.ticks.len() - 1) as f64 / span.as_secs_f64()
+        (self.ticks.last().unwrap().1 - self.ticks.first().unwrap().1) as f64 / span.as_secs_f64()
     }
 }
 
@@ -243,7 +250,7 @@ mod tests {
         let t0 = Instant::now();
         // 60 ticks at 16.67ms apart.
         for i in 0..60 {
-            c.tick(t0 + Duration::from_micros(16_667 * i));
+            c.sample(t0 + Duration::from_micros(16_667 * i), i);
         }
         assert!((c.fps() - 60.0).abs() < 1.0, "got {}", c.fps());
     }
@@ -252,7 +259,7 @@ mod tests {
     fn fps_counter_is_zero_before_it_has_evidence() {
         let mut c = FpsCounter::new();
         assert_eq!(c.fps(), 0.0);
-        c.tick(Instant::now());
+        c.sample(Instant::now(), 0);
         assert_eq!(c.fps(), 0.0);
     }
 
@@ -261,10 +268,23 @@ mod tests {
         let mut c = FpsCounter::new();
         let t0 = Instant::now();
         for i in 0..60 {
-            c.tick(t0 + Duration::from_micros(16_667 * i));
+            c.sample(t0 + Duration::from_micros(16_667 * i), i);
         }
         // Ten seconds later, a single tick: the old window must have aged out.
-        c.tick(t0 + Duration::from_secs(10));
+        c.sample(t0 + Duration::from_secs(10), 60);
+        assert_eq!(c.fps(), 0.0);
+    }
+
+    #[test]
+    fn health_messages_do_not_count_as_video_frames() {
+        let mut c = FpsCounter::new();
+        let t = Instant::now();
+        c.sample(t, 100);
+        c.sample(t + Duration::from_millis(500), 100);
+        assert_eq!(c.fps(), 0.0);
+        c.sample(t + Duration::from_secs(1), 160);
+        assert_eq!(c.fps(), 60.0);
+        c.sample(t + Duration::from_millis(1500), 0);
         assert_eq!(c.fps(), 0.0);
     }
 }
