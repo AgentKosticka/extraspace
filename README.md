@@ -267,7 +267,7 @@ fixed PipeWire negotiation remain in place. See
 ### Running in the tray
 
 Open the main menu (**☰**) and enable **Keep Running in Tray**. Closing the
-window then hides it while the display and reconnect handling continue running.
+window (or pressing **Ctrl+W**) then hides it while the display and reconnect handling continue running.
 The tray menu has **Open Extraspace**, **Connect**, **Disconnect** and **Quit**.
 **Hide Window** hides it immediately; opening Extraspace from the applications
 grid also restores the existing window. **Quit** or **Ctrl+Q** always stops the
@@ -462,6 +462,7 @@ cargo test                                          # unit tests, no hardware ne
 cargo run -p xs-mutter --example virtual_monitor    # create a monitor for 5 seconds
 RUST_LOG=debug cargo run                            # verbose
 python3 scripts/tests/test_install.py               # isolated installer/setup checks
+dbus-run-session -- /usr/bin/python3 scripts/tests/test_tray.py ./target/release/extraspace # GUI tray lifecycle
 cargo run --release -p xs-core --example device_cycle -- 3 10  # real-device cycles
 XS_TEST_LOSS=1 cargo run --release -p xs-core --example device_cycle -- 2 20
 cd android && ./gradlew assembleRelease lintRelease # companion build + lint

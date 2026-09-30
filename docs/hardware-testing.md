@@ -52,6 +52,27 @@ MediaCodec presentation and cursor overlay were retained.
   kept the same registered application. Quit removed the monitor and forwards.
   The original user settings were retained.
 
+## Desktop packaging and tray follow-up
+
+* The desktop SVG is generated from the Android adaptive-icon paths and background
+  color, and CI checks for drift.
+* Added a default-off, persisted Keep Running in Tray option, with Open, Connect,
+  Disconnect and Quit in the real StatusNotifier menu. The host does not depend
+  on GTK 3/AppIndicator libraries.
+* On this GNOME session, the tray registered successfully. Hide Window and
+  closing with Ctrl+W kept the same process and virtual monitor running. Tray
+  activation and launching the app again restored the same window. Disconnect
+  removed the virtual output; Connect recreated it. Quit while hidden removed
+  the output and Extraspace ADB forwards.
+* A private D-Bus GUI test registered a test StatusNotifier watcher, closed the
+  window to the tray, then removed the watcher. The hidden window was restored,
+  close without a tray kept it accessible, and explicit Quit exited cleanly.
+* Five isolated installer checks passed, including valid release download,
+  checksum corruption, companion-version mismatch and conflicting APK options.
+* Android release build and lint passed with the persistent signing configuration.
+  The existing certificate is stored in an encrypted Actions secret, with explicit
+  user approval, to preserve APK upgrade compatibility.
+
 ## Limits
 
 These are software/device observations, not a measured motion-to-photon latency
