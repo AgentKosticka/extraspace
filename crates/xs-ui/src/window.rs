@@ -149,6 +149,7 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
                             }
                         }
                         if !available && !window.is_visible() && !quitting.get() {
+                            tracing::info!("tray disappeared; restoring hidden window");
                             window.present();
                             toasts.add_toast(adw::Toast::new(
                                 "Tray support disappeared; Extraspace is still running.",
@@ -366,6 +367,12 @@ fn wire_actions(
         }
     });
     app.add_action(&hide);
+
+    let close = gtk::gio::SimpleAction::new("close-window", None);
+    let parent = window.clone();
+    close.connect_activate(move |_, _| parent.close());
+    app.add_action(&close);
+    app.set_accels_for_action("app.close-window", &["<primary>w"]);
     let about = gtk::gio::SimpleAction::new("about", None);
     let parent = window.clone();
     about.connect_activate(move |_, _| {
