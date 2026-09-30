@@ -92,7 +92,17 @@ def test(binary):
                 assert app.poll() is None
                 action("quit")
                 assert app.wait(timeout=10) == 0
-            print("PASS: close to tray, watcher loss, accessible fallback, explicit quit")
+            # A fresh launch on vanilla GNOME without any tray host must work.
+            with log.open("w") as output:
+                app = subprocess.Popen([str(binary)], env=env, stdout=output, stderr=output)
+                wait_for(lambda: "tray unavailable" in log.read_text(), "startup without tray")
+                wait_for(lambda: "close-window" in call(APP, "/io/github/tymonoman/Extraspace", "org.gtk.Actions", "DescribeAll")[0], "window actions")
+                action("close-window")
+                assert "window closed to tray" not in log.read_text()
+                assert app.poll() is None
+                action("quit")
+                assert app.wait(timeout=10) == 0
+            print("PASS: close to tray, watcher loss, accessible fallback, no tray at startup, explicit quit")
         finally:
             for process in (app, host):
                 if process is not None and process.poll() is None:

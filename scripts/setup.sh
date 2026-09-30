@@ -59,13 +59,16 @@ else
   echo 'Required packages are installed.'
 fi
 if ((CHECK_ONLY == 0)); then
-  if ((EUID == 0)); then ROOT=(); else
-    command -v sudo >/dev/null || { echo 'Install sudo or run setup as root.' >&2; exit 1; }
-    if ! sudo -n true 2>/dev/null; then
-      [[ -t 0 ]] || { echo 'Run setup.sh from a terminal for sudo, or use --check.' >&2; exit 1; }
-      sudo -v
+  ROOT=()
+  if ((${#missing[@]})) || { ((CAMERA)) && [[ ! -e /dev/video10 ]]; }; then
+    if ((EUID != 0)); then
+      command -v sudo >/dev/null || { echo 'Install sudo or run setup as root.' >&2; exit 1; }
+      if ! sudo -n true 2>/dev/null; then
+        [[ -t 0 ]] || { echo 'Run setup.sh from a terminal for sudo, or use --check.' >&2; exit 1; }
+        sudo -v
+      fi
+      ROOT=(sudo)
     fi
-    ROOT=(sudo)
   fi
   if ((${#missing[@]})); then
     case "$MANAGER" in

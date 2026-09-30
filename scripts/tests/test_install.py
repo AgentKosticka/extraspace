@@ -132,6 +132,13 @@ class Installation(unittest.TestCase):
         self.assertNotIn("v4l2loopback", result.stdout)
         self.assertNotIn("must-not-run", result.stderr)
 
+        # An ordinary upgrade with satisfied dependencies needs no sudo at all.
+        (mocks / "dpkg-query").write_text("#!/bin/sh\necho 'install ok installed'\n")
+        result = subprocess.run([str(REPO / "scripts/setup.sh")], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Required packages are installed", result.stdout)
+        self.assertNotIn("must-not-run", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

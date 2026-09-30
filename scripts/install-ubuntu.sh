@@ -20,6 +20,7 @@ done
 # shellcheck disable=SC1091
 source /etc/os-release
 [[ ${ID:-} == ubuntu ]] || { echo 'This installer is for Ubuntu. Use setup.sh and install.sh on other distributions.' >&2; exit 1; }
+[[ ${VERSION_ID%%.*} -ge 24 ]] || { echo 'Ubuntu 24.04 or newer is required for GNOME 46 and libadwaita 1.5.' >&2; exit 1; }
 "$REPO_ROOT/scripts/setup.sh" "${SETUP_ARGS[@]}"
 export PATH="$HOME/.cargo/bin:$PATH"
 if ! command -v cargo >/dev/null; then
