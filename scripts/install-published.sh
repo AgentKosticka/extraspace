@@ -2,16 +2,7 @@
 # Build the last published, tested source with its immutable companion release.
 set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-INSTALLER=install.sh
-if [[ ${1:-} == --ubuntu ]]; then
-  INSTALLER=install-ubuntu.sh
-  shift
-fi
-for arg in "$@"; do
-  [[ $arg == --camera && $INSTALLER == install-ubuntu.sh ]] || {
-    echo 'Usage: install-published.sh [--ubuntu [--camera]]' >&2; exit 2;
-  }
-done
+(($# == 0)) || { echo 'Usage: install-published.sh' >&2; exit 2; }
 for command in curl git tar; do
   command -v "$command" >/dev/null || { echo "Install $command to install a published build." >&2; exit 1; }
 done
@@ -33,8 +24,4 @@ git -C "$REPO_ROOT" archive "$COMMIT" | tar -x -C "$PUBLISHED_DIR/source"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/extraspace/target}
 [[ $CARGO_TARGET_DIR == /* ]] || export CARGO_TARGET_DIR="$REPO_ROOT/$CARGO_TARGET_DIR"
 export EXTRASPACE_RELEASE_URL="$RELEASE_BASE/build-$COMMIT"
-if [[ $INSTALLER == install.sh ]]; then
-  "$PUBLISHED_DIR/source/scripts/$INSTALLER" --download-apk
-else
-  "$PUBLISHED_DIR/source/scripts/$INSTALLER" "$@"
-fi
+"$PUBLISHED_DIR/source/scripts/install.sh" --download-apk

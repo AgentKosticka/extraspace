@@ -208,6 +208,33 @@ class Installation(unittest.TestCase):
         self.assertIn("Invalid published source commit", result.stderr)
         self.assertFalse(built_version.exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "Ubuntu installer requires a normal user")
+    def test_ubuntu_sets_up_dependencies_before_fetching_published_source(self):
+        source = self.root / "ubuntu-source/scripts"
+        source.mkdir(parents=True)
+        shutil.copy2(REPO / "scripts/install-ubuntu.sh", source)
+        setup = source / "setup.sh"
+        setup.write_text('#!/bin/sh\ntouch "$TEST_SETUP_DONE"\n')
+        setup.chmod(0o755)
+        published = source / "install-published.sh"
+        published.write_text('#!/bin/sh\ntest -f "$TEST_SETUP_DONE" || exit 99\ntouch "$TEST_PUBLISHED_DONE"\n')
+        published.chmod(0o755)
+        release = self.root / "os-release"
+        release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
+        env = dict(self.env, EXTRASPACE_OS_RELEASE=str(release),
+                   TEST_SETUP_DONE=str(self.root / "setup-done"),
+                   TEST_PUBLISHED_DONE=str(self.root / "published-done"))
+        result = subprocess.run([str(source / "install-ubuntu.sh"), "--published"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertTrue((self.root / "published-done").exists())
+        # Conflicting choices fail before setup or any source download.
+        (self.root / "setup-done").unlink()
+        result = subprocess.run([str(source / "install-ubuntu.sh"), "--published", "--build-apk"],
+                                env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "setup-done").exists())
+
     def test_check_detects_ubuntu_without_privileged_commands(self):
         release = self.root / "os-release"
         release.write_text('ID=ubuntu\nID_LIKE=debian\nPRETTY_NAME="Test Ubuntu"\n')

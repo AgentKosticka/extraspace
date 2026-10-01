@@ -18,13 +18,10 @@ while (($#)); do
   shift
 done
 ((APK_CHOICE < 2)) || { echo 'Choose --apk or --build-apk, not both.' >&2; exit 2; }
-if ((PUBLISHED)); then
-  ((APK_CHOICE == 0)) || { echo 'Choose --published, --apk or --build-apk.' >&2; exit 2; }
-  exec "$REPO_ROOT/scripts/install-published.sh" --ubuntu "${SETUP_ARGS[@]}"
-fi
+((PUBLISHED == 0 || APK_CHOICE == 0)) || { echo 'Choose --published, --apk or --build-apk.' >&2; exit 2; }
 ((EUID != 0)) || { echo 'Run this installer as your normal user; setup asks for sudo when needed.' >&2; exit 1; }
 # shellcheck disable=SC1091
-source /etc/os-release
+source "${EXTRASPACE_OS_RELEASE:-/etc/os-release}"
 [[ ${ID:-} == ubuntu ]] || { echo 'This installer is for Ubuntu. Use setup.sh and install.sh on other distributions.' >&2; exit 1; }
 [[ ${VERSION_ID%%.*} -ge 24 ]] || { echo 'Ubuntu 24.04 or newer is required for GNOME 46 and libadwaita 1.5.' >&2; exit 1; }
 "$REPO_ROOT/scripts/setup.sh" "${SETUP_ARGS[@]}"
@@ -37,4 +34,9 @@ if ! command -v cargo >/dev/null; then
     --tlsv1.2 https://sh.rustup.rs -o "$RUSTUP_SCRIPT"
   sh "$RUSTUP_SCRIPT" -y --profile minimal --default-toolchain stable
 fi
-"$REPO_ROOT/scripts/install.sh" "${INSTALL_ARGS[@]}"
+if ((PUBLISHED)); then
+  # Setup supplies curl and the compiler before fetching the published source.
+  "$REPO_ROOT/scripts/install-published.sh"
+else
+  "$REPO_ROOT/scripts/install.sh" "${INSTALL_ARGS[@]}"
+fi

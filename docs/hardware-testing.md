@@ -108,7 +108,8 @@ are added.
   with warnings denied; the compositor integration test remains ignored.
 * Stable Clippy for all workspace targets, formatting and icon synchronization
   checks passed. Locked dependencies were adjusted to support the declared MSRV.
-* Eight isolated installer tests passed. Actual GIO launches verified literal
+* Nine isolated installer tests passed, including dependency setup before
+  published-source fetching on Ubuntu. Actual GIO launches verified literal
   backslashes, spaces, quotes, dollars, backticks and percent signs in paths.
   A newer checkout with an older published companion installs the matching
   published source and APK without changing the checkout or local edits.
