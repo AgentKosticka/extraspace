@@ -205,8 +205,20 @@ impl Adb {
 
     /// Launches an activity, e.g. `io.github.tymonoman.extraspace/.MirrorActivity`.
     pub async fn start_activity(&self, serial: &str, component: &str) -> Result<()> {
-        self.run_on(serial, &["shell", "am", "start", "-n", component])
-            .await?;
+        self.run_on(
+            serial,
+            &[
+                "shell",
+                "am",
+                "start",
+                "-n",
+                component,
+                "--es",
+                "connection_transport",
+                "adb",
+            ],
+        )
+        .await?;
         debug!(component, "activity started");
         Ok(())
     }

@@ -18,6 +18,7 @@ tokio.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json = "1"
+rusb = { version = "0.9.4", features = ["vendored"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util"] }

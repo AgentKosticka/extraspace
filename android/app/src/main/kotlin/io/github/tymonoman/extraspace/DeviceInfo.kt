@@ -17,6 +17,7 @@ import android.util.Log
 object DeviceInfo {
     data class Camera(val id: String, val facing: String, val maxWidth: Int, val maxHeight: Int)
 
+    var deviceId: String = ""; private set
     var width: Int = 1920; private set
     var height: Int = 1080; private set
     var densityDpi: Int = 160; private set
@@ -24,6 +25,12 @@ object DeviceInfo {
     var cameras: List<Camera> = emptyList(); private set
 
     fun load(context: Context) {
+        val prefs = context.getSharedPreferences("companion", Context.MODE_PRIVATE)
+        deviceId = prefs.getString("device_uuid", null)?.takeIf {
+            runCatching { java.util.UUID.fromString(it).toString() == it }.getOrDefault(false)
+        } ?: java.util.UUID.randomUUID().toString().also {
+            check(prefs.edit().putString("device_uuid", it).commit()) { "Could not save device identity" }
+        }
         loadDisplay(context)
         loadCameras(context)
         Log.i(TAG, "device: ${width}x$height @${refreshRate}Hz, ${densityDpi}dpi, ${cameras.size} cameras")

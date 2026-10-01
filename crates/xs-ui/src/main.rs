@@ -71,6 +71,8 @@ fn session_config(config: &Config) -> xs_core::SessionConfig {
     xs_core::SessionConfig {
         mode: config.display_mode(),
         scale: config.scale,
+        transport: config.transport,
+        last_device_id: None,
         framerate: config.framerate,
         encoder: config.encoder.clone(),
         bounds: config.bounds(),

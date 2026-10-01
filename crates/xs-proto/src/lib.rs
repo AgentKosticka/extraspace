@@ -91,6 +91,10 @@ pub enum ControlKind {
     Error = 6,
     /// Host -> device: cursor overlay. Binary; see [`CursorMessage`].
     Cursor = 7,
+    /// Host -> accessory: repeat Hello after reconnecting the bulk endpoints.
+    HelloRequest = 8,
+    /// Host -> accessory: stop displaying without physically unplugging USB.
+    SessionEnd = 9,
 }
 
 impl ControlKind {
@@ -104,6 +108,8 @@ impl ControlKind {
             5 => Self::Pong,
             6 => Self::Error,
             7 => Self::Cursor,
+            8 => Self::HelloRequest,
+            9 => Self::SessionEnd,
             _ => return None,
         })
     }
@@ -262,6 +268,9 @@ impl CursorMessage {
 pub struct Hello {
     pub protocol_version: u32,
     pub device_name: String,
+    /// Installation UUID shared across ADB and accessory transports. Older apps omit it.
+    #[serde(default)]
+    pub device_id: Option<String>,
     pub android_release: String,
     pub width: u32,
     pub height: u32,

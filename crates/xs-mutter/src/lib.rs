@@ -30,6 +30,13 @@ mod patched;
 mod proxies;
 
 pub use keys::Chord;
+
+/// Migrate serial-keyed layouts after a companion introduces its installation UUID.
+pub fn migrate_display_identity(old: &str, new: &str) {
+    if let Err(e) = display::persistence::migrate(old, new) {
+        tracing::warn!(error = %e, "could not migrate device layout identity");
+    }
+}
 pub use patched::scaled_modes_allowed;
 pub use proxies::CursorMode;
 use proxies::{
@@ -350,7 +357,7 @@ impl Session {
         Ok(())
     }
 
-    /// Restore positions only after the caller has observed a real capture frame.
+    /// Restore placement and GNOME scale after observing a real capture frame.
     pub async fn restore_display_placement(&self) {
         if let Some(device) = self.config.layout_key.as_deref() {
             if let Err(e) = display::persistence::restore(&self._conn, device).await {

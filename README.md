@@ -132,14 +132,14 @@ welcome.
   it depends on mutter-specific D-Bus APIs that KDE, Sway and friends do not have.
   GNOME 50+ additionally lets the monitor be pinned to an exact mode.
 - An **Android 11+** tablet (API 30, for `MediaCodec` low-latency decoding).
-- A **USB cable** and USB debugging enabled on the tablet.
+- A **USB data cable**. ADB requires USB debugging; AOA requires accessory support, the companion installed, and host USB permissions.
 - Any GPU. **Automatic** encoding is the default: it tries available GPU
   encoders first, then falls back to CPU encoding. CPU encoding needs roughly
   one core; hardware encoding requires a working driver and GStreamer plugin.
 
 ## Getting started
 
-Four steps, once. After that it is plug in the cable and open the app.
+These steps use ADB. For a connection without USB debugging, see Android setup screen and USB methods below. After setup, plug in the cable and open the app.
 
 ### 1. Turn on USB debugging, on the tablet
 
@@ -481,6 +481,97 @@ Things that cost time, recorded so they cost you less:
   against the idle rate instead, and a keyframe is requested explicitly whenever a
   tablet attaches.
 
+## Device identity and remembered displays
+
+The Android companion generates an installation UUID and sends it in Hello over
+both USB transports. The PC remembers ExtraSpace render scale, Extend/Mirror,
+encoder, bitrate bounds, frame rate and camera preferences in
+`~/.config/extraspace/device-settings.json`. Position, primary monitor and GNOME
+logical scale live in `monitor-layouts.json`. Existing ADB serial layout profiles
+are adopted on the first UUID connection. APK updates retain the UUID; clearing
+Android app data or uninstalling generates a new identity. It is an identifier,
+not a pairing secret.
+
+**Render Scale** controls the framebuffer size in the default capture path.
+**Ubuntu Settings → Displays → Scale** controls GNOME logical/UI size, independently
+of framebuffer resolution. On reconnect ExtraSpace restores the latter with the
+saved placement after capture is ready, only if the monitor modes, physical
+monitor scales, transforms and topology still match and Mutter advertises the
+saved tablet scale. Unsupported or changed layouts are left to GNOME. Existing
+Mutter mode/crash guards remain in effect.
+
+For native pixels, choose **Render Scale → 1×**, then set the desired UI size in
+**Ubuntu Settings → Displays → Scale** once the stream is running. The latter
+is remembered without reducing the stream resolution. Native pixels require
+more encoding and decoding work; the app does not silently lower resolution
+when the link is busy.
+
+The live display path uses hardware encoding when available, hardware decoding
+on Android, a direct SurfaceView, bounded queues, and damage-driven capture.
+Variable-rate capture is capped before conversion/encoding at the selected
+frame rate; idle periods do not generate duplicate frames. The Android decoder
+blocks waiting for output, with at most four timeout wakeups per second at idle.
+The screen requests the stream's refresh rate and stays awake only while
+streaming. Keep the experimental frame-selection option off unless it helps
+your device; it has no established power or latency benefit.
+
+USB charging power depends on the port, cable, panel brightness and tablet.
+Battery charge trend can confirm that the battery is not being discharged, but
+does not measure the PC's total power use or establish parity with a physical
+monitor. Measure USB input power and end-to-end display latency to validate
+those requirements on a particular setup.
+See the [connection and power validation report](docs/device-connections.md)
+for measured results and remaining hardware coverage.
+
+## Android setup screen and USB methods
+
+The companion works as a setup and diagnostics app without a running PC: it shows
+panel information and its device ID, explains connection setup, offers a retry
+button, and has an offline color/grid/touch check. Android Back opens this screen
+while streaming; Return to desktop resumes viewing. The screen stays awake during
+streaming, and can sleep while waiting. Camera use requests Android camera consent.
+
+Choose **USB Connection** in the PC menu (available even while disconnected):
+
+- **Automatic** prefers an authorized ADB device and falls back to accessory mode
+  when no authorized ADB device is available. It does not change the transport
+  underneath a working stream.
+- **ADB** retains APK install/upgrade, activity launch and fresh-session automation.
+  Enable USB debugging and accept Android's debugging authorization.
+- **USB accessory (AOA)** uses libusb and Android's accessory API without requiring
+  USB debugging. Install the companion first, select accessory mode on the PC,
+  then connect a data cable. Android offers Allow/Deny; allowing opens the stream.
+  Consent remains valid for host session rebuilds during that cable attachment.
+  Denial leaves the app's setup screen available; Retry asks again. Google AOA
+  bulk endpoints carry the same framed video, touch, cursor, camera and telemetry.
+
+For Ubuntu accessory permissions, run `./scripts/setup.sh --accessory` once
+(`--check --accessory` previews what is missing). This adds narrow `uaccess` rules
+for Google's accessory VID/PIDs and Ubuntu's Android USB permission package.
+Reconnect the cable after setup. Other distributions also need user access to the
+Android device before it switches into accessory mode. ExtraSpace reports USB
+permission failures; running the desktop app as root is unnecessary. Only one
+AOA-capable tablet may be attached when initiating accessory mode.
+
+The Android connection selector can restrict the companion to either method;
+leave both ends on Automatic unless you want to force one. AOA support varies by
+device/vendor and cable. Its single bulk link shares bandwidth between channels;
+ADB retains separate channels. USB accessory permission and APK installation
+remain Android/system operations, following the
+[Android accessory API](https://developer.android.com/develop/connectivity/usb/accessory)
+and [AOA negotiation protocol](https://source.android.com/docs/core/interaction/accessories/aoa).
+
+### Experimental device processing
+
+The companion's **Experimental device frame selection** switch is off by default.
+When multiple decoded outputs are ready, Android discards older outputs and
+presents the newest, without dropping H.264 reference inputs. Drops are reported
+through existing telemetry. This can help a busy tablet catch up but may increase
+visible frame skips; compare on your hardware. Hardware decoding, upscaling and
+cursor composition already happen on Android. Desktop capture and H.264 encoding
+remain on the PC: sending raw pixels to encode on Android would consume much more
+USB bandwidth. This experiment is not an encoding-offload mode.
+
 ## Troubleshooting
 
 **"No tablet found"** — check `adb devices`. If it is empty, the cable may be
@@ -536,6 +627,7 @@ python3 scripts/tests/test_install.py               # isolated installer/setup c
 dbus-run-session -- /usr/bin/python3 scripts/tests/test_tray.py ./target/release/extraspace # GUI tray lifecycle
 cargo run --release -p xs-core --example device_cycle -- 3 10  # real-device cycles
 XS_TEST_LOSS=1 cargo run --release -p xs-core --example device_cycle -- 2 20
+cargo run -p xs-core --example usb_reconnect -- adb  # real tablet, two reconnects
 cd android && ./gradlew assembleRelease lintRelease # companion build + lint
 ```
 

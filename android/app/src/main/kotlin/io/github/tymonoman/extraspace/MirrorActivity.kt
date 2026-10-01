@@ -5,6 +5,19 @@ import android.graphics.SurfaceTexture
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.Manifest
+import android.widget.Button
+import android.widget.Spinner
+import android.widget.ArrayAdapter
+import android.widget.AdapterView
+import android.widget.Switch
+import android.app.AlertDialog
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.addCallback
+import androidx.core.content.ContextCompat
 import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
@@ -37,6 +50,18 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
     private var decoderSurface: Surface? = null
     private var connection: ConnectionManager? = null
     private var camera: CameraSource? = null
+    private lateinit var lobby: View
+    private lateinit var accessories: AccessoryController
+    private val preferences by lazy { getSharedPreferences("companion", MODE_PRIVATE) }
+    private var pendingAccessory: ParcelFileDescriptor? = null
+    private var accessoryConnected = false
+    private var destroyed = false
+    private var waitingCamera: (() -> Unit)? = null
+    private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
+        val start = waitingCamera; waitingCamera = null
+        if (allowed) start?.invoke()
+        else showStatus("Camera access denied. Enable it in Android app permissions, then toggle Tablet Camera on the PC.")
+    }
     private val main = Handler(Looper.getMainLooper())
 
     /** Dimensions of the incoming stream; touches are mapped into this space. */
@@ -64,11 +89,26 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         DeviceInfo.load(this)
 
         // A second monitor that sleeps is not a second monitor.
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Keep awake only while streaming; the setup screen can sleep.
         goFullscreen()
 
         setContentView(R.layout.activity_mirror)
         statusView = findViewById(R.id.status)
+        lobby = findViewById(R.id.lobby)
+        setupLobby()
+        accessories = AccessoryController(this,
+            enabled = { preferences.getString("transport", "auto") != "adb"
+                && intent.getStringExtra("connection_transport") != "adb" },
+            status = { showStatus(it) },
+            ready = { fd ->
+                resetConnection()
+                pendingAccessory = fd
+                accessoryConnected = true
+                startConnection()
+            },
+            detached = { resetConnection(); accessories.reset(); startConnection() })
+        onBackPressedDispatcher.addCallback(this) { showLobby() }
+        main.post { accessories.check() }
         val original = findViewById<SurfaceView>(R.id.surface)
         // Retain a diagnostic fallback for devices with broken surface composition.
         if (intent.getBooleanExtra("texture_output", false)) {
@@ -119,7 +159,8 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         stopDecoder()
         decoderSurface = surface
         ownsDecoderSurface = ownsSurface
-        decoder = VideoDecoder(surface, intent.getBooleanExtra("latency_trace", false))
+        decoder = VideoDecoder(surface, intent.getBooleanExtra("latency_trace", false),
+            preferences.getBoolean("device_processing", false))
         if (streamWidth > 0 && streamHeight > 0) {
             decoder?.start(streamWidth, streamHeight, null)
             requestFrameRate()
@@ -147,11 +188,90 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         ownsDecoderSurface = false
     }
 
+    private fun setupLobby() {
+        findViewById<TextView>(R.id.device_details).text =
+            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · ${DeviceInfo.width}×${DeviceInfo.height} · ${DeviceInfo.refreshRate.toInt()} Hz\nDevice ID: ${DeviceInfo.deviceId}"
+        val spinner = findViewById<Spinner>(R.id.connection_method)
+        spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
+            listOf("Automatic", "ADB (USB debugging)", "USB accessory (AOA)"))
+        val modes = listOf("auto", "adb", "accessory")
+        spinner.setSelection(modes.indexOf(preferences.getString("transport", "auto")).coerceAtLeast(0))
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val mode = modes[position]
+                if (mode == preferences.getString("transport", "auto")) return
+                intent.removeExtra("connection_transport")
+                preferences.edit().putString("transport", mode).apply()
+                retryConnection()
+            }
+        }
+        findViewById<Switch>(R.id.device_processing).apply {
+            isChecked = preferences.getBoolean("device_processing", false)
+            setOnCheckedChangeListener { _, enabled ->
+                preferences.edit().putBoolean("device_processing", enabled).apply()
+                decoder?.selectNewestFrame = enabled
+            }
+        }
+        findViewById<Button>(R.id.retry).setOnClickListener { retryConnection() }
+        findViewById<Button>(R.id.resume).setOnClickListener { lobby.visibility = View.GONE }
+        findViewById<Button>(R.id.display_test).setOnClickListener {
+            AlertDialog.Builder(this).setTitle("Display / touch check")
+                .setView(DisplayCheckView(this)).setPositiveButton("Close", null)
+                .create().also { dialog ->
+                    dialog.show()
+                    dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT,
+                        WindowManager.LayoutParams.MATCH_PARENT)
+                }
+        }
+    }
+    private fun showLobby() {
+        lobby.visibility = View.VISIBLE
+        findViewById<Button>(R.id.resume).visibility = if (streamWidth > 0) View.VISIBLE else View.GONE
+    }
+    private fun resetConnection() {
+        main.removeCallbacks(reconnect)
+        main.removeCallbacks(statsTicker)
+        connection?.close(); connection = null
+        pendingAccessory?.close(); pendingAccessory = null
+        camera?.stop(); camera = null; waitingCamera = null
+        decoder?.stop()
+        streamWidth = 0; streamHeight = 0
+        accessoryConnected = false
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (::cursorOverlay.isInitialized) cursorOverlay.hide()
+        showLobby()
+    }
+    private val reconnect = Runnable {
+        if (!destroyed) { resetConnection(); accessories.reset(); startConnection(); accessories.check() }
+    }
+    private fun retryConnection() {
+        resetConnection()
+        accessories.reset()
+        startConnection()
+        accessories.check()
+    }
     private fun startConnection() {
-        if (connection != null) return
+        if (connection != null || decoderSurface == null || destroyed) return
+        val fd = pendingAccessory
+        pendingAccessory = null
+        if (fd == null && preferences.getString("transport", "auto") == "accessory") {
+            showStatus(getString(R.string.accessory_waiting))
+            return
+        }
         showStatus(getString(R.string.waiting_for_host))
-        connection = ConnectionManager(this).also { it.start() }
-        main.postDelayed(statsTicker, STATS_INTERVAL_MS)
+        runCatching { ConnectionManager(this, fd).also { it.start() } }
+            .onSuccess { connection = it }
+            .onFailure { fd?.close(); showStatus(it.message ?: "Unable to listen for the computer") }
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        accessories.check()
+    }
+    override fun onResume() {
+        super.onResume()
+        if (::accessories.isInitialized) accessories.check()
     }
 
     private fun goFullscreen() {
@@ -167,6 +287,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         main.post {
             statusView.text = text ?: ""
             statusView.visibility = if (text == null) View.GONE else View.VISIBLE
+            if (text != null) showLobby()
         }
     }
 
@@ -183,6 +304,12 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
             requestFrameRate()
             cursorOverlay.setStreamSize(width, height)
             decoder?.start(width, height, null)
+            main.removeCallbacks(statsTicker)
+            main.postDelayed(statsTicker, STATS_INTERVAL_MS)
+            statusView.text = "Streaming ${width}×${height} at $framerate fps over ${if (accessoryConnected) "USB accessory" else "ADB"}"
+            statusView.visibility = View.VISIBLE
+            lobby.visibility = View.GONE
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             Log.i(TAG, "stream configured ${width}x$height @$framerate")
         }
     }
@@ -193,21 +320,22 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         if (decoder == null) return
         if (streamWidth == 0) return
         decoder?.decode(data, length, ptsUs, isConfig)
-        if (statusView.visibility == View.VISIBLE) showStatus(null)
+
     }
 
     override fun onCameraControl(
         enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int,
     ) {
         main.post {
-            camera?.stop()
-            camera = if (enabled) {
-                CameraSource(this) { data, length, ptsUs, isConfig, isKey ->
+            camera?.stop(); camera = null; waitingCamera = null
+            if (!enabled) return@post
+            val start = {
+                camera = CameraSource(this) { data, length, ptsUs, isConfig, isKey ->
                     connection?.sendCameraFrame(data, length, ptsUs, isConfig, isKey)
                 }.also { it.start(cameraId, width, height, framerate, bitrateKbps) }
-            } else {
-                null
             }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) start()
+            else { waitingCamera = start; cameraPermission.launch(Manifest.permission.CAMERA) }
         }
     }
 
@@ -216,18 +344,26 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
     }
 
     override fun onConnected() {
-        showStatus(null)
+        showStatus("Connected. Waiting for the desktop stream…")
     }
 
     override fun onDisconnected(reason: String) {
         Log.w(TAG, "disconnected: $reason")
-        cursorOverlay.hide()
-        showStatus(getString(R.string.disconnected, reason))
+        main.post {
+            if (destroyed) return@post
+            val wasAccessory = accessoryConnected
+            resetConnection()
+            if (!wasAccessory) intent.removeExtra("connection_transport")
+            showStatus(getString(R.string.disconnected, reason))
+            // Existing accessory consent survives host restarts until the cable is detached.
+            main.postDelayed(reconnect, 1500)
+        }
     }
 
     // --------------------------------------------------------------- touch
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (lobby.visibility == View.VISIBLE) return super.onTouchEvent(event)
         val conn = connection ?: return false
         if (streamWidth == 0 || streamHeight == 0) return false
 
@@ -284,7 +420,11 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        main.removeCallbacks(reconnect)
         main.removeCallbacks(statsTicker)
+        accessories.close()
+        pendingAccessory?.close()
         camera?.stop()
         connection?.close()
         stopDecoder()

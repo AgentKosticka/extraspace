@@ -96,6 +96,26 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     encoding
         .connect_activate(move |_, _| crate::encoding::present(&parent, &video_engine, &settings));
     app.add_action(&encoding);
+    let usb_action = gtk::gio::SimpleAction::new("usb-connection", None);
+    let parent = window.clone();
+    let settings = config.clone();
+    let usb_engine = engine.clone();
+    usb_action.connect_activate(move |_, _| {
+        let dialog = adw::PreferencesDialog::builder().title("USB Connection").build();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::builder()
+            .description("ADB installs and refreshes the app automatically. Accessory uses Android’s Allow/Deny prompt and needs the app installed first.") .build();
+        let row = adw::ComboRow::builder().title("Connection method")
+            .model(&gtk::StringList::new(&["Automatic", "ADB", "USB accessory (AOA)"])).build();
+        row.set_selected(match settings.borrow().transport { xs_core::TransportMode::Auto => 0, xs_core::TransportMode::Adb => 1, xs_core::TransportMode::Accessory => 2 });
+        let settings = settings.clone(); let engine = usb_engine.clone();
+        row.connect_selected_notify(move |r| {
+            let mode = match r.selected() { 1 => xs_core::TransportMode::Adb, 2 => xs_core::TransportMode::Accessory, _ => xs_core::TransportMode::Auto };
+            settings.borrow_mut().transport = mode; settings.borrow().save(); engine.send(Command::SetTransport(mode));
+        });
+        group.add(&row); page.add(&group); dialog.add(&page); dialog.present(Some(&parent));
+    });
+    app.add_action(&usb_action);
     wire_controls(&widgets, &engine, &config);
     listen_to_engine(&widgets, &engine, &config);
 
@@ -244,7 +264,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
     let scale_labels: Vec<String> = SCALE_OPTIONS.iter().map(|s| format!("{s}×")).collect();
     let scale_refs: Vec<&str> = scale_labels.iter().map(String::as_str).collect();
     let scale_row = adw::ComboRow::builder()
-        .title("Scale")
+        .title("Render Scale")
         .subtitle("GNOME UI scale on native panel pixels")
         .model(&gtk::StringList::new(&scale_refs))
         .build();
@@ -329,6 +349,7 @@ fn gio_menu() -> gtk::gio::Menu {
         Some("app.keep-running-in-tray"),
     );
     menu.append(Some("_Hide Window"), Some("app.hide-window"));
+    menu.append(Some("_USB Connection"), Some("app.usb-connection"));
     menu.append(Some("_Video Encoding"), Some("app.video-encoding"));
     menu.append(Some("_About Extraspace"), Some("app.about"));
     menu.append(Some("_Quit"), Some("app.quit"));
@@ -412,7 +433,17 @@ fn wire_actions(
     let quitting = quitting.clone();
     quit.connect_activate(move |_, _| {
         quitting.set(true);
-        window.close();
+        // Adwaita routes a parent close to its open dialog. Close that first
+        // so Quit reaches our session teardown rather than merely hiding a sheet.
+        let dialogs = window.dialogs();
+        let open: Vec<_> = (0..dialogs.n_items())
+            .filter_map(|i| dialogs.item(i).and_downcast::<adw::Dialog>())
+            .collect();
+        for dialog in open {
+            dialog.force_close();
+        }
+        let window = window.clone();
+        glib::idle_add_local_once(move || window.close());
     });
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &["<primary>q"]);
@@ -456,6 +487,9 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
         let config = Rc::clone(config);
         let widgets_ref = Rc::clone(widgets);
         widgets.scale_row.connect_selected_notify(move |row| {
+            if widgets_ref.updating_display.get() {
+                return;
+            }
             let Some(&scale) = SCALE_OPTIONS.get(row.selected() as usize) else {
                 return;
             };
@@ -469,7 +503,11 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
     {
         let engine = engine.clone();
         let config = Rc::clone(config);
+        let widgets_ref = Rc::clone(widgets);
         widgets.mode_row.connect_selected_notify(move |row| {
+            if widgets_ref.updating_display.get() {
+                return;
+            }
             let mode = if row.selected() == 1 {
                 DisplayMode::Mirror
             } else {
@@ -489,7 +527,11 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
     {
         let engine = engine.clone();
         let config = Rc::clone(config);
+        let widgets_ref = Rc::clone(widgets);
         widgets.camera_switch.connect_active_notify(move |row| {
+            if widgets_ref.updating_display.get() {
+                return;
+            }
             let enabled = row.is_active();
             let camera_id = {
                 let mut c = config.borrow_mut();
@@ -513,6 +555,8 @@ fn update_scale_subtitle(widgets: &Rc<Widgets>, config: &Rc<RefCell<Config>>) {
     let scale = config.borrow().scale;
     let description = if xs_core::modes_enabled() {
         "GNOME scale on panel pixels"
+    } else if (scale - 1.0).abs() < f64::EPSILON {
+        "native panel pixels; set UI size in Ubuntu Displays"
     } else {
         "smaller framebuffer, upscaled on the tablet"
     };
@@ -530,6 +574,33 @@ fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<Re
         loop {
             match events.recv().await {
                 Ok(Event::State(state)) => apply_state(&widgets, &state, &config),
+                Ok(Event::DeviceSettings(s)) => {
+                    {
+                        let mut c = config.borrow_mut();
+                        c.scale = s.scale;
+                        c.mode = if s.mode == DisplayMode::Mirror {
+                            "mirror"
+                        } else {
+                            "extend"
+                        }
+                        .into();
+                        c.mirror_source = s.mirror_source;
+                        c.framerate = s.framerate;
+                        c.encoder = s.encoder;
+                        c.camera_enabled = s.camera_enabled;
+                        c.camera_id = s.camera_id;
+                        c.min_bitrate_kbps = s.bounds.min_kbps;
+                        c.max_bitrate_kbps = s.bounds.max_kbps;
+                    }
+                    widgets.updating_display.set(true);
+                    widgets.scale_row.set_selected(scale_index(s.scale));
+                    widgets
+                        .mode_row
+                        .set_selected(if s.mode == DisplayMode::Mirror { 1 } else { 0 });
+                    widgets.camera_switch.set_active(s.camera_enabled);
+                    widgets.updating_display.set(false);
+                    update_scale_subtitle(&widgets, &config);
+                }
                 Ok(Event::Stats(stats)) => apply_stats(&widgets, &stats),
                 Ok(Event::Warning(message)) => {
                     widgets.toasts.add_toast(adw::Toast::new(&message));
@@ -583,9 +654,11 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>
             show_status(
                 "phone-disconnected-symbolic",
                 "No tablet found",
-                "Connect your tablet over USB, then enable USB debugging:\n\n\
-                 1.  Settings → About tablet → tap “Build number” seven times\n\
-                 2.  Settings → System → Developer options → USB debugging",
+                if config.borrow().transport == xs_core::TransportMode::Accessory {
+                    "Connect an AOA-compatible tablet over USB with the companion installed. Unlock it and tap Allow. USB debugging is optional."
+                } else {
+                    "Connect your tablet with a data cable. For ADB, enable USB debugging and accept Android’s authorization prompt. For AOA, choose USB accessory in the USB Connection menu and tap Allow on the tablet."
+                },
                 Some("Check Again"),
             );
         }

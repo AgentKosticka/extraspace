@@ -17,6 +17,21 @@ use tracing::{debug, info, warn};
 use xs_proto::ports;
 
 pub mod adb;
+mod aoa;
+
+/// Automatic prefers ADB, then tries USB accessory mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    #[default]
+    Auto,
+    Adb,
+    Accessory,
+}
+
+pub trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Stream for T {}
+pub type TransportStream = Box<dyn Stream>;
 pub mod frame;
 
 pub use adb::{Adb, Device, DeviceState};
@@ -40,6 +55,9 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("USB accessory: {0}")]
+    Accessory(String),
+
     #[error(transparent)]
     Adb(#[from] adb::Error),
 
@@ -65,11 +83,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A connected tablet with all three channels established.
 pub struct Transport {
     pub device: Device,
-    pub control: TcpStream,
-    pub video: TcpStream,
-    pub camera: TcpStream,
+    pub control: TransportStream,
+    pub video: TransportStream,
+    pub camera: TransportStream,
     adb: Adb,
     simulated: bool,
+    accessory: Option<std::sync::Arc<aoa::AccessoryHandle>>,
 }
 
 /// The teardown half of a [`Transport`], kept after the sockets are handed out.
@@ -82,11 +101,38 @@ pub struct TransportHandle {
     adb: Adb,
     /// True for the fake-tablet path, where there is nothing for adb to undo.
     simulated: bool,
+    accessory: Option<std::sync::Arc<aoa::AccessoryHandle>>,
+}
+
+/// Undo forwards/USB ownership if setup is cancelled while awaiting user consent.
+pub struct PendingConnection(Option<TransportHandle>);
+impl PendingConnection {
+    pub fn new(handle: TransportHandle) -> Self {
+        Self(Some(handle))
+    }
+    pub fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    handle.disconnect().await;
+                });
+            }
+        }
+    }
 }
 
 impl TransportHandle {
-    /// Removes the port forwards and stops the companion app.
+    /// Removes forwards or closes accessory streaming; Android returns to setup.
     pub async fn disconnect(&self) {
+        if let Some(accessory) = &self.accessory {
+            accessory.disconnect().await;
+            return;
+        }
         if self.simulated {
             debug!("simulated transport: nothing to tear down");
             return;
@@ -94,8 +140,7 @@ impl TransportHandle {
         for port in [ports::CONTROL, ports::VIDEO, ports::CAMERA] {
             self.adb.remove_forward(&self.device.serial, port).await;
         }
-        self.adb.force_stop(&self.device.serial, PACKAGE).await;
-        debug!("transport torn down");
+        debug!("transport torn down; companion remains available for setup");
     }
 }
 
@@ -118,6 +163,41 @@ impl Transport {
     /// `apk` is optional -- when present and newer than what is installed, it is
     /// pushed automatically so the app and host can never drift out of sync.
     pub async fn connect(apk: Option<&Path>, apk_version: u32) -> Result<Self> {
+        Self::connect_with_mode(apk, apk_version, TransportMode::Auto).await
+    }
+    pub async fn connect_with_mode(
+        apk: Option<&Path>,
+        apk_version: u32,
+        mode: TransportMode,
+    ) -> Result<Self> {
+        if fake_tablet_requested() {
+            return Self::connect_fake().await;
+        }
+        if mode == TransportMode::Accessory {
+            return aoa::connect().await;
+        }
+        match Self::connect_adb(apk, apk_version).await {
+            Ok(t) => Ok(t),
+            Err(e)
+                if mode == TransportMode::Auto
+                    && matches!(
+                        &e,
+                        Error::Adb(
+                            adb::Error::NoDevice
+                                | adb::Error::Unauthorized(_)
+                                | adb::Error::AdbNotFound
+                        )
+                    ) =>
+            {
+                match aoa::connect().await {
+                    Err(Error::Adb(adb::Error::NoDevice)) => Err(e),
+                    result => result,
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+    async fn connect_adb(apk: Option<&Path>, apk_version: u32) -> Result<Self> {
         if fake_tablet_requested() {
             return Self::connect_fake().await;
         }
@@ -144,7 +224,9 @@ impl Transport {
             device: device.clone(),
             adb: adb.clone(),
             simulated: false,
+            accessory: None,
         };
+        let mut guard = PendingConnection::new(cleanup.clone());
         let result = async {
             // Forward first: the app needs somewhere to be reached even though it is
             // the one listening.
@@ -169,17 +251,19 @@ impl Transport {
 
             Ok(Self {
                 device,
-                control,
-                video,
-                camera,
+                control: Box::new(control),
+                video: Box::new(video),
+                camera: Box::new(camera),
                 adb,
                 simulated: false,
+                accessory: None,
             })
         }
         .await;
         if result.is_err() {
             cleanup.disconnect().await;
         }
+        guard.disarm();
         result
     }
 
@@ -198,12 +282,17 @@ impl Transport {
                 state: DeviceState::Ready,
                 model: Some("Simulated_Tablet".into()),
             },
-            control,
-            video,
-            camera,
+            control: Box::new(control),
+            video: Box::new(video),
+            camera: Box::new(camera),
             adb: Adb::find().unwrap_or_else(|_| Adb::none()),
             simulated: true,
+            accessory: None,
         })
+    }
+
+    pub fn is_accessory(&self) -> bool {
+        self.accessory.is_some()
     }
 
     /// A cleanup handle usable if host setup fails after transport connection.
@@ -212,17 +301,26 @@ impl Transport {
             device: self.device.clone(),
             adb: self.adb.clone(),
             simulated: self.simulated,
+            accessory: self.accessory.clone(),
         }
     }
 
     /// Splits into a teardown handle and the three sockets, so each can be moved
     /// into its own task.
-    pub fn split(self) -> (TransportHandle, TcpStream, TcpStream, TcpStream) {
+    pub fn split(
+        self,
+    ) -> (
+        TransportHandle,
+        TransportStream,
+        TransportStream,
+        TransportStream,
+    ) {
         (
             TransportHandle {
                 device: self.device,
                 adb: self.adb,
                 simulated: self.simulated,
+                accessory: self.accessory.clone(),
             },
             self.control,
             self.video,
@@ -232,11 +330,7 @@ impl Transport {
 
     /// Removes the port forwards. Called on teardown; failures are logged only.
     pub async fn disconnect(&self) {
-        for port in [ports::CONTROL, ports::VIDEO, ports::CAMERA] {
-            self.adb.remove_forward(&self.device.serial, port).await;
-        }
-        self.adb.force_stop(&self.device.serial, PACKAGE).await;
-        debug!("transport torn down");
+        self.teardown_handle().disconnect().await;
     }
 }
 

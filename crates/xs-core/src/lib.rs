@@ -13,7 +13,10 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, warn};
 
 pub mod adaptive;
+mod device_settings;
 mod session;
+pub use device_settings::DeviceSettings;
+pub use xs_transport::TransportMode;
 
 pub use xs_video::{available_encoders, EncoderOption, EncoderSelection, EncodingMode};
 
@@ -35,6 +38,7 @@ pub enum Command {
     Disconnect,
     /// Rebuild the virtual monitor with a different UI scale.
     SetScale(f64),
+    SetTransport(TransportMode),
     /// Switch between extending and mirroring.
     SetMode(DisplayMode),
     /// Apply an encoder policy; rebuild an active session safely.
@@ -42,7 +46,10 @@ pub enum Command {
     /// Change the quality envelope the adaptive controller works within.
     SetBitrateBounds(BitrateBounds),
     /// Start or stop camera passthrough.
-    SetCamera { enabled: bool, camera_id: String },
+    SetCamera {
+        enabled: bool,
+        camera_id: String,
+    },
     /// Shut the engine thread down.
     Shutdown,
 }
@@ -89,6 +96,8 @@ pub struct Stats {
 pub enum Event {
     State(State),
     Stats(Stats),
+    /// Settings selected by the connected installation UUID.
+    DeviceSettings(DeviceSettings),
     /// Non-fatal; shown as a toast rather than replacing the whole view.
     Warning(String),
 }

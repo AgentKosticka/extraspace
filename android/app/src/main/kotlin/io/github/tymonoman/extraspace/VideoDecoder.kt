@@ -22,7 +22,8 @@ import kotlin.concurrent.thread
  * as possible and report its depth back to the host, which lowers bitrate when it
  * starts to grow.
  */
-class VideoDecoder(private val surface: Surface, private val traceLatency: Boolean = false) {
+class VideoDecoder(private val surface: Surface, private val traceLatency: Boolean = false,
+    @Volatile var selectNewestFrame: Boolean = false) {
     @Volatile private var codec: MediaCodec? = null
     @Volatile private var running = false
     private var drainThread: Thread? = null
@@ -164,18 +165,25 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
             try {
                 when (val index = mc.dequeueOutputBuffer(info, DRAIN_TIMEOUT_US)) {
                     in 0..Int.MAX_VALUE -> {
-                        // Present now on the device clock. A zero timestamp is
-                        // outside SurfaceView's scheduling window and disables
-                        // its ability to discard superseded frames at a VSYNC.
-                        if (traceLatency) {
-                            Log.i(TAG, "latency stage=decoded local_pts_us=${info.presentationTimeUs} decode_us=${System.nanoTime() / 1000 - info.presentationTimeUs}")
+                        var newestIndex = index
+                        var newestInfo = MediaCodec.BufferInfo().apply {
+                            set(info.offset, info.size, info.presentationTimeUs, info.flags)
                         }
-                        mc.releaseOutputBuffer(index, System.nanoTime())
-                        if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                            pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
-                            framesDecoded.incrementAndGet()
+                        // Drop only decoded outputs, preserving all H.264 reference inputs.
+                        // A bounded drain avoids starving presentation on fast producers.
+                        if (selectNewestFrame) {
+                            var inspected = 0
+                            while (inspected++ < 8 && running) {
+                                val nextInfo = MediaCodec.BufferInfo()
+                                val next = mc.dequeueOutputBuffer(nextInfo, 0)
+                                if (next == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue
+                                if (next < 0) break
+                                releaseDecoded(mc, newestIndex, newestInfo, false)
+                                newestIndex = next
+                                newestInfo = nextInfo
+                            }
                         }
-                        outputPace.observe("pts_us=${info.presentationTimeUs} size=${info.size}")
+                        releaseDecoded(mc, newestIndex, newestInfo, true)
                     }
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
                         Log.i(TAG, "output format now ${mc.outputFormat}")
@@ -186,6 +194,19 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
                 break
             }
         }
+    }
+
+    private fun releaseDecoded(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo, render: Boolean) {
+        if (traceLatency) {
+            Log.i(TAG, "latency stage=decoded local_pts_us=${info.presentationTimeUs} decode_us=${System.nanoTime() / 1000 - info.presentationTimeUs} render=$render")
+        }
+        if (render) mc.releaseOutputBuffer(index, System.nanoTime())
+        else { mc.releaseOutputBuffer(index, false); submittedPts.remove(info.presentationTimeUs) }
+        if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+            pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
+            if (render) framesDecoded.incrementAndGet() else framesDropped.incrementAndGet()
+        }
+        outputPace.observe("pts_us=${info.presentationTimeUs} size=${info.size}")
     }
 
     @Synchronized
@@ -206,8 +227,9 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
         const val TAG = "extraspace"
         const val INPUT_TIMEOUT_US = 10_000L
 
-        /// Long enough that an idle desktop does not spin the CPU, short enough
-        /// that shutdown is not noticeably delayed waiting for this to return.
-        const val DRAIN_TIMEOUT_US = 20_000L
+        // This is a maximum wait, not a presentation delay: the codec wakes the
+        // call as soon as an output is ready. An idle desktop needs only four
+        // timeout wakeups per second; stop() still joins within its 500 ms budget.
+        const val DRAIN_TIMEOUT_US = 250_000L
     }
 }

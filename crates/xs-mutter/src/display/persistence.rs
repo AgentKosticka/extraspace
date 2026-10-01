@@ -1,7 +1,7 @@
 //! Keep layout identity independent of Mutter's per-process virtual serials.
 //!
-//! On stock Mutter we restore positions only, after capture has produced a frame.
-//! Modes, scales, transforms and enabled outputs must match the saved profile.
+//! Restore placement and the tablet logical scale after capture produces a frame.
+//! Physical modes, scales, transforms and enabled outputs must match the profile.
 //! This avoids unconfigured CRTCs / missing stage views during live capture.
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -71,13 +71,19 @@ fn profile(device: &str, state: &CurrentState) -> Option<Profile> {
     })
 }
 
+fn is_virtual_identity(spec: &MonitorSpec) -> bool {
+    spec.0 == "@extraspace"
+}
+
 fn same_geometry(a: &Profile, b: &Profile) -> bool {
     a.device == b.device
         && a.layout_mode == b.layout_mode
         && a.modes == b.modes
         && a.placements.len() == b.placements.len()
         && a.placements.iter().zip(&b.placements).all(|(a, b)| {
-            a.members == b.members && a.scale == b.scale && a.transform == b.transform
+            a.members == b.members
+                && (a.members.iter().all(is_virtual_identity) || a.scale == b.scale)
+                && a.transform == b.transform
         })
 }
 
@@ -160,8 +166,22 @@ pub(crate) async fn restore(conn: &Connection, device: &str) -> Result<()> {
         let Some(placement) = saved.placements.iter().find(|p| p.members == identities) else {
             return Ok(());
         };
-        // Redundant with same_geometry, deliberately fail closed at the write boundary.
-        if *scale != placement.scale || *transform != placement.transform {
+        if *transform != placement.transform {
+            return Ok(());
+        }
+        if identities.iter().all(is_virtual_identity) {
+            let connector = &members[0].0;
+            let mode_id = &members[0].1;
+            let mode = layout
+                .monitors
+                .iter()
+                .find(|(s, ..)| &s.0 == connector)
+                .and_then(|(_, modes, _)| modes.iter().find(|m| &m.0 == mode_id));
+            if !mode.is_some_and(|m| supported_scale(m, placement.scale)) {
+                return Ok(());
+            }
+            *scale = placement.scale;
+        } else if *scale != placement.scale {
             return Ok(());
         }
         *x = placement.x;
@@ -181,8 +201,45 @@ pub(crate) async fn restore(conn: &Connection, device: &str) -> Result<()> {
         ),
     )
     .await?;
-    info!("restored tablet placement without changing modes, scales or transforms");
+    info!("restored tablet placement and GNOME scale");
     Ok(())
+}
+
+fn supported_scale(mode: &Mode, scale: f64) -> bool {
+    scale.is_finite() && scale >= 1.0 && mode.5.iter().any(|s| (*s - scale).abs() < 0.0001)
+}
+
+/// Adopt a legacy ADB serial profile once; UUID profiles always win.
+pub(crate) fn migrate(old: &str, new: &str) -> Result<()> {
+    if old == new {
+        return Ok(());
+    }
+    let Some(path) = path() else {
+        return Ok(());
+    };
+    let mut profiles = load(&path)?;
+    if profiles.iter().any(|p| p.device == new) {
+        return Ok(());
+    }
+    let adopted: Vec<_> = profiles
+        .iter()
+        .filter(|p| p.device == old)
+        .cloned()
+        .map(|mut p| {
+            p.device = new.into();
+            p
+        })
+        .collect();
+    if adopted.is_empty() {
+        return Ok(());
+    }
+    profiles.extend(adopted);
+    let text =
+        serde_json::to_string_pretty(&profiles).map_err(|e| Error::DisplayLayout(e.to_string()))?;
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&temp, text)
+        .and_then(|_| std::fs::rename(temp, path))
+        .map_err(|e| Error::DisplayLayout(e.to_string()))
 }
 
 #[cfg(test)]
@@ -212,6 +269,21 @@ mod tests {
         profile("test-tablet", &(1, monitors, logical, HashMap::new())).unwrap()
     }
     #[test]
+    fn restore_only_accepts_scales_advertised_by_the_current_mode() {
+        let m = (
+            "mode".into(),
+            1920,
+            1200,
+            60.0,
+            1.0,
+            vec![1.0, 1.5, 2.0],
+            HashMap::new(),
+        );
+        assert!(supported_scale(&m, 1.5));
+        assert!(!supported_scale(&m, 1.75));
+        assert!(!supported_scale(&m, f64::NAN));
+    }
+    #[test]
     fn compositor_serial_changes_do_not_lose_identity() {
         assert_eq!(
             sample("0x000001", "1920x1080"),
@@ -225,7 +297,9 @@ mod tests {
         b.placements[0].x = 300;
         assert!(same_geometry(&a, &b));
         b.placements[0].scale = 1.5;
-        assert!(!same_geometry(&a, &b));
+        assert!(same_geometry(&a, &b)); // virtual scale is restored
+        b.placements[1].scale = 1.5;
+        assert!(!same_geometry(&a, &b)); // physical scale must still match
         b = a.clone();
         b.placements[0].transform = 1;
         assert!(!same_geometry(&a, &b));

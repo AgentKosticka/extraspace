@@ -326,7 +326,7 @@ impl CursorHub {
                 .field("drm-format", drm_format)
                 .field("width", width as i32)
                 .field("height", height as i32)
-                .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
+                .field("framerate", gst::Fraction::new(0, 1))
                 .field("colorimetry", "sRGB")
                 .build();
             if let Some(appsrc) = self.appsrc.lock().expect("cursor appsrc lock").clone() {
@@ -344,7 +344,7 @@ impl CursorHub {
             .field("format", "BGRx")
             .field("width", width as i32)
             .field("height", height as i32)
-            .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
+            .field("framerate", gst::Fraction::new(0, 1))
             .field("colorimetry", "sRGB")
             .build();
         appsrc.set_caps(Some(&caps));

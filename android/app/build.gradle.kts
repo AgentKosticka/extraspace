@@ -54,6 +54,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity:1.9.3")
     implementation("androidx.appcompat:appcompat:1.7.0")

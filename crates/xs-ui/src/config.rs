@@ -16,6 +16,7 @@ use xs_core::{BitrateBounds, DisplayMode, EncoderSelection};
 pub struct Config {
     /// GNOME UI scale on the native-pixel virtual monitor. 1.0 is tiny text.
     pub scale: f64,
+    pub transport: xs_core::TransportMode,
     /// `"extend"` or `"mirror"`.
     pub mode: String,
     /// Connector to mirror, when mode is `"mirror"`.
@@ -37,6 +38,7 @@ impl Default for Config {
         Self {
             // 1x is unreadable on a 10.4" panel; 1.5x is the sweet spot.
             scale: 1.5,
+            transport: xs_core::TransportMode::default(),
             mode: "extend".into(),
             mirror_source: None,
             framerate: 60,

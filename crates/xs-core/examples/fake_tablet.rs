@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let mut control_writer = FrameWriter::new(control_tx);
 
     let hello = Hello {
+        device_id: Some("15bb50c4-82d8-4628-8f06-16c6a871da11".into()),
         protocol_version: xs_proto::PROTOCOL_VERSION,
         device_name: "Simulated T Tablet".into(),
         android_release: "15".into(),

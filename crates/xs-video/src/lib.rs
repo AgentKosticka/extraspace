@@ -309,7 +309,9 @@ impl VideoPipeline {
             .field("format", "BGRx")
             .field("width", config.width as i32)
             .field("height", config.height as i32)
-            .field("framerate", gst::Fraction::new(config.framerate as i32, 1))
+            // Damage-driven capture is variable-rate and may arrive in bursts.
+            // Advertising the target here lets videorate negotiate passthrough.
+            .field("framerate", gst::Fraction::new(0, 1))
             .field("colorimetry", RGB_COLORIMETRY)
             .build();
         let overlay_src = AppSrc::builder()
@@ -329,9 +331,7 @@ impl VideoPipeline {
 
         match kind {
             PipelineKind::Full => {
-                let rate = make("videorate")?;
-                rate.set_property("drop-only", true);
-                rate.set_property("skip-to-first", true);
+                let rate = rate_limiter(config.framerate)?;
                 // Caps with no features listed match system memory only, which
                 // would reject the dma-buf frames this filter is meant to pass
                 // through untouched -- it exists to cap the rate, nothing else.
@@ -469,8 +469,7 @@ impl VideoPipeline {
                     pipeline.add_many(elems)?;
                     gst::Element::link_many(elems)?;
                 } else {
-                    let rate = make("videorate")?;
-                    rate.set_property("drop-only", true);
+                    let rate = rate_limiter(config.framerate)?;
                     rate.set_property("skip-to-first", true);
                     let rate_caps = caps_filter(
                         gst::Caps::builder("video/x-raw")
@@ -723,6 +722,17 @@ impl Drop for VideoPipeline {
     }
 }
 
+fn rate_limiter(framerate: u32) -> Result<gst::Element> {
+    gst::ElementFactory::make("videorate")
+        .property("drop-only", true)
+        .property("skip-to-first", true)
+        .property("max-rate", framerate as i32)
+        .build()
+        .map_err(|_| Error::ElementMissing {
+            element: "videorate",
+        })
+}
+
 fn validate_config(config: &VideoConfig) -> Result<()> {
     if config.width < 2
         || config.height < 2
@@ -744,6 +754,75 @@ fn validate_config(config: &VideoConfig) -> Result<()> {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+    #[test]
+    fn burst_capture_is_capped_without_creating_frames_during_idle() {
+        gst::init().unwrap();
+        for timestamps in [
+            (0..120)
+                .map(|i| i * 1_000_000_000 / 120)
+                .collect::<Vec<u64>>(),
+            vec![0, 10_000_000_000],
+        ] {
+            let pipeline = gst::Pipeline::new();
+            let source = AppSrc::builder()
+                .format(gst::Format::Time)
+                .caps(
+                    &gst::Caps::builder("video/x-raw")
+                        .field("format", "BGRx")
+                        .field("width", 16i32)
+                        .field("height", 16i32)
+                        .field("framerate", gst::Fraction::new(0, 1))
+                        .build(),
+                )
+                .build();
+            let rate = rate_limiter(60).unwrap();
+            let caps = gst::ElementFactory::make("capsfilter")
+                .property(
+                    "caps",
+                    gst::Caps::builder("video/x-raw")
+                        .field("framerate", gst::Fraction::new(60, 1))
+                        .build(),
+                )
+                .build()
+                .unwrap();
+            let sink = AppSink::builder().sync(false).wait_on_eos(false).build();
+            let elements = [source.upcast_ref(), &rate, &caps, sink.upcast_ref()];
+            pipeline.add_many(elements).unwrap();
+            gst::Element::link_many(elements).unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            for pts in &timestamps {
+                let mut buffer = gst::Buffer::with_size(16 * 16 * 4).unwrap();
+                let b = buffer.get_mut().unwrap();
+                b.set_pts(gst::ClockTime::from_nseconds(*pts));
+                b.set_duration(gst::ClockTime::from_nseconds(1_000_000_000 / 60));
+                source.push_buffer(buffer).unwrap();
+            }
+            source.end_of_stream().unwrap();
+            let done = pipeline.bus().unwrap().timed_pop_filtered(
+                gst::ClockTime::from_seconds(3),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            );
+            let count = rate.property::<u64>("out");
+            let duplicates = rate.property::<u64>("duplicate");
+            pipeline.set_state(gst::State::Null).unwrap();
+            assert!(
+                matches!(
+                    done.as_ref().map(|m| m.view()),
+                    Some(gst::MessageView::Eos(_))
+                ),
+                "{done:?}"
+            );
+            assert_eq!(duplicates, 0);
+            if timestamps.len() == 120 {
+                assert!(
+                    (59..=61).contains(&count),
+                    "passed {count} frames from a 120 fps burst"
+                );
+            } else {
+                assert_eq!(count, 2, "an idle gap must not manufacture frames");
+            }
+        }
+    }
     #[test]
     fn rejects_invalid_capture_modes_before_building_or_dividing_by_fps() {
         assert!(validate_config(&VideoConfig::default()).is_ok());

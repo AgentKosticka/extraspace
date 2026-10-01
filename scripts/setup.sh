@@ -3,11 +3,13 @@
 set -euo pipefail
 CHECK_ONLY=0
 CAMERA=0
+ACCESSORY=0
 for arg in "$@"; do
   case "$arg" in
     --check) CHECK_ONLY=1 ;;
     --camera) CAMERA=1 ;;
-    --help) echo 'Usage: setup.sh [--check] [--camera]'; exit 0 ;;
+    --accessory) ACCESSORY=1 ;;
+    --help) echo 'Usage: setup.sh [--check] [--camera] [--accessory]'; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -22,6 +24,7 @@ case "${ID:-} ${ID_LIKE:-}" in
       libclang-dev gstreamer1.0-tools gstreamer1.0-plugins-base
       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
       gstreamer1.0-plugins-ugly gstreamer1.0-pipewire adb)
+    ((ACCESSORY == 0)) || PACKAGES+=(android-sdk-platform-tools-common)
     ((CAMERA == 0)) || PACKAGES+=(v4l2loopback-dkms "linux-headers-$(uname -r)")
     ;;
   *fedora*|*rhel*)
@@ -58,9 +61,16 @@ if ((${#missing[@]})); then
 else
   echo 'Required packages are installed.'
 fi
+ACCESSORY_RULE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/packaging/70-extraspace-accessory.rules
+ACCESSORY_RULE_INSTALLED=0
+if cmp -s "$ACCESSORY_RULE" /etc/udev/rules.d/70-extraspace-accessory.rules; then ACCESSORY_RULE_INSTALLED=1; fi
+if ((ACCESSORY)); then
+  if ((ACCESSORY_RULE_INSTALLED)); then echo 'USB accessory permission rules are installed.';
+  else echo 'USB accessory permission rules need installing; reconnect the cable after setup.'; fi
+fi
 if ((CHECK_ONLY == 0)); then
   ROOT=()
-  if ((${#missing[@]})) || { ((CAMERA)) && [[ ! -e /dev/video10 ]]; }; then
+  if ((${#missing[@]})) || { ((CAMERA)) && [[ ! -e /dev/video10 ]]; } || { ((ACCESSORY && !ACCESSORY_RULE_INSTALLED)); }; then
     if ((EUID != 0)); then
       command -v sudo >/dev/null || { echo 'Install sudo or run setup as root.' >&2; exit 1; }
       if ! sudo -n true 2>/dev/null; then
@@ -77,6 +87,11 @@ if ((CHECK_ONLY == 0)); then
       # Install listed packages only; a full system upgrade belongs to the user.
       pacman) "${ROOT[@]}" pacman -S --needed --noconfirm "${missing[@]}" ;;
     esac
+  fi
+  if ((ACCESSORY && !ACCESSORY_RULE_INSTALLED)); then
+    "${ROOT[@]}" install -m 0644 "$ACCESSORY_RULE" /etc/udev/rules.d/70-extraspace-accessory.rules
+    "${ROOT[@]}" udevadm control --reload-rules
+    echo 'Reconnect the USB cable to activate accessory permissions.'
   fi
   if ((CAMERA)); then
     if [[ -e /dev/video10 ]]; then

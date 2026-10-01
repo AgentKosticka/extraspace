@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::WriteHalf;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -38,7 +38,7 @@ const PING_INTERVAL: Duration = Duration::from_millis(500);
 /// a CRTC that has no configuration yet.
 const TEARDOWN_SETTLE: Duration = Duration::from_millis(1200);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DisplayMode {
     /// A new monitor: the desktop gets bigger.
     Extend,
@@ -62,6 +62,9 @@ pub struct SessionConfig {
     pub apk_version: u32,
     pub camera_enabled: bool,
     pub camera_id: String,
+    pub transport: xs_transport::TransportMode,
+    /// Engine-selected identity, retained so failed connections can be repaired.
+    pub last_device_id: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -77,6 +80,8 @@ impl Default for SessionConfig {
             apk_version: 1,
             camera_enabled: false,
             camera_id: "0".into(),
+            transport: xs_transport::TransportMode::default(),
+            last_device_id: None,
         }
     }
 }
@@ -177,7 +182,7 @@ pub fn clamp_ui_scale(scale: f64) -> f64 {
     scale.clamp(1.0, 3.0)
 }
 
-type SharedWriter = Arc<Mutex<FrameWriter<OwnedWriteHalf>>>;
+type SharedWriter = Arc<Mutex<FrameWriter<WriteHalf<xs_transport::TransportStream>>>>;
 
 /// Everything belonging to one live connection.
 struct Active {
@@ -232,31 +237,36 @@ pub async fn run(
     emit(State::Idle);
 
     let mut wanted = false;
+    let mut pending_command = None;
     let mut poll = tokio::time::interval(Duration::from_secs(2));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let command = tokio::select! {
-            command = commands.recv() => match command { Some(c) => c, None => break },
-            _ = poll.tick() => {
-                if let Some(message) = active.as_ref().and_then(|session| session.pipeline.failure()) {
-                    if let Some(session) = active.take() { session.shutdown().await; }
-                    wanted = false;
-                    emit(State::Failed { message: format!("Video encoding failed: {message}. Choose another encoder in Video Encoding, then connect again.") });
-                    tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    continue;
+        let command = if let Some(command) = pending_command.take() {
+            command
+        } else {
+            tokio::select! {
+                command = commands.recv() => match command { Some(c) => c, None => break },
+                _ = poll.tick() => {
+                    if let Some(message) = active.as_ref().and_then(|session| session.pipeline.failure()) {
+                        if let Some(session) = active.take() { session.shutdown().await; }
+                        wanted = false;
+                        emit(State::Failed { message: format!("Video encoding failed: {message}. Choose another encoder in Video Encoding, then connect again.") });
+                        tokio::time::sleep(TEARDOWN_SETTLE).await;
+                        continue;
+                    }
+                    let lost = active.as_ref().is_some_and(|session| {
+                        session.tasks.iter().take(4).any(JoinHandle::is_finished)
+                            || monotonic_us().saturating_sub(session.last_contact_us.load(Ordering::Relaxed)) > 5_000_000
+                    });
+                    if lost {
+                        warn!("tablet connection lost; removing display and waiting for reconnect");
+                        if let Some(session) = active.take() { session.shutdown().await; }
+                        emit(State::NoTablet);
+                        tokio::time::sleep(TEARDOWN_SETTLE).await;
+                    }
+                    if let Some(session) = &active { session.mutter.remember_display_layout().await; }
+                    if wanted && active.is_none() { Command::Connect } else { continue; }
                 }
-                let lost = active.as_ref().is_some_and(|session| {
-                    session.tasks.iter().take(4).any(JoinHandle::is_finished)
-                        || monotonic_us().saturating_sub(session.last_contact_us.load(Ordering::Relaxed)) > 5_000_000
-                });
-                if lost {
-                    warn!("tablet connection lost; removing display and waiting for reconnect");
-                    if let Some(session) = active.take() { session.shutdown().await; }
-                    emit(State::NoTablet);
-                    tokio::time::sleep(TEARDOWN_SETTLE).await;
-                }
-                if let Some(session) = &active { session.mutter.remember_display_layout().await; }
-                if wanted && active.is_none() { Command::Connect } else { continue; }
             }
         };
         match command {
@@ -265,7 +275,13 @@ pub async fn run(
                 if active.is_some() {
                     continue;
                 }
-                let (session, retry) = try_connect(&config, &events).await;
+                let (session, retry) = connect_interruptible(
+                    &mut config,
+                    &events,
+                    &mut commands,
+                    &mut pending_command,
+                )
+                .await;
                 active = session;
                 if !retry {
                     wanted = false;
@@ -284,12 +300,39 @@ pub async fn run(
             // so the session is rebuilt. Never mid-stream: changing PipeWire
             // params on a live virtual node re-enters the mutter code path that
             // logs the user out.
-            Command::SetScale(scale) => {
-                config.scale = clamp_ui_scale(scale);
+            Command::SetTransport(mode) => {
+                config.transport = mode;
                 if let Some(session) = active.take() {
                     session.shutdown().await;
                     tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    let (session, retry) = try_connect(&config, &events).await;
+                }
+                if wanted {
+                    let (session, retry) = connect_interruptible(
+                        &mut config,
+                        &events,
+                        &mut commands,
+                        &mut pending_command,
+                    )
+                    .await;
+                    active = session;
+                    wanted = retry;
+                }
+            }
+            Command::SetScale(scale) => {
+                config.scale = clamp_ui_scale(scale);
+                if let Some(id) = &config.last_device_id {
+                    crate::device_settings::remember(&config, id);
+                }
+                if let Some(session) = active.take() {
+                    session.shutdown().await;
+                    tokio::time::sleep(TEARDOWN_SETTLE).await;
+                    let (session, retry) = connect_interruptible(
+                        &mut config,
+                        &events,
+                        &mut commands,
+                        &mut pending_command,
+                    )
+                    .await;
                     active = session;
                     if !retry {
                         wanted = false;
@@ -299,10 +342,19 @@ pub async fn run(
 
             Command::SetMode(mode) => {
                 config.mode = mode;
+                if let Some(id) = &config.last_device_id {
+                    crate::device_settings::remember(&config, id);
+                }
                 if let Some(session) = active.take() {
                     session.shutdown().await;
                     tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    let (session, retry) = try_connect(&config, &events).await;
+                    let (session, retry) = connect_interruptible(
+                        &mut config,
+                        &events,
+                        &mut commands,
+                        &mut pending_command,
+                    )
+                    .await;
                     active = session;
                     if !retry {
                         wanted = false;
@@ -315,10 +367,19 @@ pub async fn run(
                     continue;
                 }
                 config.encoder = selection;
+                if let Some(id) = &config.last_device_id {
+                    crate::device_settings::remember(&config, id);
+                }
                 if let Some(session) = active.take() {
                     session.shutdown().await;
                     tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    let (session, retry) = try_connect(&config, &events).await;
+                    let (session, retry) = connect_interruptible(
+                        &mut config,
+                        &events,
+                        &mut commands,
+                        &mut pending_command,
+                    )
+                    .await;
                     active = session;
                     if !retry {
                         wanted = false;
@@ -328,6 +389,9 @@ pub async fn run(
 
             Command::SetBitrateBounds(bounds) => {
                 config.bounds = bounds;
+                if let Some(id) = &config.last_device_id {
+                    crate::device_settings::remember(&config, id);
+                }
                 if let Some(session) = active.as_ref() {
                     let mut controller = session.controller.lock().await;
                     controller.set_bounds(bounds);
@@ -338,6 +402,9 @@ pub async fn run(
             Command::SetCamera { enabled, camera_id } => {
                 config.camera_enabled = enabled;
                 config.camera_id = camera_id.clone();
+                if let Some(id) = &config.last_device_id {
+                    crate::device_settings::remember(&config, id);
+                }
                 if let Some(session) = active.as_ref() {
                     if let Err(e) =
                         send_camera_control(&session.control_writer, enabled, &camera_id).await
@@ -362,9 +429,25 @@ pub async fn run(
     debug!("engine loop exited");
 }
 
+/// Cancel setup promptly when the UI disconnects, quits or changes connection method.
+async fn connect_interruptible(
+    config: &mut SessionConfig,
+    events: &broadcast::Sender<Event>,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    pending: &mut Option<Command>,
+) -> (Option<Active>, bool) {
+    tokio::select! {
+        result = try_connect(config, events) => result,
+        command = commands.recv() => {
+            *pending = Some(command.unwrap_or(Command::Shutdown));
+            (None, true)
+        }
+    }
+}
+
 /// Connects and reports the outcome, returning the session on success.
 async fn try_connect(
-    config: &SessionConfig,
+    config: &mut SessionConfig,
     events: &broadcast::Sender<Event>,
 ) -> (Option<Active>, bool) {
     match connect(config, events).await {
@@ -404,7 +487,7 @@ fn state_for_error(e: &anyhow::Error) -> State {
 }
 
 async fn connect(
-    config: &SessionConfig,
+    config: &mut SessionConfig,
     events: &broadcast::Sender<Event>,
 ) -> anyhow::Result<Active> {
     let step = |s: &str| {
@@ -414,46 +497,79 @@ async fn connect(
     };
 
     step("Looking for your tablet…");
-    let transport = Transport::connect(config.apk_path.as_deref(), config.apk_version).await?;
+    let transport = Transport::connect_with_mode(
+        config.apk_path.as_deref(),
+        config.apk_version,
+        config.transport,
+    )
+    .await?;
     let cleanup = transport.teardown_handle();
+    let mut guard = xs_transport::PendingConnection::new(cleanup.clone());
     let result = connect_streams(config, events, transport).await;
     if result.is_err() {
         cleanup.disconnect().await;
     }
+    guard.disarm();
     result
 }
 
 async fn connect_streams(
-    config: &SessionConfig,
+    config: &mut SessionConfig,
     events: &broadcast::Sender<Event>,
     transport: Transport,
 ) -> anyhow::Result<Active> {
     let step = |s: &str| {
         let _ = events.send(Event::State(State::Connecting { step: s.into() }));
     };
-    let device_name = transport.device.display_name();
+    let accessory = transport.is_accessory();
+    let fallback_device_name = transport.device.display_name();
     let (handle, control, video, camera) = transport.split();
     // Only the control channel is bidirectional, so only it is split. This is not
     // tidiness: dropping tokio's `OwnedWriteHalf` calls shutdown(Write), and adb's
     // forwarder tears down the entire unix socket to the device when either
     // direction closes. Splitting the camera stream and dropping its write half
     // therefore killed the channel, and the tablet's very next frame hit EPIPE.
-    let (control_rx, control_tx) = control.into_split();
+    let (control_rx, control_tx) = tokio::io::split(control);
 
     let mut control_reader = FrameReader::new(control_rx);
     let control_writer: SharedWriter = Arc::new(Mutex::new(FrameWriter::new(control_tx)));
 
-    step("Waiting for the tablet to introduce itself…");
-    let hello = tokio::time::timeout(Duration::from_secs(5), read_hello(&mut control_reader))
-        .await
-        .map_err(|_| anyhow::anyhow!("tablet handshake timed out"))??;
+    step(if accessory {
+        "Tap Allow on your tablet to start USB accessory display…"
+    } else {
+        "Waiting for the tablet to introduce itself…"
+    });
+    let hello = tokio::time::timeout(
+        Duration::from_secs(if accessory { 60 } else { 5 }),
+        read_hello(&mut control_reader),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "tablet handshake timed out; unlock the tablet and tap Allow, then reconnect"
+        )
+    })??;
+    let device_name = if hello.device_name.trim().is_empty() {
+        fallback_device_name
+    } else {
+        hello.device_name.clone()
+    };
     info!(
         device = %hello.device_name,
+        device_id = ?hello.device_id,
         panel = format!("{}x{}", hello.width, hello.height),
         android = %hello.android_release,
         "tablet said hello"
     );
 
+    let device_id = crate::device_settings::identity(&hello, &handle.device.serial);
+    crate::device_settings::restore(config, &device_id);
+    config.last_device_id = Some(device_id.clone());
+    xs_mutter::migrate_display_identity(&handle.device.serial, &device_id);
+    crate::device_settings::remember(config, &device_id);
+    let _ = events.send(Event::DeviceSettings(crate::DeviceSettings::from_config(
+        config,
+    )));
     let scale = clamp_ui_scale(config.scale);
     let (asked_width, asked_height) = if modes_enabled() {
         scaled_size_for(hello.width, hello.height, scale)
@@ -504,7 +620,7 @@ async fn connect_streams(
             refresh_rate: config.framerate as f64,
             scale,
             fallback_sizes: fallback_sizes(hello.width, hello.height),
-            layout_key: (config.mode == DisplayMode::Extend).then(|| handle.device.serial.clone()),
+            layout_key: (config.mode == DisplayMode::Extend).then(|| device_id.clone()),
             // Metadata, not Embedded: mutter only paints an embedded cursor
             // when the virtual monitor is damaged, so a still window freezes
             // the pointer. Cursor sprite/position is forwarded to the tablet.
@@ -979,7 +1095,7 @@ async fn read_hello<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut FrameReader<R>,
 ) -> anyhow::Result<Hello> {
     // A few frames of slack in case anything is queued ahead of it.
-    for _ in 0..8 {
+    for _ in 0..128 {
         let frame = reader.read_frame().await?;
         if frame.header.channel == Channel::Control && frame.header.kind == ControlKind::Hello as u8
         {

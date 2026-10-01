@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 /// Bitrate range the controller may move within.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BitrateBounds {
     pub min_kbps: u32,
     pub max_kbps: u32,

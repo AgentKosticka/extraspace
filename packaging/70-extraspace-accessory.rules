@@ -1,0 +1,3 @@
+# ExtraSpace AOA interface: local active users, never world-writable USB devices.
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", TAG+="uaccess"

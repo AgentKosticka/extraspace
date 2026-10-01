@@ -42,6 +42,8 @@ object Protocol {
         const val PONG: Byte = 5
         const val ERROR: Byte = 6
         const val CURSOR: Byte = 7
+        const val HELLO_REQUEST: Byte = 8
+        const val SESSION_END: Byte = 9
     }
 
     object CursorFlags {
