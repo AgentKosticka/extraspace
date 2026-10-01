@@ -3,6 +3,12 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Keep the public version aligned with the Rust workspace. The companion code
+// independently tracks APK upgrades and host compatibility.
+val releaseVersion = Regex("""(?m)^version = "([^"]+)"$""")
+    .find(rootProject.file("../Cargo.toml").readText())?.groupValues?.get(1)
+    ?: error("Missing workspace package version in Cargo.toml")
+
 android {
     namespace = "io.github.tymonoman.extraspace"
     compileSdk = 35
@@ -12,7 +18,7 @@ android {
         // The host refuses to talk to a mismatched app, so this is the number it
         // compares against when deciding whether to push a new APK.
         versionCode = rootProject.file("../companion-version").readText().trim().toInt()
-        versionName = "0.1.0"
+        versionName = releaseVersion
         // MediaFormat.KEY_LOW_LATENCY needs 30; below that the decoder buffers
         // several frames and the whole latency budget is gone.
         minSdk = 30

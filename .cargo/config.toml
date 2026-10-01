@@ -1,0 +1,3 @@
+# Keep dependency updates compatible with the workspace MSRV. CI also tests it.
+[resolver]
+incompatible-rust-versions = "fallback"

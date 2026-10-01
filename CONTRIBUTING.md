@@ -4,7 +4,7 @@
 
 Run it on hardware that is not mine and say what happened. Extraspace is
 verified on exactly one tablet and one GNOME version; everything beyond that is
-untested. A [hardware report](https://github.com/Tymonoman/extraspace/issues/new?template=hardware_report.yml)
+untested. A [hardware report](https://github.com/AgentKosticka/extraspace/issues/new?template=hardware_report.yml)
 takes two minutes and is worth more than most patches right now — including the
 boring "it just worked" ones.
 

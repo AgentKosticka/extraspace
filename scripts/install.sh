@@ -54,7 +54,7 @@ if ((DOWNLOAD_APK)); then
     echo 'APK checksum mismatch. Retry after the release finishes publishing.' >&2; exit 1;
   }
   [[ $(cat "$DOWNLOAD_DIR/companion-version") == "$(cat "$REPO_ROOT/companion-version")" ]] || {
-    echo 'Published APK version differs from this checkout. Update sources or use --build-apk.' >&2; exit 1;
+    echo 'Published APK version differs from this checkout. Use install-ubuntu.sh --published (or install-published.sh) for the tested source, wait for CI, or use --build-apk.' >&2; exit 1;
   }
   APK_SRC=$DOWNLOAD_DIR/extraspace.apk
 fi
@@ -89,13 +89,18 @@ elif [[ ! -f $DATA_DIR/extraspace/extraspace.apk ]]; then
   echo 'No companion APK bundled. Install one with --apk PATH; an already installed tablet app can still be used.'
 fi
 copy_atomic "$REPO_ROOT/packaging/$APP_ID.svg" "$ICON_DIR/$APP_ID.svg" 644
-# Desktop Exec has its own quoting rules (not shell syntax), plus entry escapes.
+# Desktop Exec has two layers: quoted argument escapes, then key-value escapes.
+# A literal backslash needs four backslashes in the file so GIO receives one.
 EXEC_PATH=$BIN_DIR/extraspace
 # Preserve an existing app-private Intel media driver setup across upgrades.
 # Normal installations without that driver keep using the binary directly.
 if [[ -x $DATA_DIR/extraspace/launch-gpu && -r $DATA_DIR/extraspace/intel-va/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so ]]; then
   EXEC_PATH=$DATA_DIR/extraspace/launch-gpu
 fi
+# GIO checks the executable before expanding %% into a literal percent. Use
+# env for that case so the executable lookup succeeds before argument expansion.
+EXEC_PREFIX=
+[[ $EXEC_PATH != *%* ]] || EXEC_PREFIX='/usr/bin/env '
 EXEC_PATH=${EXEC_PATH//\\/\\\\}
 EXEC_PATH=${EXEC_PATH//\"/\\\"}
 EXEC_PATH=${EXEC_PATH//\$/\\\$}
@@ -109,7 +114,7 @@ Type=Application
 Name=Extraspace
 GenericName=Tablet Display
 Comment=Use an Android tablet as an extra display and webcam
-Exec="$EXEC_PATH"
+Exec=${EXEC_PREFIX}"$EXEC_PATH"
 Icon=$APP_ID
 Terminal=false
 Categories=Utility;GTK;GNOME;

@@ -13,7 +13,7 @@ jobs:
     name: Publish APK
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: extraspace-apk
           path: dist
@@ -54,22 +54,42 @@ jobs:
 
           Clone https://github.com/$GH_REPO, then run:
 
-              ./scripts/install-ubuntu.sh
+              ./scripts/install-ubuntu.sh --published
 
-          This installs dependencies, builds the desktop app and downloads the
+          This installs the tested source commit with its matching APK, even if
+          main has newer changes still in CI. It installs dependencies and downloads the
           checksum-verified APK. No Android SDK is needed. Open Extraspace from
-          the GNOME applications grid. Re-run the installer after updating sources
+          the GNOME applications grid. Re-run the published installer
           to upgrade. See the README for USB debugging setup and other distributions.
 
           CI run: https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID
           EOF
+          # Publish a complete commit-specific release before updating the moving
+          # pointer. Installers can keep using the previous tested build during CI
+          # or an interrupted continuous-release upload.
+          build_tag="build-$GITHUB_SHA"
+          if ! gh release view "$build_tag" >/dev/null 2>&1; then
+            gh release create "$build_tag" dist/* --target "$GITHUB_SHA" \
+              --title "Tested build $GITHUB_SHA" --notes-file notes.md --prerelease --latest=false
+          fi
+          # An interrupted first upload must not become the published pointer.
+          mkdir verified
+          gh release download "$build_tag" --dir verified
+          test "$(cat verified/commit.txt)" = "$GITHUB_SHA"
+          test "$(cat verified/companion-version)" = "$(cat dist/companion-version)"
+          (cd verified && sha256sum --check extraspace.apk.sha256)
           if gh release view "$tag" >/dev/null 2>&1; then
             if [ "$tag" = continuous ]; then
               gh api "repos/$GH_REPO/git/refs/tags/$tag" -X PATCH -f sha="$GITHUB_SHA" -F force=true
             fi
-            gh release edit "$tag" --title "$title" --notes-file notes.md "${flags[@]}"
+            gh release edit "$tag" --target "$GITHUB_SHA" --title "$title" --notes-file notes.md "${flags[@]}"
             gh release upload "$tag" dist/* --clobber
           else
             gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "$title" \
               --notes-file notes.md "${flags[@]}"
+          fi
+          if [ "$tag" = continuous ]; then
+            # This single asset is replaced last, only after immutable assets exist.
+            cp dist/commit.txt tested-commit.txt
+            gh release upload continuous tested-commit.txt --clobber
           fi

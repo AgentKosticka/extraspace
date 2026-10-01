@@ -5,17 +5,23 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SETUP_ARGS=()
 INSTALL_ARGS=(--download-apk)
 APK_CHOICE=0
+PUBLISHED=0
 while (($#)); do
   case "$1" in
+    --published) PUBLISHED=1 ;;
     --camera) SETUP_ARGS+=(--camera) ;;
     --apk) [[ $# -ge 2 && -n $2 ]] || { echo '--apk requires a path' >&2; exit 2; }; INSTALL_ARGS=(--apk "$2"); APK_CHOICE=$((APK_CHOICE + 1)); shift ;;
     --build-apk) INSTALL_ARGS=(--build-apk); APK_CHOICE=$((APK_CHOICE + 1)) ;;
-    --help) echo 'Usage: install-ubuntu.sh [--camera] [--apk PATH | --build-apk]'; exit 0 ;;
+    --help) echo 'Usage: install-ubuntu.sh [--camera] [--published | --apk PATH | --build-apk]'; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
 ((APK_CHOICE < 2)) || { echo 'Choose --apk or --build-apk, not both.' >&2; exit 2; }
+if ((PUBLISHED)); then
+  ((APK_CHOICE == 0)) || { echo 'Choose --published, --apk or --build-apk.' >&2; exit 2; }
+  exec "$REPO_ROOT/scripts/install-published.sh" --ubuntu "${SETUP_ARGS[@]}"
+fi
 ((EUID != 0)) || { echo 'Run this installer as your normal user; setup asks for sudo when needed.' >&2; exit 1; }
 # shellcheck disable=SC1091
 source /etc/os-release

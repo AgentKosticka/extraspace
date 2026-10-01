@@ -67,7 +67,8 @@ and GPU capture/encoding path. The original implementation is
 The current validation environment is Ubuntu 26.04.1, GNOME Shell 50.1 / Mutter
 50.1-0ubuntu2.4, Wayland, and a Samsung SM-X620 running Android 16 over USB 2.0
 High Speed, with a 2880×1800 panel. The default 1.5× setting sends 1920×1200
-pixels through x264 on this machine. Native GNOME scaling requires a verified
+pixels. Both x264 and Intel VA H.264 were exercised on this machine;
+see [the validation report](docs/hardware-testing.md) for their setup and coverage. Native GNOME scaling requires a verified
 patched Mutter; it is deliberately not enabled on stock Ubuntu.
 
 Display streaming, touch, repeated connection cycles, and conservative monitor
@@ -132,7 +133,9 @@ welcome.
   GNOME 50+ additionally lets the monitor be pinned to an exact mode.
 - An **Android 11+** tablet (API 30, for `MediaCodec` low-latency decoding).
 - A **USB cable** and USB debugging enabled on the tablet.
-- Any GPU. Encoding is done on the CPU by default and needs roughly one core.
+- Any GPU. **Automatic** encoding is the default: it tries available GPU
+  encoders first, then falls back to CPU encoding. CPU encoding needs roughly
+  one core; hardware encoding requires a working driver and GStreamer plugin.
 
 ## Getting started
 
@@ -160,15 +163,19 @@ On **Ubuntu 24.04 or newer with GNOME on Wayland**, run:
 ```bash
 git clone https://github.com/AgentKosticka/extraspace
 cd extraspace
-./scripts/install-ubuntu.sh
+./scripts/install-ubuntu.sh --published
 ```
 
 If `git` is missing, install it first with `sudo apt install git`.
 The installer asks for sudo to install Ubuntu dependencies, installs a user Rust
-compiler if needed, builds the desktop app, and downloads the published companion
-APK with a SHA-256 check. **No Android SDK or JDK is needed.** The application,
+compiler if needed, builds the last successfully published source commit in a
+temporary directory, and downloads its matching companion APK with a SHA-256
+check. Compiled dependencies are cached under `$XDG_CACHE_HOME/extraspace/target`
+(default `~/.cache/extraspace/target`). **No Android SDK or JDK is needed.** The application,
 APK, matching Android/desktop icon, and launcher are installed in your user
-account. Do not run the installer with sudo.
+account. Your checkout and local changes stay in place; newer changes on `main`
+are installed only after their CI build is published. Do not run the installer
+with sudo.
 
 After installation, press **Super**, type **Extraspace**, and click its icon.
 You can also find it in GNOME's applications grid. No terminal or repository
@@ -179,7 +186,7 @@ For an upgrade, close Extraspace, then run:
 
 ```bash
 git pull --ff-only
-./scripts/install-ubuntu.sh
+./scripts/install-ubuntu.sh --published
 ```
 
 To include the optional tablet webcam, add `--camera`. This installs v4l2loopback
@@ -192,8 +199,11 @@ release build, lint and signature verification. Only after both jobs pass does
 CI publish the APK, checksum, companion version and source commit to the
 [continuous release](https://github.com/AgentKosticka/extraspace/releases/tag/continuous).
 This is a development prerelease; `v*` tag pushes produce versioned releases.
-If the published companion version differs from your checkout, installation
-stops and asks you to update sources or build the APK locally.
+The recommended `--published` installer reads `tested-commit.txt` and uses the
+commit-specific `build-<commit>` release. While a newer `main` build is running,
+it installs the previous tested source and matching APK. The source installer
+without `--published` builds your checkout and rejects an incompatible APK; wait
+for CI or use `--build-apk` to build that checkout locally.
 
 ### 3. Other distributions and source APK builds
 
@@ -202,7 +212,7 @@ For Fedora/Arch, or to manage setup separately:
 ```bash
 ./scripts/setup.sh --check
 ./scripts/setup.sh
-./scripts/install.sh --download-apk
+./scripts/install-published.sh
 ```
 
 Setup detects Ubuntu/Debian, Fedora and Arch package names and installs GTK,
@@ -220,9 +230,10 @@ export ANDROID_HOME="$HOME/Android/Sdk" # adjust to your SDK location
 ```
 
 Or use a specific APK with `./scripts/install.sh --apk /path/to/extraspace.apk`.
-The Ubuntu installer accepts `--apk PATH` and `--build-apk` as alternatives to
-its default download. `--download-apk`, `--build-apk` and `--apk` are mutually
-exclusive. The normal installer always rebuilds with `Cargo.lock`; `--no-build`
+The Ubuntu installer accepts `--apk PATH` and `--build-apk` to install your
+current checkout instead of `--published`. For a published APK with your current
+checkout, use `./scripts/install.sh --download-apk`. `--download-apk`,
+`--build-apk` and `--apk` are mutually exclusive. The normal installer always rebuilds with `Cargo.lock`; `--no-build`
 explicitly uses an existing release binary. Files are replaced by rename, so an
 upgrade does not truncate a running executable. A previously installed APK is
 retained when no new APK is supplied. `EXTRASPACE_APK=/path/to/app.apk` also works
@@ -231,7 +242,10 @@ for a source launch; an invalid override is reported instead of silently ignored
 The host installs a missing companion or replaces an older version while
 preserving its data. It never silently uninstalls an app to bypass a signing-key
 mismatch and does not downgrade a newer app. Host and Gradle read the same
-`companion-version` file. Developer changes to the companion should increment
+`companion-version` file. The public Android version name and desktop About
+version come from the Rust workspace package version (currently 0.2.0). The
+companion code (currently 11) independently tracks APK upgrades and compatibility.
+Developer changes to the companion should increment
 that number, or be installed explicitly with `adb install -r -g PATH.apk`.
 
 Remove the user installation with `./scripts/install.sh --uninstall`. Your
@@ -543,7 +557,14 @@ future GNOME release changes it, the damage is contained to one file.
 `.github/workflows/ci.yml` builds and verifies `extraspace.apk`, then calls the
 reusable release workflow with that same artifact. Failed Rust/Android checks or
 pull requests cannot publish releases. Each release includes `extraspace.apk`,
-`extraspace.apk.sha256`, `companion-version` and `commit.txt`.
+`extraspace.apk.sha256`, `companion-version` and `commit.txt`. CI publishes
+a complete `build-<commit>` prerelease before updating `continuous`, and replaces
+its `tested-commit.txt` pointer last. Published installation uses that pointer
+and the commit-specific assets, avoiding the `main`/APK build window.
+
+Rust CI tests both the minimum supported compiler, **1.85.0**, and current stable.
+Dependency resolution prefers versions compatible with that minimum, and all
+external Actions are pinned to full commit SHAs.
 
 Maintainers must configure the encrypted repository secret
 `EXTRASPACE_KEYSTORE_BASE64` with a persistent base64-encoded Android keystore
@@ -566,6 +587,17 @@ commit the SVG. CI checks that the two stay in sync. The same SVG is also embedd
 in the desktop executable as a GTK icon resource, so the app's window/About icon
 does not depend on its working directory. Installation registers that artwork
 in the desktop icon theme for the launcher and tray.
+
+### Application identity and upgrades
+
+This fork intentionally retains the legacy GTK ID/icon name
+`io.github.tymonoman.Extraspace`, resource path, Android application ID/namespace
+`io.github.tymonoman.extraspace`, and Kotlin package structure. These identifiers
+keep existing launchers, GNOME window grouping, stored settings, Android app data,
+and signed APK upgrades associated with the same application. They identify the
+installed app; the repository, report links and package metadata identify
+[AgentKosticka/extraspace](https://github.com/AgentKosticka/extraspace). A future ID
+change requires an explicit migration and a separate Android installation.
 
 ## Contributing
 

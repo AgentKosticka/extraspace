@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
@@ -71,7 +72,7 @@ class Installation(unittest.TestCase):
         if shutil.which("desktop-file-validate"):
             subprocess.run(["desktop-file-validate", str(self.desktop)], check=True, capture_output=True)
         entry = self.desktop.read_text()
-        self.assertIn('Exec="', entry)
+        self.assertIn('Exec=/usr/bin/env "', entry)
         self.assertIn("%%", entry)
         self.assertIn("Terminal=false", entry)
         self.assertFalse((self.root / "config/autostart/io.github.tymonoman.Extraspace.desktop").exists())
@@ -79,6 +80,31 @@ class Installation(unittest.TestCase):
         self.assertFalse(installed.exists())
         self.assertFalse(self.desktop.exists())
         self.assertEqual(settings.read_text(), '{"scale":1.75}')
+
+    def test_desktop_launch_round_trips_backslashes_and_reserved_characters(self):
+        # Validate the two desktop-entry escaping layers through the real launcher,
+        # not just desktop-file-validate or a parser that mirrors the installer.
+        marker = self.root / "launched"
+        self.binary.write_text('#!/bin/sh\nprintf launched > "$EXTRASPACE_LAUNCH_MARKER"\n')
+        launcher = (
+            "import sys\nfrom gi.repository import Gio\n"
+            "app = Gio.DesktopAppInfo.new_from_filename(sys.argv[1])\n"
+            "assert app is not None\napp.launch([], None)\n"
+        )
+        for suffix in ['one\\', 'two\\\\', 'before\\"$`% and spaces']:
+            with self.subTest(suffix=suffix):
+                self.env["XDG_BIN_HOME"] = str(self.root / suffix)
+                marker.unlink(missing_ok=True)
+                self.run_install("--no-build", "--apk", str(self.apk))
+                env = dict(self.env, EXTRASPACE_LAUNCH_MARKER=str(marker))
+                result = subprocess.run(["/usr/bin/python3", "-c", launcher, str(self.desktop)],
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                deadline = time.monotonic() + 3
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(marker.exists(), result.stderr)
+                self.assertEqual(marker.read_text(), "launched")
 
     def test_invalid_apk_or_option_does_not_install(self):
         self.run_install("--no-build", "--apk", str(self.root / "missing.apk"), success=False)
@@ -123,6 +149,64 @@ class Installation(unittest.TestCase):
         result = self.run_install("--download-apk", "--no-build", success=False)
         self.assertIn("version differs", result.stderr)
         self.assertFalse(self.bin_dir.exists())
+
+    def test_published_install_uses_matching_source_without_changing_checkout(self):
+        assets = self.mock_release()
+        source = self.root / "published-source"
+        source.mkdir()
+        (source / "scripts").mkdir()
+        for name in ["install.sh", "install-published.sh"]:
+            shutil.copy2(REPO / "scripts" / name, source / "scripts" / name)
+        (source / "packaging").mkdir()
+        shutil.copy2(REPO / "packaging/io.github.tymonoman.Extraspace.svg", source / "packaging")
+        (source / "companion-version").write_text("9\n")
+        (source / "README.md").write_text("tested source\n")
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(source), *args], text=True,
+                                           stderr=subprocess.PIPE).strip()
+        git("init", "-b", "main")
+        git("config", "user.name", "Installer Test")
+        git("config", "user.email", "test@example.invalid")
+        git("add", ".")
+        git("commit", "-m", "Published version")
+        commit = git("rev-parse", "HEAD")
+        git("remote", "add", "origin", source.as_uri())
+        # Simulate a newer main companion still waiting for its CI build.
+        (source / "companion-version").write_text("11\n")
+        git("commit", "-am", "New unpublished companion")
+        new_head = git("rev-parse", "HEAD")
+        (source / "README.md").write_text("local edits must survive\n")
+        (assets / "companion-version").write_text("9\n")
+        (assets / "tested-commit.txt").write_text(commit + "\n")
+        mocks = Path(self.env["PATH"].split(":")[0])
+        cargo = mocks / "cargo"
+        cargo.write_text('#!/bin/sh\ncat companion-version > "$TEST_BUILT_VERSION"\n')
+        cargo.chmod(0o755)
+        built_version = self.root / "built-version"
+        self.env.update(EXTRASPACE_RELEASE_BASE_URL="https://example.invalid/releases/download",
+                        TEST_BUILT_VERSION=str(built_version))
+        curl = mocks / "curl"
+        curl.write_text(curl.read_text() +
+                        "with open(os.environ['TEST_URL_LOG'], 'a') as log: log.write(sys.argv[-3] + '\\n')\n")
+        url_log = self.root / "urls"
+        self.env["TEST_URL_LOG"] = str(url_log)
+        result = subprocess.run([str(source / "scripts/install-published.sh")],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(built_version.read_text(), "9\n")
+        self.assertEqual(git("rev-parse", "HEAD"), new_head)
+        self.assertEqual((source / "README.md").read_text(), "local edits must survive\n")
+        self.assertEqual((source / "companion-version").read_text(), "11\n")
+        self.assertIn(f"build-{commit}/extraspace.apk", url_log.read_text())
+        self.assertEqual((self.root / "data/extraspace/extraspace.apk").read_bytes(), self.apk.read_bytes())
+        # Untrusted or incomplete pointers fail before fetching/building sources.
+        built_version.unlink()
+        (assets / "tested-commit.txt").write_text("main; invalid\n")
+        result = subprocess.run([str(source / "scripts/install-published.sh")],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid published source commit", result.stderr)
+        self.assertFalse(built_version.exists())
 
     def test_check_detects_ubuntu_without_privileged_commands(self):
         release = self.root / "os-release"

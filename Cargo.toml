@@ -11,13 +11,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/Tymonoman/extraspace"
-homepage = "https://github.com/Tymonoman/extraspace"
-authors = ["Tymonoman"]
+repository = "https://github.com/AgentKosticka/extraspace"
+homepage = "https://github.com/AgentKosticka/extraspace"
+authors = ["AgentKosticka", "sal0-h", "Tymonoman"]
 
 [workspace.dependencies]
 xs-proto = { path = "crates/xs-proto" }
