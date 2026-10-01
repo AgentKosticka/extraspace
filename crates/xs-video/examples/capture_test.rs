@@ -17,7 +17,7 @@
 use std::time::{Duration, Instant};
 
 use xs_mutter::{CaptureSource, CursorMode, DisplayConfig};
-use xs_video::{VideoConfig, VideoPipeline};
+use xs_video::{available_encoders, EncoderSelection, EncodingMode, VideoConfig, VideoPipeline};
 
 const FRAMERATE: u32 = 60;
 
@@ -68,7 +68,19 @@ async fn main() -> anyhow::Result<()> {
     println!("  pipewire node {}", session.node_id());
     let (width, height) = session.effective_size();
 
-    let (pipeline, mut frames, _cursor) = VideoPipeline::new(
+    let selection = EncoderSelection {
+        mode: match std::env::var("XS_ENCODING_MODE").ok().as_deref() {
+            Some("cpu") => EncodingMode::Cpu,
+            Some("gpu") => EncodingMode::Gpu,
+            _ => EncodingMode::Auto,
+        },
+        factory: std::env::var("XS_ENCODER").ok(),
+    };
+    let option = selection
+        .candidates(available_encoders())
+        .map_err(anyhow::Error::msg)?
+        .remove(0);
+    let (pipeline, mut frames, _cursor) = VideoPipeline::new_with_encoder(
         session.node_id(),
         VideoConfig {
             width,
@@ -77,8 +89,9 @@ async fn main() -> anyhow::Result<()> {
             bitrate_kbps: 15_000,
             scale,
         },
+        &option,
     )?;
-    println!("  encoder: {}", pipeline.encoder().human_name());
+    println!("  encoder: {}", pipeline.encoder_label());
     pipeline.start()?;
 
     let started = Instant::now();
@@ -116,8 +129,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let (mutter_frames, pushed, push_fail, copy_max_us) = pipeline.take_capture_counts();
+    let failure = pipeline.failure();
     pipeline.stop();
     session.close().await?;
+    anyhow::ensure!(failure.is_none(), "pipeline failed: {failure:?}");
 
     let elapsed = started.elapsed().as_secs_f64();
     let fps = count as f64 / elapsed;

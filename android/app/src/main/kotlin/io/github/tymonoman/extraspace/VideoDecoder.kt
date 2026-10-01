@@ -3,9 +3,12 @@ package io.github.tymonoman.extraspace
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
@@ -19,7 +22,7 @@ import kotlin.concurrent.thread
  * as possible and report its depth back to the host, which lowers bitrate when it
  * starts to grow.
  */
-class VideoDecoder(private val surface: Surface) {
+class VideoDecoder(private val surface: Surface, private val traceLatency: Boolean = false) {
     @Volatile private var codec: MediaCodec? = null
     @Volatile private var running = false
     private var drainThread: Thread? = null
@@ -28,7 +31,7 @@ class VideoDecoder(private val surface: Surface) {
     val queueDepth: Int get() = pendingInputs.get()
     val framesDecoded = AtomicLong(0)
     val framesDropped = AtomicLong(0)
-    /** Device-clock microseconds when the most recent frame was released for display. */
+    /** Device-clock microseconds reported by the codec for its last surface render. */
     val renderedAtUs = AtomicLong(0)
     val lastFramePtsUs = AtomicLong(0)
 
@@ -36,6 +39,7 @@ class VideoDecoder(private val surface: Surface) {
     private val pendingInputs = AtomicInteger(0)
     private val inputPace = PaceWatch("decode_in")
     private val outputPace = PaceWatch("decode_out")
+    private val submittedPts = ConcurrentHashMap<Long, Long>()
 
     @Synchronized
     fun start(width: Int, height: Int, csd: ByteArray?) {
@@ -70,6 +74,17 @@ class VideoDecoder(private val surface: Surface) {
 
         codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
             configure(format, surface, null, 0)
+            setOnFrameRenderedListener({ renderedCodec, localPtsUs, renderedNs ->
+                // A queued callback from an old codec must not update a new stream.
+                if (codec !== renderedCodec) return@setOnFrameRenderedListener
+                val hostPts = submittedPts.remove(localPtsUs)
+                if (renderedNs > 0) renderedAtUs.set(renderedNs / 1000)
+                if (hostPts != null) lastFramePtsUs.set(hostPts)
+                if (traceLatency) {
+                    Log.i(TAG, "latency stage=rendered local_pts_us=$localPtsUs render_us=${renderedNs / 1000 - localPtsUs} host_pts_us=$hostPts")
+                }
+            }, Handler(Looper.getMainLooper()))
+            Log.i(TAG, "decoder selected name=$name low_latency_supported=${codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).isFeatureSupported("low-latency")}")
             start()
         }
         framesDecoded.set(0)
@@ -106,19 +121,28 @@ class VideoDecoder(private val surface: Surface) {
                 put(data, 0, length)
             }
             val flags = if (isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
-            // Do not pass the host GStreamer PTS through: it is a different
-            // clock and Samsung MediaCodec will pace to it. 0 = "show now".
+            // Use a unique timestamp on the device clock to measure decode time.
+            // Presentation remains explicit in releaseOutputBuffer; host PTS is
+            // from an unrelated clock and must never schedule tablet playback.
+            val localPtsUs = waitStart / 1000
+            if (!isConfig) {
+                // A decoder can drop outputs; bound diagnostics memory too.
+                if (submittedPts.size >= 256) submittedPts.clear()
+                submittedPts[localPtsUs] = ptsUs
+            }
             // Increment before submission: the independent drain thread can
             // release an output before queueInputBuffer returns. Config buffers
             // do not produce a corresponding picture and must not inflate depth.
             if (!isConfig) pendingInputs.incrementAndGet()
             try {
-                mc.queueInputBuffer(index, 0, length, 0, flags)
+                mc.queueInputBuffer(index, 0, length, localPtsUs, flags)
             } catch (e: IllegalStateException) {
-                if (!isConfig) pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
+                if (!isConfig) {
+                    submittedPts.remove(localPtsUs)
+                    pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
+                }
                 throw e
             }
-            lastFramePtsUs.set(ptsUs)
             inputPace.observe("bytes=$length pts_us=$ptsUs wait_ms=$waitMs")
             true
         } catch (e: IllegalStateException) {
@@ -140,14 +164,17 @@ class VideoDecoder(private val surface: Surface) {
             try {
                 when (val index = mc.dequeueOutputBuffer(info, DRAIN_TIMEOUT_US)) {
                     in 0..Int.MAX_VALUE -> {
-                        // 0 ns = present immediately; the boolean overload lets
-                        // SurfaceFlinger keep the (zero/host) PTS and hitch.
-                        mc.releaseOutputBuffer(index, 0L)
+                        // Present now on the device clock. A zero timestamp is
+                        // outside SurfaceView's scheduling window and disables
+                        // its ability to discard superseded frames at a VSYNC.
+                        if (traceLatency) {
+                            Log.i(TAG, "latency stage=decoded local_pts_us=${info.presentationTimeUs} decode_us=${System.nanoTime() / 1000 - info.presentationTimeUs}")
+                        }
+                        mc.releaseOutputBuffer(index, System.nanoTime())
                         if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
                             pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
                             framesDecoded.incrementAndGet()
                         }
-                        renderedAtUs.set(System.nanoTime() / 1000)
                         outputPace.observe("pts_us=${info.presentationTimeUs} size=${info.size}")
                     }
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
@@ -172,6 +199,7 @@ class VideoDecoder(private val surface: Surface) {
         }
         codec = null
         pendingInputs.set(0)
+        submittedPts.clear()
     }
 
     private companion object {

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
-use xs_core::{BitrateBounds, DisplayMode};
+use xs_core::{BitrateBounds, DisplayMode, EncoderSelection};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -21,6 +21,7 @@ pub struct Config {
     /// Connector to mirror, when mode is `"mirror"`.
     pub mirror_source: Option<String>,
     pub framerate: u32,
+    pub encoder: EncoderSelection,
     pub min_bitrate_kbps: u32,
     pub max_bitrate_kbps: u32,
     pub camera_enabled: bool,
@@ -39,6 +40,7 @@ impl Default for Config {
             mode: "extend".into(),
             mirror_source: None,
             framerate: 60,
+            encoder: EncoderSelection::default(),
             min_bitrate_kbps: BitrateBounds::default().min_kbps,
             max_bitrate_kbps: BitrateBounds::default().max_kbps,
             camera_enabled: false,
@@ -205,5 +207,22 @@ mod tests {
         assert_eq!(back.scale, 2.0);
         assert_eq!(back.framerate, 60);
         assert!(!back.keep_running_in_tray);
+        assert_eq!(back.encoder, EncoderSelection::default());
+    }
+
+    #[test]
+    fn encoder_policy_persists_and_unknown_modes_do_not_reset_other_settings() {
+        let c: Config = serde_json::from_str(
+            r#"{"scale":1.75,"encoder":{"mode":"gpu","factory":"varenderD129h264enc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.encoder.mode, xs_core::EncodingMode::Gpu);
+        let saved = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back.encoder, c.encoder);
+        let unknown: Config =
+            serde_json::from_str(r#"{"scale":1.75,"encoder":{"mode":"future_mode"}}"#).unwrap();
+        assert_eq!(unknown.scale, 1.75);
+        assert_eq!(unknown.encoder.mode, xs_core::EncodingMode::Auto);
     }
 }

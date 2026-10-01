@@ -293,6 +293,63 @@ Cheese and anything else that reads a webcam. It only shows up in those lists
 while Extraspace is actually running, so it does not clutter your camera picker
 the rest of the time.
 
+### Choose an encoder
+
+Open **Video Encoding** from the main menu or the Display section. The settings
+remain accessible if an encoder fails to start.
+
+- **Automatic** tries installed GPU encoders first and falls back to CPU when
+  startup fails. A notification identifies the fallback.
+- **CPU** uses x264 or OpenH264. **GPU** uses a supported VA-API or NVIDIA NVENC
+  backend and stays on GPU even if no GPU encoder works.
+- **Encoder / Driver** lists detected implementations and GPU devices. Choose
+  **Best available** to allow fallback within your mode, or pin an exact encoder.
+  A pinned choice reports an error if unavailable; it never silently substitutes
+  another driver. VA conversion and encoding are matched to the same render device.
+
+Click **Apply** to save the choice. An active connection reconnects automatically;
+otherwise the choice applies the next time you connect. Existing settings default
+to Automatic. Installing a driver or plugin requires restarting Extraspace before
+it appears in the list. Registering a factory is only a detection step: startup
+must produce a real encoded frame before the app reports it as working.
+
+VA-API needs the vendor's media driver as well as GStreamer's `va` plugin. On an
+Intel Ubuntu host, `intel-media-va-driver-non-free` provides the full Intel media
+encoder implementation. NVENC needs NVIDIA's driver and GStreamer's `nvcodec`
+encoder plugin; some distributions omit this plugin. Unsupported encoders are
+not offered. The statistics panel and `--diagnostics` show the encoder identity.
+
+### Tablet presentation latency
+
+The companion decodes directly into a SurfaceView behind the app window, with
+cursor and status views above it. This avoids the extra UI composition step of
+TextureView. It requests the stream frame rate on the surface and presents each
+output at the current device time, allowing Android to discard superseded frames
+at a VSYNC. Host timestamps never schedule tablet presentation.
+
+Decoder diagnostics log the selected codec and its advertised low-latency support.
+Launching MirrorActivity with the boolean intent extra `latency_trace=true` enables
+per-frame decode/surface timing. `texture_output=true` selects the former playback
+path for A/B diagnostics. The host restarts the activity on connection, so pass
+these extras on that launch when testing. Normal playback logs no per-frame timings.
+Codec render callbacks are informational; they are not physical screen latency.
+
+### Private Intel driver startup
+
+When an Intel driver and its `libigdgmm.so.12` dependency are installed under
+`$XDG_DATA_HOME/extraspace/intel-va/usr/lib/x86_64-linux-gnu` (defaulting to
+`~/.local/share`), the app prepares their runtime paths before initializing
+GStreamer. It re-executes itself once so the dynamic loader can resolve the
+private dependency. This works for desktop shortcuts, application-menu entries,
+and direct binary launches; it does not depend on a shell launcher's environment
+surviving reboot. A separate GStreamer registry avoids sharing plugin-discovery
+results with launches using system drivers. Explicit `LIBVA_DRIVERS_PATH`,
+`LIBVA_DRIVER_NAME`, and `GST_REGISTRY` settings are respected.
+
+`extraspace --diagnostics` reports the effective driver paths and detected encoders.
+Driver detection and the saved CPU/GPU encoding selection are independent.
+
+
 ### About scale
 
 A 10.4" tablet at its native 2000×1200 renders GNOME at a size that is technically
@@ -333,7 +390,7 @@ Frames are requested from mutter as dma-bufs, so they stay on the GPU from
 compositing through to encode. Where the VA-API plugin is missing, the same
 pipeline runs with `videoconvert → x264enc` over copied frames instead.
 
-and on the tablet, `MediaCodec` → `TextureView`. Touches travel back on a separate
+and on the tablet, `MediaCodec` → `SurfaceView`. Touches travel back on a separate
 socket and become `NotifyTouchDown/Motion/Up` calls, whose coordinates are already
 in the virtual monitor's space.
 
@@ -520,6 +577,6 @@ distribution, and tablet model.
 
 [GPL-3.0-or-later](LICENSE).
 
-Note that the default encoder, x264, is itself GPL-licensed, so a distributed
+Note that the supported x264 encoder is itself GPL-licensed, so a distributed
 binary would carry GPL obligations regardless. Licensing the project this way
 keeps the situation unambiguous.

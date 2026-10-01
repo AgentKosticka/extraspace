@@ -9,6 +9,8 @@ use gtk::glib;
 
 mod config;
 mod diagnostics;
+mod encoding;
+mod private_driver;
 mod tray;
 mod window;
 
@@ -16,6 +18,9 @@ use config::Config;
 use window::APP_ID;
 
 fn main() -> glib::ExitCode {
+    if let Err(error) = private_driver::prepare() {
+        eprintln!("Could not prepare the private Intel video driver: {error}");
+    }
     let log_writer = diagnostics::LogWriter::new();
     tracing_subscriber::fmt()
         .with_writer(move || log_writer.clone())
@@ -67,6 +72,7 @@ fn session_config(config: &Config) -> xs_core::SessionConfig {
         mode: config.display_mode(),
         scale: config.scale,
         framerate: config.framerate,
+        encoder: config.encoder.clone(),
         bounds: config.bounds(),
         mirror_source: config.mirror_source.clone(),
         apk_path: bundled_apk(),

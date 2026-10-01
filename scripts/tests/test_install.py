@@ -39,6 +39,22 @@ class Installation(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
         return result
 
+    def test_upgrade_preserves_private_gpu_launcher(self):
+        data = self.root / "data/extraspace"
+        data.mkdir(parents=True)
+        launcher = data / "launch-gpu"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        driver = data / "intel-va/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so"
+        driver.parent.mkdir(parents=True)
+        driver.write_bytes(b"test-driver")
+        self.run_install("--no-build", "--apk", str(self.apk))
+        self.assertIn(f'Exec="{launcher}"', self.desktop.read_text())
+        # A launcher without its driver must not mask the normal installation.
+        driver.unlink()
+        self.run_install("--no-build", "--apk", str(self.apk))
+        self.assertNotIn(f'Exec="{launcher}"', self.desktop.read_text())
+
     def test_upgrade_replaces_running_binary_and_preserves_settings(self):
         settings = self.root / "config/extraspace/config.json"
         settings.parent.mkdir(parents=True)

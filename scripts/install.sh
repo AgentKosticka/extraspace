@@ -91,6 +91,11 @@ fi
 copy_atomic "$REPO_ROOT/packaging/$APP_ID.svg" "$ICON_DIR/$APP_ID.svg" 644
 # Desktop Exec has its own quoting rules (not shell syntax), plus entry escapes.
 EXEC_PATH=$BIN_DIR/extraspace
+# Preserve an existing app-private Intel media driver setup across upgrades.
+# Normal installations without that driver keep using the binary directly.
+if [[ -x $DATA_DIR/extraspace/launch-gpu && -r $DATA_DIR/extraspace/intel-va/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so ]]; then
+  EXEC_PATH=$DATA_DIR/extraspace/launch-gpu
+fi
 EXEC_PATH=${EXEC_PATH//\\/\\\\}
 EXEC_PATH=${EXEC_PATH//\"/\\\"}
 EXEC_PATH=${EXEC_PATH//\$/\\\$}

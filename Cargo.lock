@@ -1864,6 +1864,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "pipewire",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",

@@ -78,7 +78,14 @@ pub fn print() {
         env!("CARGO_PKG_VERSION"),
         super::apk_version()
     );
-    for name in ["XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "WAYLAND_DISPLAY"] {
+    for name in [
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "WAYLAND_DISPLAY",
+        "LIBVA_DRIVERS_PATH",
+        "LIBVA_DRIVER_NAME",
+        "GST_REGISTRY",
+    ] {
         println!(
             "{name}: {}",
             std::env::var(name).unwrap_or_else(|_| "unset".into())
@@ -93,6 +100,10 @@ pub fn print() {
     match gstreamer::init() {
         Ok(()) => {
             println!("{}", gstreamer::version_string());
+            println!("Encoder preference: {:?}", super::Config::load().encoder);
+            for option in xs_core::available_encoders() {
+                println!("Encoder choice: {} ({})", option.label, option.factory);
+            }
             for name in [
                 "vah264lpenc",
                 "vah264enc",

@@ -89,6 +89,13 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
         &config,
         &widgets.toasts,
     );
+    let encoding = gtk::gio::SimpleAction::new("video-encoding", None);
+    let parent = window.clone();
+    let settings = config.clone();
+    let video_engine = engine.clone();
+    encoding
+        .connect_activate(move |_, _| crate::encoding::present(&parent, &video_engine, &settings));
+    app.add_action(&encoding);
     wire_controls(&widgets, &engine, &config);
     listen_to_engine(&widgets, &engine, &config);
 
@@ -242,6 +249,14 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         .model(&gtk::StringList::new(&scale_refs))
         .build();
     display_group.add(&scale_row);
+    let encoding_row = adw::ActionRow::builder()
+        .title("Video Encoding")
+        .subtitle("Choose Automatic, CPU or GPU and the encoder driver")
+        .activatable(true)
+        .action_name("app.video-encoding")
+        .build();
+    encoding_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    display_group.add(&encoding_row);
     prefs.add(&display_group);
 
     let camera_group = adw::PreferencesGroup::builder()
@@ -314,6 +329,7 @@ fn gio_menu() -> gtk::gio::Menu {
         Some("app.keep-running-in-tray"),
     );
     menu.append(Some("_Hide Window"), Some("app.hide-window"));
+    menu.append(Some("_Video Encoding"), Some("app.video-encoding"));
     menu.append(Some("_About Extraspace"), Some("app.about"));
     menu.append(Some("_Quit"), Some("app.quit"));
     menu

@@ -8,9 +8,12 @@ import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
@@ -19,20 +22,15 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 
 /**
- * The screen the tablet actually shows: a full-bleed [TextureView] fed by
- * [VideoDecoder], with touches forwarded back to the host.
- *
- * Deliberately not a Compose UI. Everything here is one surface and one gesture
- * stream, and Compose would add a recomposition layer between the touch event and
- * the socket for no benefit.
- *
- * Video is a TextureView so the cursor ImageView can composite on top.
- * A SurfaceView is a separate plane; on Samsung the decoder sits above any
- * in-window overlay, which made the pointer invisible.
+ * A direct decoder surface with the host cursor in the app layer above it.
+ * TextureView remains available for devices with broken surface composition.
  */
 class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
 
-    private lateinit var textureView: TextureView
+    private lateinit var videoView: View
+    private var textureView: TextureView? = null
+    private var surfaceView: SurfaceView? = null
+    private var ownsDecoderSurface = false
     private lateinit var statusView: TextView
     private lateinit var cursorOverlay: CursorOverlay
     private var decoder: VideoDecoder? = null
@@ -44,6 +42,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
     /** Dimensions of the incoming stream; touches are mapped into this space. */
     private var streamWidth = 0
     private var streamHeight = 0
+    private var streamFramerate = 60
 
     private val statsTicker = object : Runnable {
         override fun run() {
@@ -69,46 +68,83 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         goFullscreen()
 
         setContentView(R.layout.activity_mirror)
-        textureView = findViewById(R.id.surface)
         statusView = findViewById(R.id.status)
-        textureView.isOpaque = true
-        cursorOverlay = CursorOverlay(textureView, findViewById<ImageView>(R.id.cursor))
-
-        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-                attachDecoder(surface)
+        val original = findViewById<SurfaceView>(R.id.surface)
+        // Retain a diagnostic fallback for devices with broken surface composition.
+        if (intent.getBooleanExtra("texture_output", false)) {
+            val parent = original.parent as FrameLayout
+            parent.removeView(original)
+            val texture = TextureView(this)
+            parent.addView(texture, 0, original.layoutParams)
+            textureView = texture
+            videoView = texture
+            texture.isOpaque = true
+            texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                    if (streamWidth > 0) texture.setDefaultBufferSize(streamWidth, streamHeight)
+                    attachDecoder(Surface(texture), true)
+                }
+                override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
+                override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                    stopDecoder()
+                    return true
+                }
+                override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
+                    if (intent.getBooleanExtra("latency_trace", false) && texture.timestamp > 0) {
+                        Log.i(TAG, "latency stage=texture_updated composition_us=${(System.nanoTime() - texture.timestamp) / 1000}")
+                    }
+                }
             }
-
-            override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
-
-            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-                stopDecoder()
-                return true
-            }
-
-            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+        } else {
+            val direct = original
+            // Default surface ordering is behind the app window. The window's
+            // transparent video hole leaves cursor/status views above the video.
+            direct.setZOrderOnTop(false)
+            direct.setZOrderMediaOverlay(false)
+            surfaceView = direct
+            videoView = direct
+            direct.holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: SurfaceHolder) {
+                    attachDecoder(holder.surface, false)
+                }
+                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+                override fun surfaceDestroyed(holder: SurfaceHolder) { stopDecoder() }
+            })
         }
-        textureView.surfaceTexture?.let { attachDecoder(it) }
+        cursorOverlay = CursorOverlay(videoView, findViewById<ImageView>(R.id.cursor))
+        Log.i(TAG, "video output=${if (surfaceView != null) "surface" else "texture"}")
     }
 
-    private fun attachDecoder(surfaceTexture: SurfaceTexture) {
+    private fun attachDecoder(surface: Surface, ownsSurface: Boolean) {
         stopDecoder()
-        if (streamWidth > 0 && streamHeight > 0) {
-            surfaceTexture.setDefaultBufferSize(streamWidth, streamHeight)
-        }
-        decoderSurface = Surface(surfaceTexture)
-        decoder = VideoDecoder(decoderSurface!!)
+        decoderSurface = surface
+        ownsDecoderSurface = ownsSurface
+        decoder = VideoDecoder(surface, intent.getBooleanExtra("latency_trace", false))
         if (streamWidth > 0 && streamHeight > 0) {
             decoder?.start(streamWidth, streamHeight, null)
+            requestFrameRate()
         }
         startConnection()
+    }
+
+    private fun requestFrameRate() {
+        // A TextureView surface is consumed by the UI, so this hint only affects
+        // direct display surfaces. Never modify the tablet's global settings.
+        if (surfaceView != null) {
+            decoderSurface?.takeIf { it.isValid }?.let { surface ->
+                runCatching {
+                    surface.setFrameRate(streamFramerate.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+                }.onFailure { Log.w(TAG, "could not request stream frame rate", it) }
+            }
+        }
     }
 
     private fun stopDecoder() {
         decoder?.stop()
         decoder = null
-        decoderSurface?.release()
+        if (ownsDecoderSurface) decoderSurface?.release()
         decoderSurface = null
+        ownsDecoderSurface = false
     }
 
     private fun startConnection() {
@@ -141,7 +177,10 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         main.post {
             streamWidth = width
             streamHeight = height
-            textureView.surfaceTexture?.setDefaultBufferSize(width, height)
+            streamFramerate = framerate
+            textureView?.surfaceTexture?.setDefaultBufferSize(width, height)
+            surfaceView?.holder?.setFixedSize(width, height)
+            requestFrameRate()
             cursorOverlay.setStreamSize(width, height)
             decoder?.start(width, height, null)
             Log.i(TAG, "stream configured ${width}x$height @$framerate")
@@ -195,8 +234,8 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         // The surface may be letterboxed if the host's monitor aspect ratio does
         // not exactly match the panel, so map through the displayed rectangle
         // rather than assuming the view fills the screen.
-        val viewW = textureView.width.toFloat()
-        val viewH = textureView.height.toFloat()
+        val viewW = videoView.width.toFloat()
+        val viewH = videoView.height.toFloat()
         if (viewW <= 0f || viewH <= 0f) return false
         val scale = minOf(viewW / streamWidth, viewH / streamHeight)
         val offsetX = (viewW - streamWidth * scale) / 2f

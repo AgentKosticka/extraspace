@@ -15,6 +15,8 @@ use tracing::{debug, error, warn};
 pub mod adaptive;
 mod session;
 
+pub use xs_video::{available_encoders, EncoderOption, EncoderSelection, EncodingMode};
+
 pub use adaptive::{AdaptiveController, BitrateBounds, HealthSample};
 pub use session::{
     clamp_ui_scale, fallback_sizes, logical_size_for, modes_enabled, scaled_size_for,
@@ -35,6 +37,8 @@ pub enum Command {
     SetScale(f64),
     /// Switch between extending and mirroring.
     SetMode(DisplayMode),
+    /// Apply an encoder policy; rebuild an active session safely.
+    SetEncoder(EncoderSelection),
     /// Change the quality envelope the adaptive controller works within.
     SetBitrateBounds(BitrateBounds),
     /// Start or stop camera passthrough.

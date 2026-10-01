@@ -53,6 +53,7 @@ pub struct SessionConfig {
     /// see [`virtual_size_for`].
     pub scale: f64,
     pub framerate: u32,
+    pub encoder: crate::EncoderSelection,
     pub bounds: BitrateBounds,
     /// Connector to mirror when [`DisplayMode::Mirror`], e.g. `DP-3`.
     pub mirror_source: Option<String>,
@@ -69,6 +70,7 @@ impl Default for SessionConfig {
             mode: DisplayMode::Extend,
             scale: 1.5,
             framerate: 60,
+            encoder: crate::EncoderSelection::default(),
             bounds: BitrateBounds::default(),
             mirror_source: None,
             apk_path: None,
@@ -208,10 +210,11 @@ impl Active {
         for task in self.tasks.drain(..) {
             task.abort();
         }
+        // Release driver/capture resources while the PipeWire node still exists.
+        self.pipeline.stop();
         if let Err(e) = self.mutter.close().await {
             warn!(error = %e, "mutter session close");
         }
-        self.pipeline.stop();
         self.transport.disconnect().await;
         info!("session stopped");
     }
@@ -235,6 +238,13 @@ pub async fn run(
         let command = tokio::select! {
             command = commands.recv() => match command { Some(c) => c, None => break },
             _ = poll.tick() => {
+                if let Some(message) = active.as_ref().and_then(|session| session.pipeline.failure()) {
+                    if let Some(session) = active.take() { session.shutdown().await; }
+                    wanted = false;
+                    emit(State::Failed { message: format!("Video encoding failed: {message}. Choose another encoder in Video Encoding, then connect again.") });
+                    tokio::time::sleep(TEARDOWN_SETTLE).await;
+                    continue;
+                }
                 let lost = active.as_ref().is_some_and(|session| {
                     session.tasks.iter().take(4).any(JoinHandle::is_finished)
                         || monotonic_us().saturating_sub(session.last_contact_us.load(Ordering::Relaxed)) > 5_000_000
@@ -289,6 +299,22 @@ pub async fn run(
 
             Command::SetMode(mode) => {
                 config.mode = mode;
+                if let Some(session) = active.take() {
+                    session.shutdown().await;
+                    tokio::time::sleep(TEARDOWN_SETTLE).await;
+                    let (session, retry) = try_connect(&config, &events).await;
+                    active = session;
+                    if !retry {
+                        wanted = false;
+                    }
+                }
+            }
+
+            Command::SetEncoder(selection) => {
+                if config.encoder == selection {
+                    continue;
+                }
+                config.encoder = selection;
                 if let Some(session) = active.take() {
                     session.shutdown().await;
                     tokio::time::sleep(TEARDOWN_SETTLE).await;
@@ -444,6 +470,19 @@ async fn connect_streams(
         "sizing the virtual monitor"
     );
 
+    // Resolve the user's saved policy before creating any monitor.
+    // The legacy environment override affects only an unpinned Auto selection.
+    let mut selection = config.encoder.clone();
+    if selection.mode == crate::EncodingMode::Auto
+        && selection.factory.is_none()
+        && std::env::var("EXTRASPACE_GPU").ok().as_deref() == Some("0")
+    {
+        selection.mode = crate::EncodingMode::Cpu;
+    }
+    let candidates = selection
+        .candidates(crate::available_encoders())
+        .map_err(anyhow::Error::msg)?;
+
     step("Creating the display…");
     let source = match (config.mode, &config.mirror_source) {
         (DisplayMode::Mirror, Some(connector)) => CaptureSource::Monitor(connector.clone()),
@@ -481,30 +520,74 @@ async fn connect_streams(
 
     step("Starting the video pipeline…");
     let start_kbps = starting_bitrate(width, height, config.framerate, config.bounds);
-    let (pipeline, mut frames, mut cursor_rx) = VideoPipeline::new(
-        mutter.node_id(),
-        PipelineConfig {
-            width,
-            height,
-            framerate: config.framerate,
-            bitrate_kbps: start_kbps,
-            scale,
-        },
-    )?;
-    let encoder_name = pipeline.encoder().human_name().to_string();
-    pipeline.start()?;
-    // Patched Mutter may need an inactive virtual output enabled before it can
-    // capture anything. This activation remains behind the existing patch gate.
-    mutter.finalize_display_layout().await?;
-    // A PipeWire node existing is not evidence that its virtual CRTC/view exists.
-    // Wait for a real encoded frame before any placement-only ApplyMonitorsConfig.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while pipeline.stats().snapshot().0 == 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let pipeline_config = PipelineConfig {
+        width,
+        height,
+        framerate: config.framerate,
+        bitrate_kbps: start_kbps,
+        scale,
+    };
+    let mut failures = Vec::new();
+    let mut started = None;
+    for candidate in candidates {
+        step(&format!("Starting {}…", candidate.label));
+        let attempt =
+            VideoPipeline::new_with_encoder(mutter.node_id(), pipeline_config.clone(), &candidate);
+        let (pipeline, frames, cursor_rx) = match attempt {
+            Ok(built) => built,
+            Err(e) => {
+                failures.push(format!("{}: {e}", candidate.label));
+                continue;
+            }
+        };
+        let ready = async {
+            pipeline.start()?;
+            mutter.finalize_display_layout().await?;
+            // Both async driver errors and a no-output timeout count as failure.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(message) = pipeline.failure() {
+                        anyhow::bail!("{message}");
+                    }
+                    if pipeline.stats().snapshot().0 > 0 {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("no encoded frame within 5 seconds"))??;
+            Ok::<_, anyhow::Error>(())
         }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("capture produced no frame within 5 seconds"))?;
+        .await;
+        match ready {
+            Ok(()) => {
+                if !failures.is_empty() {
+                    warn!(failures = ?failures, encoder = candidate.factory, "using fallback encoder");
+                    let _ = events.send(Event::Warning(format!(
+                        "An encoder could not start. Using {}.",
+                        candidate.label
+                    )));
+                }
+                started = Some((pipeline, frames, cursor_rx));
+                break;
+            }
+            Err(e) => {
+                failures.push(format!("{}: {e}", candidate.label));
+                pipeline.stop();
+                // Drop the sole PipeWire consumer before trying another one.
+                drop(pipeline);
+            }
+        }
+    }
+    let Some((pipeline, mut frames, mut cursor_rx)) = started else {
+        let _ = mutter.close().await;
+        anyhow::bail!(
+            "Could not start video encoding. {}. Choose another encoder in Video Encoding.",
+            failures.join("; ")
+        );
+    };
+    let encoder_name = pipeline.encoder_label().to_string();
     mutter.restore_display_placement().await;
     let pipeline = Arc::new(pipeline);
 
@@ -554,9 +637,16 @@ async fn connect_streams(
     {
         let write_pace = Arc::clone(&write_pace);
         let mut video_writer = FrameWriter::new(video);
+        let recovery_pipeline = Arc::clone(&pipeline);
         tasks.push(tokio::spawn(async move {
             let mut last_start = Instant::now();
-            while let Some(frame) = frames.recv().await {
+            let mut recovery_poll = tokio::time::interval(Duration::from_millis(100));
+            recovery_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let frame = tokio::select! {
+                    _ = recovery_poll.tick() => { recovery_pipeline.recover_dropped_frames(); continue; }
+                    frame = frames.recv() => match frame { Some(frame) => frame, None => break },
+                };
                 let inter = last_start.elapsed();
                 last_start = Instant::now();
                 let flag = if frame.keyframe { flags::KEYFRAME } else { 0 };

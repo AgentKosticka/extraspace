@@ -30,7 +30,7 @@
 //! up, frames are dropped here rather than allowed to accumulate -- for a live
 //! display, a stale frame has no value.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -43,8 +43,11 @@ use tracing::{debug, error, info, warn};
 mod cursor;
 mod encoder;
 mod pacing;
+mod recovery;
+mod selection;
 pub use encoder::Encoder;
 pub use pacing::StagePace;
+pub use selection::{available_encoders, EncoderOption, EncoderSelection, EncodingMode};
 
 /// `(frames, gaps, max_gap_us)` for one pipeline stage.
 pub type PaceWindow = (u64, u64, u64);
@@ -87,26 +90,6 @@ fn pipeline_kind() -> PipelineKind {
     }
 }
 
-/// Picks the encoder, preferring the GPU. Set `EXTRASPACE_GPU=0` to force
-/// software encoding.
-///
-/// Measured at 2296x1428 on an i7-1355U: `videoconvert` plus `x264enc` costs
-/// 22.4 ms per frame, a 45 fps ceiling before mutter has done any work, and
-/// neither more threads (2 to 6) nor `ultrafast` recovered more than a tenth of
-/// it -- the chain is limited by DRAM bandwidth, not compute. VA-API encode of
-/// the same frames costs about 1 ms, so the GPU is preferred whenever it is
-/// available, even though realising the win also needs the frames to arrive as
-/// dma-bufs rather than as a copy.
-fn select_encoder() -> Result<Encoder> {
-    if !matches!(std::env::var("EXTRASPACE_GPU").ok().as_deref(), Some("0")) {
-        if let Some(gpu) = Encoder::detect_gpu() {
-            return Ok(gpu);
-        }
-        debug!("no VA-API encoder found; falling back to software");
-    }
-    Encoder::detect().ok_or(Error::NoEncoder)
-}
-
 /// Pixel layouts that can be both requested from mutter and imported by the
 /// GPU, in descending order of preference. Mutter offers the `x`/`A` pairs of
 /// each ordering; the DRM fourccs are what `vapostproc` lists in its dma-buf
@@ -124,8 +107,8 @@ const DMABUF_CANDIDATES: [(&str, &str); 4] = [
 ///
 /// Returns `None` when the VA plugin is absent or lists no importable layout,
 /// which leaves capture on the system-memory path.
-fn va_dmabuf_import() -> Option<cursor::DmaBufImport> {
-    let factory = gst::ElementFactory::find("vapostproc")?;
+fn va_dmabuf_import(postproc: &str) -> Option<cursor::DmaBufImport> {
+    let factory = gst::ElementFactory::find(postproc)?;
     let mut supported: Vec<(String, u64)> = Vec::new();
     for template in factory.static_pad_templates() {
         if template.direction() != gst::PadDirection::Sink {
@@ -259,6 +242,9 @@ pub struct VideoPipeline {
     pipeline: gst::Pipeline,
     encoder_element: gst::Element,
     encoder: Encoder,
+    encoder_label: String,
+    failure: Arc<Mutex<Option<String>>>,
+    keyframe_needed: Arc<AtomicBool>,
     stats: Arc<VideoStats>,
     config: VideoConfig,
     capture_pace: Arc<StagePace>,
@@ -280,7 +266,25 @@ impl VideoPipeline {
     ) -> Result<(Self, mpsc::Receiver<EncodedFrame>, mpsc::Receiver<()>)> {
         gst::init()?;
 
-        let encoder = select_encoder()?;
+        let mut selection = EncoderSelection::default();
+        if matches!(std::env::var("EXTRASPACE_GPU").ok().as_deref(), Some("0")) {
+            selection.mode = EncodingMode::Cpu;
+        }
+        let option = selection
+            .candidates(available_encoders())
+            .map_err(Error::Pipeline)?
+            .remove(0);
+        Self::new_with_encoder(node_id, config, &option)
+    }
+
+    pub fn new_with_encoder(
+        node_id: u32,
+        config: VideoConfig,
+        option: &EncoderOption,
+    ) -> Result<(Self, mpsc::Receiver<EncodedFrame>, mpsc::Receiver<()>)> {
+        gst::init()?;
+        validate_config(&config)?;
+        let encoder = option.encoder;
         let stats = Arc::new(VideoStats::default());
         let capture_pace = Arc::new(StagePace::new("capture"));
         let rate_pace = Arc::new(StagePace::new("videorate"));
@@ -319,8 +323,9 @@ impl VideoPipeline {
         overlay_src.set_property_from_str("leaky-type", "downstream");
 
         let kind = pipeline_kind();
-        let encoder_element = encoder.build(config.bitrate_kbps, config.framerate)?;
+        let encoder_element = option.build(config.bitrate_kbps, config.framerate)?;
         let (tx, rx) = mpsc::channel(FRAME_QUEUE_DEPTH);
+        let keyframe_needed = Arc::new(AtomicBool::new(false));
 
         match kind {
             PipelineKind::Full => {
@@ -339,9 +344,9 @@ impl VideoPipeline {
                 // A GPU encoder wants a VA surface, and `vapostproc` is what
                 // produces one -- importing the frame for free when it arrives
                 // as a dma-buf, and uploading it when it does not.
-                let (convert, convert_caps) = if encoder.is_gpu() {
+                let (convert, convert_caps) = if let Some(postproc) = &option.postproc {
                     (
-                        make("vapostproc")?,
+                        gst::ElementFactory::make(postproc).build()?,
                         caps_filter(
                             gst::Caps::builder("video/x-raw")
                                 .features(["memory:VAMemory"])
@@ -355,7 +360,14 @@ impl VideoPipeline {
                         make("videoconvert")?,
                         caps_filter(
                             gst::Caps::builder("video/x-raw")
-                                .field("format", "I420")
+                                .field(
+                                    "format",
+                                    if encoder == Encoder::NvH264 {
+                                        "NV12"
+                                    } else {
+                                        "I420"
+                                    },
+                                )
                                 .field("colorimetry", YUV_COLORIMETRY)
                                 .build(),
                         )?,
@@ -397,6 +409,8 @@ impl VideoPipeline {
 
                 let sink_stats = Arc::clone(&stats);
                 let sink_pace = Arc::clone(&encode_pace);
+                let recovery_request = Arc::clone(&keyframe_needed);
+                let mut recovery = recovery::FrameRecovery::default();
                 appsink.set_callbacks(
                     gstreamer_app::AppSinkCallbacks::builder()
                         .new_sample(move |sink| {
@@ -404,6 +418,10 @@ impl VideoPipeline {
                             let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                             let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                             let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                            if !recovery.accepts(keyframe) {
+                                sink_stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                                return Ok(gst::FlowSuccess::Ok);
+                            }
                             let pts_us = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
                             let au_bytes = map.len();
                             let frame = EncodedFrame {
@@ -425,9 +443,12 @@ impl VideoPipeline {
                             sink_pace.observe(au_bytes, pts_us, keyframe.then_some("keyframe"));
                             match tx.try_send(frame) {
                                 Ok(()) => {
+                                    recovery.delivered(keyframe);
                                     sink_stats.frames_encoded.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Err(mpsc::error::TrySendError::Full(_)) => {
+                                    recovery.dropped();
+                                    recovery_request.store(true, Ordering::Relaxed);
                                     sink_stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -503,20 +524,20 @@ impl VideoPipeline {
 
         // Only worth asking for dma-bufs if the encoder can take them without a
         // trip through the CPU; a software encoder would have to map them back.
-        let dmabuf = if encoder.is_gpu()
+        let dmabuf = if option.postproc.is_some()
             && kind == PipelineKind::Full
             && !matches!(
                 std::env::var("EXTRASPACE_DMABUF").ok().as_deref(),
                 Some("0")
             ) {
-            va_dmabuf_import()
+            option.postproc.as_deref().and_then(va_dmabuf_import)
         } else {
             None
         };
 
         info!(
             node_id,
-            encoder = encoder.element_name(),
+            encoder = option.factory,
             dmabuf = dmabuf.is_some(),
             width = config.width,
             height = config.height,
@@ -532,6 +553,9 @@ impl VideoPipeline {
                 pipeline,
                 encoder_element,
                 encoder,
+                encoder_label: option.label.clone(),
+                failure: Arc::new(Mutex::new(None)),
+                keyframe_needed,
                 stats,
                 config,
                 capture_pace,
@@ -559,6 +583,10 @@ impl VideoPipeline {
     }
 
     pub fn start(&self) -> Result<()> {
+        *self.failure.lock().expect("pipeline failure lock") = None;
+        if let Some(bus) = self.pipeline.bus() {
+            bus.set_flushing(false);
+        }
         self.watch_bus();
         self.pipeline
             .set_state(gst::State::Playing)
@@ -584,30 +612,39 @@ impl VideoPipeline {
     }
 
     pub fn stop(&self) {
+        debug!("stopping PipeWire capture");
         if let Ok(mut capture) = self.capture.lock() {
             *capture = None;
         }
+        debug!("stopping GStreamer encoder");
         if let Err(e) = self.pipeline.set_state(gst::State::Null) {
             warn!(error = %e, "pipeline did not stop cleanly");
         }
+        if let Some(bus) = self.pipeline.bus() {
+            bus.set_flushing(true);
+        }
+        if let Some(bus) = self.pipeline.bus() {
+            bus.unset_sync_handler();
+        }
+        debug!("video pipeline stopped");
     }
 
     /// Adjusts bitrate on the running pipeline; the adaptive controller's lever.
     pub fn set_bitrate(&self, kbps: u32) {
-        self.encoder.set_bitrate(&self.encoder_element, kbps);
+        if let Err(e) = self.encoder.set_bitrate(&self.encoder_element, kbps) {
+            warn!(error = %e, kbps, "encoder rejected bitrate change");
+            *self.failure.lock().expect("pipeline failure lock") = Some(e.to_string());
+        }
         debug!(kbps, "bitrate updated");
     }
 
     /// Asks the encoder for an immediate keyframe, with headers. Used when the
     /// tablet reconnects or reports it cannot decode.
     pub fn request_keyframe(&self) {
-        let structure = gst::Structure::builder("GstForceKeyUnit")
-            .field("all-headers", true)
+        let event = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
             .build();
-        if !self
-            .encoder_element
-            .send_event(gst::event::CustomUpstream::new(structure))
-        {
+        if !self.encoder_element.send_event(event) {
             debug!("encoder did not accept the force-keyframe request");
         }
     }
@@ -629,6 +666,21 @@ impl VideoPipeline {
         self.encoder
     }
 
+    /// Request recovery outside the appsink callback to avoid re-entering the encoder.
+    pub fn recover_dropped_frames(&self) {
+        if self.keyframe_needed.swap(false, Ordering::Relaxed) {
+            self.request_keyframe();
+        }
+    }
+
+    pub fn encoder_label(&self) -> &str {
+        &self.encoder_label
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().expect("pipeline failure lock").clone()
+    }
+
     pub fn config(&self) -> &VideoConfig {
         &self.config
     }
@@ -639,28 +691,28 @@ impl VideoPipeline {
         let Some(bus) = self.pipeline.bus() else {
             return;
         };
-        std::thread::spawn(move || {
-            for msg in bus.iter_timed(gst::ClockTime::NONE) {
-                match msg.view() {
-                    gst::MessageView::Error(e) => {
-                        error!(
-                            source = ?e.src().map(|s| s.path_string()),
-                            error = %e.error(),
-                            debug = ?e.debug(),
-                            "pipeline error"
-                        );
-                        break;
-                    }
-                    gst::MessageView::Warning(w) => {
-                        warn!(warning = %w.error(), "pipeline warning");
-                    }
-                    gst::MessageView::Eos(_) => {
-                        info!("pipeline reached end of stream");
-                        break;
-                    }
-                    _ => {}
+        let failure = Arc::clone(&self.failure);
+        // Record errors as they are posted. A separate thread blocked forever on
+        // an idle bus complicates teardown and can prevent encoder switching.
+        // Drop handled messages so an unattended pipeline cannot grow a bus queue.
+        bus.set_sync_handler(move |_, msg| {
+            match msg.view() {
+                gst::MessageView::Error(e) => {
+                    *failure.lock().expect("pipeline failure lock") = Some(format!(
+                        "{}: {}",
+                        e.src().map(|s| s.name().to_string()).unwrap_or_default(),
+                        e.error()
+                    ));
+                    error!(error = %e.error(), debug = ?e.debug(), "pipeline error");
                 }
+                gst::MessageView::Warning(w) => warn!(warning = %w.error(), "pipeline warning"),
+                gst::MessageView::Eos(_) => {
+                    *failure.lock().expect("pipeline failure lock") =
+                        Some("Video encoder stopped producing output".into());
+                }
+                _ => {}
             }
+            gst::BusSyncReply::Drop
         });
     }
 }
@@ -668,5 +720,51 @@ impl VideoPipeline {
 impl Drop for VideoPipeline {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+fn validate_config(config: &VideoConfig) -> Result<()> {
+    if config.width < 2
+        || config.height < 2
+        || config.width > i32::MAX as u32
+        || config.height > i32::MAX as u32
+        || config.width % 2 != 0
+        || config.height % 2 != 0
+        || !(1..=240).contains(&config.framerate)
+        || config.bitrate_kbps == 0
+    {
+        return Err(Error::Pipeline(
+            "Invalid video configuration: use even dimensions, 1–240 fps and a positive bitrate"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    #[test]
+    fn rejects_invalid_capture_modes_before_building_or_dividing_by_fps() {
+        assert!(validate_config(&VideoConfig::default()).is_ok());
+        for fps in [0, 241, u32::MAX] {
+            assert!(validate_config(&VideoConfig {
+                framerate: fps,
+                ..Default::default()
+            })
+            .is_err());
+        }
+        for width in [0, 1, 1333, u32::MAX] {
+            assert!(validate_config(&VideoConfig {
+                width,
+                ..Default::default()
+            })
+            .is_err());
+        }
+        assert!(validate_config(&VideoConfig {
+            bitrate_kbps: 0,
+            ..Default::default()
+        })
+        .is_err());
     }
 }

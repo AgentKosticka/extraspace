@@ -31,6 +31,8 @@ pub enum Encoder {
     VaH264Lp,
     /// VA-API on the general encode engine, where VDENC is absent.
     VaH264,
+    /// NVIDIA NVENC using the installed nvcodec driver.
+    NvH264,
 }
 
 impl Encoder {
@@ -40,15 +42,17 @@ impl Encoder {
             Self::OpenH264 => "openh264enc",
             Self::VaH264Lp => "vah264lpenc",
             Self::VaH264 => "vah264enc",
+            Self::NvH264 => "nvh264enc",
         }
     }
 
     pub fn human_name(self) -> &'static str {
         match self {
-            Self::X264 => "x264 (software, recommended)",
-            Self::OpenH264 => "OpenH264 (software, fallback)",
+            Self::X264 => "x264 (CPU)",
+            Self::OpenH264 => "OpenH264 (CPU)",
             Self::VaH264Lp => "VA-API (GPU, low-power engine)",
             Self::VaH264 => "VA-API (GPU)",
+            Self::NvH264 => "NVIDIA NVENC (GPU)",
         }
     }
 
@@ -59,7 +63,7 @@ impl Encoder {
     /// encode itself, so a GPU encoder is only worth having if the frames reach
     /// it without a trip through the CPU.
     pub fn is_gpu(self) -> bool {
-        matches!(self, Self::VaH264Lp | Self::VaH264)
+        matches!(self, Self::VaH264Lp | Self::VaH264 | Self::NvH264)
     }
 
     /// Encoders in descending order of preference.
@@ -105,64 +109,119 @@ impl Encoder {
     /// in exactly one place.
     fn bitrate_property_value(self, kbps: u32) -> u32 {
         match self {
-            Self::X264 | Self::VaH264Lp | Self::VaH264 => kbps,
+            Self::X264 | Self::VaH264Lp | Self::VaH264 | Self::NvH264 => kbps,
             Self::OpenH264 => kbps.saturating_mul(1000),
         }
     }
 
     /// Builds the encoder element configured for low-latency streaming.
     pub fn build(self, kbps: u32, framerate: u32) -> Result<gst::Element, gst::glib::BoolError> {
-        let e = gst::ElementFactory::make(self.element_name());
-        let element = match self {
-            Self::X264 => e
-                .property("bitrate", self.bitrate_property_value(kbps))
-                // zerolatency disables lookahead and B-frames; without it the
-                // encoder buffers frames and adds tens of milliseconds.
-                .property_from_str("tune", "zerolatency")
-                .property_from_str("speed-preset", "veryfast")
-                // Sliced threads keep zerolatency's frame-in/frame-out; the
-                // default thread pool can add a scheduling hitch on U-series CPUs.
-                .property("sliced-threads", true)
-                .property("threads", 2u32)
-                // Annex-B, so the tablet can feed bytes straight to MediaCodec.
-                .property_from_str("byte-stream", "true")
-                // Keyframe interval is counted in *frames*, and an idle desktop
-                // only produces ~11 fps, so a naive framerate*2 can mean ten
-                // seconds between keyframes -- and a tablet that reconnects
-                // stares at a black screen until the next one. Sized against the
-                // idle rate instead, and the session explicitly asks for a
-                // keyframe whenever a tablet attaches.
-                .property("key-int-max", keyframe_interval_frames(framerate))
-                .build()?,
-            Self::OpenH264 => e
-                .property("bitrate", self.bitrate_property_value(kbps))
-                .property_from_str("rate-control", "bitrate")
-                .property_from_str("complexity", "low")
-                .property("gop-size", keyframe_interval_frames(framerate))
-                .build()?,
-            // Rate control is left at the element's default (CBR), which the
-            // adaptive controller can steer predictably. B-frames would reorder
-            // output and add a frame of latency for a display that is being
-            // driven live, and one reference frame is all a screen cast needs.
-            Self::VaH264Lp | Self::VaH264 => e
-                .property("bitrate", self.bitrate_property_value(kbps))
-                .property("key-int-max", keyframe_interval_frames(framerate))
-                .property("b-frames", 0u32)
-                .property("ref-frames", 1u32)
-                .build()?,
+        self.build_factory(self.element_name(), kbps, framerate)
+    }
+
+    /// Configure only a supported factory, including a device-specific variant.
+    pub(crate) fn build_factory(
+        self,
+        factory: &str,
+        kbps: u32,
+        framerate: u32,
+    ) -> Result<gst::Element, gst::glib::BoolError> {
+        let element = gst::ElementFactory::make(factory).build()?;
+        let bitrate = self.bitrate_property_value(kbps);
+        set_checked(&element, "bitrate", &bitrate.to_string())?;
+        let gop = keyframe_interval_frames(framerate).to_string();
+        let properties: &[(&str, &str)] = match self {
+            Self::X264 => &[
+                ("tune", "zerolatency"),
+                ("speed-preset", "veryfast"),
+                ("sliced-threads", "true"),
+                ("threads", "2"),
+                ("byte-stream", "true"),
+                ("key-int-max", &gop),
+                // Bound burst size to a short live-display budget.
+                ("vbv-buf-capacity", "100"),
+            ],
+            Self::OpenH264 => &[
+                ("rate-control", "bitrate"),
+                ("complexity", "low"),
+                ("gop-size", &gop),
+            ],
+            Self::VaH264Lp | Self::VaH264 => &[
+                ("rate-control", "cbr"),
+                ("key-int-max", &gop),
+                ("b-frames", "0"),
+                ("ref-frames", "1"),
+            ],
+            Self::NvH264 => &[
+                ("rc-mode", "cbr"),
+                ("gop-size", &gop),
+                ("bframes", "0"),
+                ("rc-lookahead", "0"),
+                ("zerolatency", "true"),
+                ("repeat-sequence-header", "true"),
+            ],
         };
-        debug!(
-            encoder = self.element_name(),
-            kbps, framerate, "encoder built"
-        );
+        for (name, value) in properties {
+            set_checked(&element, name, value)?;
+        }
+        debug!(encoder = factory, kbps, framerate, "encoder built");
         Ok(element)
     }
 
-    /// Changes bitrate on a running pipeline. Both supported encoders accept this
-    /// in PLAYING state, which is what makes adaptive control possible.
-    pub fn set_bitrate(self, element: &gst::Element, kbps: u32) {
-        element.set_property("bitrate", self.bitrate_property_value(kbps));
+    pub fn set_bitrate(
+        self,
+        element: &gst::Element,
+        kbps: u32,
+    ) -> Result<(), gst::glib::BoolError> {
+        set_checked(
+            element,
+            "bitrate",
+            &self.bitrate_property_value(kbps).to_string(),
+        )
     }
+}
+
+/// Driver versions can expose different properties/ranges. Turn incompatibility
+/// into a recoverable error rather than a GObject property-set panic.
+fn set_checked(element: &gst::Element, name: &str, text: &str) -> Result<(), gst::glib::BoolError> {
+    let pspec = element
+        .find_property(name)
+        .ok_or_else(|| gst::glib::bool_error!("{} has no {} property", element.name(), name))?;
+    if !pspec.flags().contains(gst::glib::ParamFlags::WRITABLE)
+        || pspec
+            .flags()
+            .contains(gst::glib::ParamFlags::CONSTRUCT_ONLY)
+    {
+        return Err(gst::glib::bool_error!("{} is not writable", name));
+    }
+    if let Some(spec) = pspec.downcast_ref::<gst::glib::ParamSpecUInt>() {
+        let value = text
+            .parse::<u32>()
+            .map_err(|_| gst::glib::bool_error!("invalid {}", name))?;
+        if value < spec.minimum() || value > spec.maximum() {
+            return Err(gst::glib::bool_error!(
+                "{} must be between {} and {}",
+                name,
+                spec.minimum(),
+                spec.maximum()
+            ));
+        }
+    } else if let Some(spec) = pspec.downcast_ref::<gst::glib::ParamSpecInt>() {
+        let value = text
+            .parse::<i32>()
+            .map_err(|_| gst::glib::bool_error!("invalid {}", name))?;
+        if value < spec.minimum() || value > spec.maximum() {
+            return Err(gst::glib::bool_error!(
+                "{} must be between {} and {}",
+                name,
+                spec.minimum(),
+                spec.maximum()
+            ));
+        }
+    }
+    let value = gst::glib::Value::deserialize(text, pspec.value_type())?;
+    element.set_property_from_value(name, &value);
+    Ok(())
 }
 
 /// Keyframe interval, in frames, targeting roughly two seconds of *wall clock*.
@@ -198,11 +257,12 @@ mod tests {
     }
 
     #[test]
-    fn only_va_encoders_are_gpu() {
+    fn hardware_backends_are_gpu() {
         assert!(Encoder::VaH264Lp.is_gpu());
         assert!(Encoder::VaH264.is_gpu());
         assert!(!Encoder::X264.is_gpu());
         assert!(!Encoder::OpenH264.is_gpu());
+        assert!(Encoder::NvH264.is_gpu());
     }
 
     #[test]
@@ -229,6 +289,36 @@ mod tests {
     fn keyframe_interval_is_never_degenerate() {
         for fps in [0, 1, 2, 5, 60, 240] {
             assert!(keyframe_interval_frames(fps) >= 2, "fps {fps}");
+        }
+    }
+
+    #[test]
+    fn incompatible_properties_return_errors_instead_of_panicking() {
+        gst::init().unwrap();
+        let element = gst::ElementFactory::make("fakesink").build().unwrap();
+        assert!(set_checked(&element, "nonexistent", "1").is_err());
+        assert!(set_checked(&element, "num-buffers", "999999999999").is_err());
+        assert!(set_checked(&element, "sync", "not-a-boolean").is_err());
+        set_checked(&element, "sync", "false").unwrap();
+        assert!(!element.property::<bool>("sync"));
+    }
+
+    #[test]
+    fn software_encoders_build_and_accept_bitrate_changes_when_installed() {
+        gst::init().unwrap();
+        for encoder in Encoder::PREFERENCE {
+            if !encoder.is_available() {
+                continue;
+            }
+            let element = encoder.build(15_000, 60).unwrap();
+            encoder.set_bitrate(&element, 10_000).unwrap();
+            assert_eq!(
+                element.property::<u32>("bitrate"),
+                encoder.bitrate_property_value(10_000)
+            );
+            if encoder == Encoder::X264 {
+                assert!(encoder.set_bitrate(&element, u32::MAX).is_err());
+            }
         }
     }
 }
