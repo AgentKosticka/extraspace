@@ -1,9 +1,11 @@
 //! The extraspace wire protocol, shared by the Linux daemon and the Android app.
 //!
-//! Three separate sockets are used rather than one multiplexed stream. Touch events
-//! are tiny and latency-critical; video is a steady ~15 Mbit/s. Sharing one socket
-//! would queue a touch behind whatever video frame is in flight, so they are kept
-//! apart and the channel byte exists mainly for sanity-checking and logging.
+//! ADB uses separate control/touch, video and camera sockets so a large video
+//! frame cannot queue a latency-sensitive touch. Android Open Accessory (AOA)
+//! multiplexes those channels over one USB bulk stream. The channel byte routes
+//! each frame to its consumer; it is required routing information on AOA and
+//! validates the stream on ADB. AOA sends Hello only in response to HelloRequest;
+//! ADB sends Hello when the control socket connects.
 //!
 //! Every frame carries a fixed 20-byte header, little-endian:
 //!
@@ -91,7 +93,7 @@ pub enum ControlKind {
     Error = 6,
     /// Host -> device: cursor overlay. Binary; see [`CursorMessage`].
     Cursor = 7,
-    /// Host -> accessory: repeat Hello after reconnecting the bulk endpoints.
+    /// Host -> accessory: request Hello on initial connection or reconnection.
     HelloRequest = 8,
     /// Host -> accessory: stop displaying without physically unplugging USB.
     SessionEnd = 9,
@@ -377,7 +379,7 @@ impl TouchEvent {
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < TOUCH_PAYLOAD_LEN {
+        if buf.len() != TOUCH_PAYLOAD_LEN {
             return None;
         }
         Some(Self {
@@ -496,6 +498,23 @@ mod tests {
             y: 987.6543,
         };
         assert_eq!(TouchEvent::decode(&t.encode()).unwrap(), t);
+    }
+
+    #[test]
+    fn touch_rejects_truncated_and_extended_payloads() {
+        let event = TouchEvent {
+            action: TouchAction::Down,
+            slot: 0,
+            x: 1.0,
+            y: 2.0,
+        };
+        let encoded = event.encode();
+        for length in 0..TOUCH_PAYLOAD_LEN {
+            assert!(TouchEvent::decode(&encoded[..length]).is_none());
+        }
+        let mut extended = encoded.to_vec();
+        extended.push(0);
+        assert!(TouchEvent::decode(&extended).is_none());
     }
 
     #[test]

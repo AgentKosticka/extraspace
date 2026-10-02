@@ -1,20 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Extraspace</string>
-    <string name="waiting_for_host">Waiting for your computer…\n\nKeep this screen open and start Extraspace on your desktop.</string>
+    <string name="waiting_for_host">Waiting for your computer…</string>
     <string name="disconnected">Disconnected: %1$s</string>
-    <string name="usb_method">USB connection method</string>
-    <string name="retry">Retry connection</string>
-    <string name="display_test">Display / touch check</string>
+    <string name="usb_method">Connection method</string>
+    <string name="retry">Check Again</string>
+    <string name="display_test">Display &amp; Touch Check</string>
     <string name="resume_display">Return to desktop</string>
     <string name="device_processing">Experimental device frame selection</string>
     <string name="processing_help">Choose the newest decoded frame on this device when several are ready. May reduce lag under load. Desktop capture and encoding still run on the computer.</string>
-    <string name="setup_help">ADB: Enable USB debugging, accept the computer authorization prompt, and turn on Extra Display on the PC. The PC opens and refreshes this app automatically.\n\nUSB accessory: Choose USB accessory in the PC’s USB Connection menu, connect a data cable, and allow USB access here. USB debugging is optional.\n\nYour device ID lets the PC remember display position, GNOME scale and ExtraSpace preferences. Reinstalling or clearing app data creates a new ID. Use Android Back to open this screen during streaming.</string>
-    <string name="allow_accessory">Allow this computer to display its desktop?</string>
-    <string name="accessory_explanation">ExtraSpace will receive video and send your touches over USB. Camera use requires a separate Android camera permission.</string>
-    <string name="allow">Allow</string>
-    <string name="deny">Deny</string>
-    <string name="accessory_denied">USB accessory access denied. Tap Retry connection to allow it.</string>
+    <string name="setup_help">ADB: Enable USB debugging, accept the computer authorization prompt, and turn on Extra Display on the PC. The PC opens and refreshes this app automatically.\n\nUSB accessory: Select USB accessory (AOA) in USB Connection on your computer. Connect a data cable and open Extraspace from Android’s USB prompt. USB debugging is optional.\n\nYour device ID lets the PC remember display position, GNOME scale and Extraspace settings. Reinstalling or clearing app data creates a new ID. Use Android Back to open this screen during streaming.</string>
+    <string name="accessory_denied">USB accessory access denied. Tap Check Again to allow it.</string>
     <string name="accessory_waiting">Waiting for USB accessory. Select USB accessory on the PC, then connect the cable.</string>
     <string name="usb_permission_waiting">Accept the Android USB access prompt to start displaying.</string>
+    <string name="product_subtitle">Your desktop, with more space</string>
+    <string name="usb_connection">USB Connection</string>
+    <string name="display_settings">Display</string>
+    <string name="getting_started">Getting Started</string>
+    <string name="connection_help">Use the same connection method on your computer and tablet. Android handles USB permission.</string>
+    <string-array name="connection_methods">
+        <item>Automatic</item><item>ADB (USB debugging)</item><item>USB accessory (AOA)</item>
+    </string-array>
 </resources>

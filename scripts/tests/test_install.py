@@ -2,6 +2,7 @@
 """Exercise installation/upgrade/removal in isolated XDG directories."""
 import os
 import hashlib
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -126,7 +127,10 @@ class Installation(unittest.TestCase):
         curl = mocks / "curl"
         curl.write_text("#!/usr/bin/env python3\n" +
                         "import os, sys, shutil\nfrom pathlib import Path\n" +
-                        "shutil.copyfile(Path(os.environ['TEST_RELEASE']) / sys.argv[-3].rsplit('/', 1)[-1], sys.argv[-1])\n")
+                        "url = sys.argv[-3] if '-o' in sys.argv else sys.argv[-1]\n" +
+                        "asset = Path(os.environ['TEST_RELEASE']) / url.rsplit('/', 1)[-1]\n" +
+                        "if '-o' in sys.argv: shutil.copyfile(asset, sys.argv[-1])\n" +
+                        "else: sys.stdout.write(asset.read_text())\n")
         curl.chmod(0o755)
         self.env.update(TEST_RELEASE=str(assets),
                         PATH=str(mocks) + ":" + os.environ["PATH"],
@@ -155,7 +159,7 @@ class Installation(unittest.TestCase):
         source = self.root / "published-source"
         source.mkdir()
         (source / "scripts").mkdir()
-        for name in ["install.sh", "install-published.sh"]:
+        for name in ["install.sh", "install-published.sh", "resolve-release.sh"]:
             shutil.copy2(REPO / "scripts" / name, source / "scripts" / name)
         (source / "packaging").mkdir()
         shutil.copy2(REPO / "packaging/io.github.tymonoman.Extraspace.svg", source / "packaging")
@@ -177,17 +181,19 @@ class Installation(unittest.TestCase):
         new_head = git("rev-parse", "HEAD")
         (source / "README.md").write_text("local edits must survive\n")
         (assets / "companion-version").write_text("9\n")
-        (assets / "tested-commit.txt").write_text(commit + "\n")
+        (assets / "commit.txt").write_text(commit + "\n")
+        (assets / "latest").write_text(json.dumps({"tag_name": "v0.2.0", "immutable": True, "draft": False, "prerelease": False}))
         mocks = Path(self.env["PATH"].split(":")[0])
         cargo = mocks / "cargo"
         cargo.write_text('#!/bin/sh\ncat companion-version > "$TEST_BUILT_VERSION"\n')
         cargo.chmod(0o755)
         built_version = self.root / "built-version"
         self.env.update(EXTRASPACE_RELEASE_BASE_URL="https://example.invalid/releases/download",
-                        TEST_BUILT_VERSION=str(built_version))
+                        TEST_BUILT_VERSION=str(built_version),
+                        EXTRASPACE_RELEASE_API_URL="https://example.invalid/latest")
         curl = mocks / "curl"
         curl.write_text(curl.read_text() +
-                        "with open(os.environ['TEST_URL_LOG'], 'a') as log: log.write(sys.argv[-3] + '\\n')\n")
+                        "with open(os.environ['TEST_URL_LOG'], 'a') as log: log.write(url + '\\n')\n")
         url_log = self.root / "urls"
         self.env["TEST_URL_LOG"] = str(url_log)
         result = subprocess.run([str(source / "scripts/install-published.sh")],
@@ -197,11 +203,11 @@ class Installation(unittest.TestCase):
         self.assertEqual(git("rev-parse", "HEAD"), new_head)
         self.assertEqual((source / "README.md").read_text(), "local edits must survive\n")
         self.assertEqual((source / "companion-version").read_text(), "11\n")
-        self.assertIn(f"build-{commit}/extraspace.apk", url_log.read_text())
+        self.assertIn("v0.2.0/extraspace.apk", url_log.read_text())
         self.assertEqual((self.root / "data/extraspace/extraspace.apk").read_bytes(), self.apk.read_bytes())
         # Untrusted or incomplete pointers fail before fetching/building sources.
         built_version.unlink()
-        (assets / "tested-commit.txt").write_text("main; invalid\n")
+        (assets / "commit.txt").write_text("main; invalid\n")
         result = subprocess.run([str(source / "scripts/install-published.sh")],
                                 env=self.env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)

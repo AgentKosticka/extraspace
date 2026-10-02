@@ -1,12 +1,12 @@
 # Android connections and remembered displays — 1 October 2026
 
-Implemented in the ExtraSpace host and Android companion:
+Implemented in the Extraspace host and Android companion:
 
 - Persistent installation UUID in Android private preferences, shared by ADB and AOA. Backup/device transfer excludes that identity. Old apps retain the ADB serial fallback; existing layout profiles migrate to UUIDs.
-- Per-device ExtraSpace preferences in `~/.config/extraspace/device-settings.json`: render scale, display mode, source, frame rate, encoder, bitrate limits, and camera choice/state. Failed encoder connections can be repaired without an old device profile overriding the repair.
+- Per-device Extraspace preferences in `~/.config/extraspace/device-settings.json`: render scale, display mode, source, frame rate, encoder, bitrate limits, and camera choice/state. Failed encoder connections can be repaired without an old device profile overriding the repair.
 - GNOME logical scale and placement restoration in `monitor-layouts.json`, after the first captured frame. Physical modes/scales, transforms and topology must still match; the active virtual mode must advertise the saved scale. Existing compositor crash guards stay in place.
 - Android setup screen with panel information, identity, connection choice, retry, instructions, offline color/grid/touch check, and access to settings through Android Back. Camera requests Android runtime permission. The screen stays awake during streaming and can sleep while waiting. ADB disconnect leaves this screen usable.
-- ADB automatic APK upgrades and fresh activity launches remain. AOA negotiates Google's accessory protocol through libusb, uses Android's Allow/Deny path, and multiplexes the same framed video, input, cursor, camera and telemetry over native bulk endpoints. Reconnect requests Hello again; SessionEnd returns Android to setup. USB output stays off the UI thread; pending consent can be cancelled promptly from the PC.
+- ADB automatic APK upgrades and fresh activity launches remain. AOA negotiates Google's accessory protocol through libusb, uses Android's system USB permission, and multiplexes the same framed video, input, cursor, camera and telemetry over native bulk endpoints. Reconnect requests Hello again; SessionEnd returns Android to setup. USB output stays off the UI thread; pending USB permission can be cancelled promptly from the PC.
 - Experimental device frame selection, off by default: choose the newest already-decoded output when several are ready. H.264 reference inputs are retained. Capture and encoding remain on the PC; this is not an encoding-offload mode or a measured latency improvement.
 
 Validation on the connected Samsung SM-X620, Android 16 / GNOME Wayland:
@@ -46,3 +46,17 @@ A 106-second native-resolution battery sample covered moving content and idle: U
 Final verification: 93 Rust tests passed (one optional graphical test ignored), Clippy with warnings denied passed, Android release assembly/lint/JVM tests passed, nine installer tests passed, and USB dialog/Quit regression passed. Installed binary/APK hashes match the release outputs; tablet reports companion 13. ADB/AOA identity, consent, scale and placement reconnect tests earlier in this report used companion 12; final companion 13 was additionally exercised with ADB/native and current-resolution motion playback. Live camera over AOA remains untested.
 
 Regular installed session was restarted with the saved preferences; diagnostics/tracing and test windows were closed. This report accompanies the source changes.
+
+## Review fixes — 2 October 2026
+
+Companion 14 removes the extra application consent dialog. Android's attachment
+or USB permission prompt grants access; the app verifies the OS permission and
+current attachment before opening it. AOA Hello is host-requested on both initial
+connection and reconnect. Historical consent tests above exercised companion 12.
+
+Rust shutdown now aborts and joins every child before destroying capture/input
+resources. Fixed-width touches reject trailing bytes. CI now enforces the Android
+USB framing tests and both graphical lifecycle tests, along with ShellCheck.
+Tablet and desktop share an icon, accent palette, section names and connection
+labels. Light/dark Android colors and the GTK accent are generated from
+`design/theme.json`; CI rejects palette drift.

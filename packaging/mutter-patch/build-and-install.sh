@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds mutter 50.5-2 (50.5 plus the ExtraSpace virtual-monitor crash guards)
+# Builds mutter 50.5-2 (50.5 plus the Extraspace virtual-monitor crash guards)
 # and installs it.
 #
 # Needs sudo twice: once for makepkg to pull in build dependencies, once for
@@ -13,6 +13,8 @@ set -eu
 cd "$(dirname "$0")"
 
 here=$(pwd)
+# Arch PKGBUILD supplies pkgver/pkgrel at runtime.
+# shellcheck disable=SC1091,SC2154
 version=$(. ./PKGBUILD; echo "$pkgver-$pkgrel")
 
 echo ">>> building mutter $version (this takes a while)"
@@ -29,11 +31,11 @@ Done. Log out and back in, then:
 
     pacman -Q mutter          # expect: mutter $version
 
-To get the sharp, panel-resolution display, run ExtraSpace with:
+To get the sharp, panel-resolution display, run Extraspace with:
 
     XS_MUTTER_MODES=1 extraspace
 
-A later mutter upgrade will print a warning and ExtraSpace will fall back to the
+A later mutter upgrade will print a warning and Extraspace will fall back to the
 safe sizing on its own, so that variable is harmless to leave set. Rerun this
 script to patch the new version.
 

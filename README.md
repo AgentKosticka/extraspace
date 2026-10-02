@@ -193,17 +193,19 @@ To include the optional tablet webcam, add `--camera`. This installs v4l2loopbac
 DKMS and headers for your running kernel. Secure Boot may require MOK enrollment.
 Display-only installation leaves camera modules alone.
 
-The [latest tested APK](https://github.com/AgentKosticka/extraspace/releases/download/continuous/extraspace.apk)
-is also available separately. Pushes to `main` run Rust checks and an Android
-release build, lint and signature verification. Only after both jobs pass does
-CI publish the APK, checksum, companion version and source commit to the
-[continuous release](https://github.com/AgentKosticka/extraspace/releases/tag/continuous).
-This is a development prerelease; `v*` tag pushes produce versioned releases.
-The recommended `--published` installer reads `tested-commit.txt` and uses the
-commit-specific `build-<commit>` release. While a newer `main` build is running,
-it installs the previous tested source and matching APK. The source installer
-without `--published` builds your checkout and rejects an incompatible APK; wait
-for CI or use `--build-apk` to build that checkout locally.
+The [latest stable APK](https://github.com/AgentKosticka/extraspace/releases/latest/download/extraspace.apk)
+is available separately from the [versioned releases](https://github.com/AgentKosticka/extraspace/releases/latest).
+The recommended `--published` installer resolves the latest immutable `vX.Y.Z`
+release once, then downloads its source commit and matching APK from that fixed
+version. A new publication cannot mix assets from two versions during an install.
+Only a version tag matching the workspace version and pointing at a reviewed
+`main` commit can publish, after Rust, GTK, installer and Android checks pass.
+Builds from `main` remain in GitHub Actions artifacts for development testing.
+Historical `continuous` and `build-<commit>` prereleases are legacy downloads;
+new installers and publications do not use or update them.
+
+The source installer without `--published` builds your checkout and rejects an
+incompatible published APK. Use `--build-apk` to build that checkout locally.
 
 ### 3. Other distributions and source APK builds
 
@@ -484,7 +486,7 @@ Things that cost time, recorded so they cost you less:
 ## Device identity and remembered displays
 
 The Android companion generates an installation UUID and sends it in Hello over
-both USB transports. The PC remembers ExtraSpace render scale, Extend/Mirror,
+both USB transports. The PC remembers Extraspace render scale, Extend/Mirror,
 encoder, bitrate bounds, frame rate and camera preferences in
 `~/.config/extraspace/device-settings.json`. Position, primary monitor and GNOME
 logical scale live in `monitor-layouts.json`. Existing ADB serial layout profiles
@@ -494,7 +496,7 @@ not a pairing secret.
 
 **Render Scale** controls the framebuffer size in the default capture path.
 **Ubuntu Settings → Displays → Scale** controls GNOME logical/UI size, independently
-of framebuffer resolution. On reconnect ExtraSpace restores the latter with the
+of framebuffer resolution. On reconnect Extraspace restores the latter with the
 saved placement after capture is ready, only if the monitor modes, physical
 monitor scales, transforms and topology still match and Mutter advertises the
 saved tablet scale. Unsupported or changed layouts are left to GNOME. Existing
@@ -526,7 +528,7 @@ for measured results and remaining hardware coverage.
 ## Android setup screen and USB methods
 
 The companion works as a setup and diagnostics app without a running PC: it shows
-panel information and its device ID, explains connection setup, offers a retry
+panel information and its device ID, explains connection setup, offers a Check Again
 button, and has an offline color/grid/touch check. Android Back opens this screen
 while streaming; Return to desktop resumes viewing. The screen stays awake during
 streaming, and can sleep while waiting. Camera use requests Android camera consent.
@@ -540,8 +542,9 @@ Choose **USB Connection** in the PC menu (available even while disconnected):
   Enable USB debugging and accept Android's debugging authorization.
 - **USB accessory (AOA)** uses libusb and Android's accessory API without requiring
   USB debugging. Install the companion first, select accessory mode on the PC,
-  then connect a data cable. Android offers Allow/Deny; allowing opens the stream.
-  Consent remains valid for host session rebuilds during that cable attachment.
+  then connect a data cable. Open Extraspace from Android’s USB attachment prompt.
+  There is no extra in-app confirmation. A manual launch requests the system USB
+  permission only when needed. Permission remains valid for host session rebuilds during that cable attachment.
   Denial leaves the app's setup screen available; Retry asks again. Google AOA
   bulk endpoints carry the same framed video, touch, cursor, camera and telemetry.
 
@@ -549,7 +552,7 @@ For Ubuntu accessory permissions, run `./scripts/setup.sh --accessory` once
 (`--check --accessory` previews what is missing). This adds narrow `uaccess` rules
 for Google's accessory VID/PIDs and Ubuntu's Android USB permission package.
 Reconnect the cable after setup. Other distributions also need user access to the
-Android device before it switches into accessory mode. ExtraSpace reports USB
+Android device before it switches into accessory mode. Extraspace reports USB
 permission failures; running the desktop app as root is unnecessary. Only one
 AOA-capable tablet may be attached when initiating accessory mode.
 
@@ -646,13 +649,34 @@ future GNOME release changes it, the damage is contained to one file.
 
 ### APK releases and signing
 
-`.github/workflows/ci.yml` builds and verifies `extraspace.apk`, then calls the
-reusable release workflow with that same artifact. Failed Rust/Android checks or
-pull requests cannot publish releases. Each release includes `extraspace.apk`,
-`extraspace.apk.sha256`, `companion-version` and `commit.txt`. CI publishes
-a complete `build-<commit>` prerelease before updating `continuous`, and replaces
-its `tested-commit.txt` pointer last. Published installation uses that pointer
-and the commit-specific assets, avoiding the `main`/APK build window.
+`.github/workflows/ci.yml` runs Rust tests, Clippy, ShellCheck, installer and
+release interruption tests, both private-D-Bus GTK lifecycle tests under Xvfb,
+and Android `assembleRelease lintRelease testReleaseUnitTest`. It verifies the
+APK signature before uploading the development artifact. Hardware/performance
+reports in `docs/` describe separate manual device validation; a green badge does
+not establish physical tablet compatibility or latency/power results.
+
+Version tags call the reusable release workflow with the exact tested artifact.
+It verifies that the tag matches `Cargo.toml` and belongs to `main`, uploads all
+assets to a draft, downloads and compares them with CI, then publishes with
+`latest` disabled. It confirms GitHub's published `immutable` metadata before
+promoting the complete version to latest. Release immutability must be enabled;
+the contents-scoped workflow token does not need administration permission. Interrupted uploads stay drafts; published assets and tags
+are never overwritten. Each release includes `extraspace.apk`, its SHA-256,
+`companion-version` and `commit.txt`. Installation resolves GitHub's latest release
+once and pins every download to its version tag; no moving source tag or release
+asset is needed.
+
+`main` requires the **Rust (1.85.0)**, **Rust (stable)** and **Android** status checks,
+an up-to-date pull request, and resolved conversations. Administrators are subject
+to these protections; force pushes and deletion are disabled. Release immutability
+and branch protection are repository settings, not properties a workflow can
+claim merely by choosing a name.
+
+To release 0.2.0, merge its checked pull request, tag that main commit `v0.2.0`,
+and push the tag. The tag pipeline publishes **Extraspace 0.2.0** only after all
+checks succeed. Bump both workspace version and `companion-version` for later
+Android changes; published version tags are never reused.
 
 Rust CI tests both the minimum supported compiler, **1.85.0**, and current stable.
 Dependency resolution prefers versions compatible with that minimum, and all
@@ -682,14 +706,13 @@ in the desktop icon theme for the launcher and tray.
 
 ### Application identity and upgrades
 
-This fork intentionally retains the legacy GTK ID/icon name
-`io.github.tymonoman.Extraspace`, resource path, Android application ID/namespace
-`io.github.tymonoman.extraspace`, and Kotlin package structure. These identifiers
-keep existing launchers, GNOME window grouping, stored settings, Android app data,
-and signed APK upgrades associated with the same application. They identify the
-installed app; the repository, report links and package metadata identify
-[AgentKosticka/extraspace](https://github.com/AgentKosticka/extraspace). A future ID
-change requires an explicit migration and a separate Android installation.
+The 0.2 compatibility release retains the installed legacy GTK and Android IDs
+so signed upgrades preserve existing app data and display profiles. This is an
+explicit transition with a [versioned identity migration roadmap](docs/application-identity.md):
+0.2.1 adds profile export/import, 0.3.0 introduces distinct AgentKosticka application
+IDs and isolated installation paths, and 1.0 removes the legacy compatibility build.
+The fork and upstream will coexist after that migration. Identifiers are not
+renamed silently because Android treats a new application ID as a new app.
 
 ## Contributing
 

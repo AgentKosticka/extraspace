@@ -20,3 +20,7 @@ android/.idea/
 
 # Local
 /scratch
+
+# Python generated caches
+__pycache__/
+*.pyc

@@ -1,7 +1,7 @@
 //! The orchestration loop.
 //!
 //! One `run` task owns the whole lifecycle; everything else is a child task it
-//! can abort. Teardown is therefore simple: cancel the children, close the mutter
+//! can abort. Teardown cancels and joins the children, then closes the mutter
 //! session, undo the adb forwards.
 //!
 //! Shared state is kept to three things, each behind an `Arc` because more than
@@ -212,9 +212,7 @@ impl Active {
     async fn shutdown(mut self) {
         // Stop the tasks first, so nothing is still pushing frames or injecting
         // input while the session underneath it disappears.
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
+        stop_tasks(std::mem::take(&mut self.tasks)).await;
         // Release driver/capture resources while the PipeWire node still exists.
         self.pipeline.stop();
         if let Err(e) = self.mutter.close().await {
@@ -222,6 +220,21 @@ impl Active {
         }
         self.transport.disconnect().await;
         info!("session stopped");
+    }
+}
+
+/// Request cancellation of every child before waiting for any one of them.
+/// Joining also runs their destructors before capture/input resources disappear.
+async fn stop_tasks(tasks: Vec<JoinHandle<()>>) {
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        if let Err(error) = task.await {
+            if !error.is_cancelled() {
+                warn!(%error, "session task failed during shutdown");
+            }
+        }
     }
 }
 
@@ -1167,6 +1180,30 @@ fn starting_bitrate(width: u32, height: u32, framerate: u32, bounds: BitrateBoun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_joins_children_and_releases_their_resources() {
+        struct Resource(Arc<AtomicU64>);
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let resource = Resource(released.clone());
+            let (started, ready) = tokio::sync::oneshot::channel();
+            tasks.push(tokio::spawn(async move {
+                let _resource = resource;
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }));
+            ready.await.unwrap();
+        }
+        stop_tasks(tasks).await;
+        assert_eq!(released.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn wrapped_adb_discovery_errors_keep_their_actionable_states() {

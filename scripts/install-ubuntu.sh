@@ -21,6 +21,8 @@ done
 ((PUBLISHED == 0 || APK_CHOICE == 0)) || { echo 'Choose --published, --apk or --build-apk.' >&2; exit 2; }
 ((EUID != 0)) || { echo 'Run this installer as your normal user; setup asks for sudo when needed.' >&2; exit 1; }
 # shellcheck disable=SC1091
+# The test override is an intentional dynamic source of os-release fields.
+# shellcheck disable=SC1090
 source "${EXTRASPACE_OS_RELEASE:-/etc/os-release}"
 [[ ${ID:-} == ubuntu ]] || { echo 'This installer is for Ubuntu. Use setup.sh and install.sh on other distributions.' >&2; exit 1; }
 [[ ${VERSION_ID%%.*} -ge 24 ]] || { echo 'Ubuntu 24.04 or newer is required for GNOME 46 and libadwaita 1.5.' >&2; exit 1; }

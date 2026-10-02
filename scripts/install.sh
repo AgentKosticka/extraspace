@@ -41,7 +41,11 @@ if ((DOWNLOAD_APK)); then
   command -v curl >/dev/null || { echo 'Install curl to download the companion APK.' >&2; exit 1; }
   DOWNLOAD_DIR=$(mktemp -d)
   trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
-  RELEASE_URL=${EXTRASPACE_RELEASE_URL:-https://github.com/AgentKosticka/extraspace/releases/download/continuous}
+  RELEASE_URL=${EXTRASPACE_RELEASE_URL:-}
+  if [[ -z $RELEASE_URL ]]; then
+    TAG=$("$REPO_ROOT/scripts/resolve-release.sh")
+    RELEASE_URL="https://github.com/AgentKosticka/extraspace/releases/download/$TAG"
+  fi
   [[ $RELEASE_URL == https://* ]] || { echo 'Release URL must use HTTPS.' >&2; exit 1; }
   echo 'Downloading the published companion APK…'
   for asset in extraspace.apk extraspace.apk.sha256 companion-version; do

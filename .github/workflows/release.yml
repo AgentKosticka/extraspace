@@ -1,6 +1,6 @@
 name: Release
 
-# CI calls this only after both Rust checks and Android build/lint succeed.
+# Only version tags call this, after every Rust/GTK and Android check succeeds.
 on:
   workflow_call:
 
@@ -8,88 +8,29 @@ permissions:
   contents: write
   actions: read
 
+concurrency:
+  group: versioned-releases
+  cancel-in-progress: false
+
 jobs:
   release:
-    name: Publish APK
+    name: Publish versioned release
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a reviewed main commit
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: extraspace-apk
           path: dist
 
-      - name: Verify release inputs
-        working-directory: dist
-        run: |
-          test "$(cat commit.txt)" = "$GITHUB_SHA"
-          test -s extraspace.apk
-          sha256sum --check extraspace.apk.sha256
-
-      - name: Publish release
+      - name: Publish verified draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          if [ "$GITHUB_REF" = refs/heads/main ]; then
-            # A newer push may have arrived while this run was building.
-            head=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
-            if [ "$head" != "$GITHUB_SHA" ]; then
-              echo 'A newer main commit exists; leaving publication to its run.'
-              exit 0
-            fi
-            tag=continuous
-            title='Latest tested build'
-            flags=(--prerelease --latest=false)
-          else
-            tag=${GITHUB_REF#refs/tags/}
-            title="Extraspace $tag"
-            flags=(--latest)
-          fi
-          cat > notes.md <<EOF
-          APK built, linted and signature-verified by CI for commit $GITHUB_SHA.
-          Companion version: $(cat dist/companion-version).
-          Both the Rust and Android jobs passed before publication.
-
-          ## Ubuntu installation
-
-          Clone https://github.com/$GH_REPO, then run:
-
-              ./scripts/install-ubuntu.sh --published
-
-          This installs the tested source commit with its matching APK, even if
-          main has newer changes still in CI. It installs dependencies and downloads the
-          checksum-verified APK. No Android SDK is needed. Open Extraspace from
-          the GNOME applications grid. Re-run the published installer
-          to upgrade. See the README for USB debugging setup and other distributions.
-
-          CI run: https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID
-          EOF
-          # Publish a complete commit-specific release before updating the moving
-          # pointer. Installers can keep using the previous tested build during CI
-          # or an interrupted continuous-release upload.
-          build_tag="build-$GITHUB_SHA"
-          if ! gh release view "$build_tag" >/dev/null 2>&1; then
-            gh release create "$build_tag" dist/* --target "$GITHUB_SHA" \
-              --title "Tested build $GITHUB_SHA" --notes-file notes.md --prerelease --latest=false
-          fi
-          # An interrupted first upload must not become the published pointer.
-          mkdir verified
-          gh release download "$build_tag" --dir verified
-          test "$(cat verified/commit.txt)" = "$GITHUB_SHA"
-          test "$(cat verified/companion-version)" = "$(cat dist/companion-version)"
-          (cd verified && sha256sum --check extraspace.apk.sha256)
-          if gh release view "$tag" >/dev/null 2>&1; then
-            if [ "$tag" = continuous ]; then
-              gh api "repos/$GH_REPO/git/refs/tags/$tag" -X PATCH -f sha="$GITHUB_SHA" -F force=true
-            fi
-            gh release edit "$tag" --target "$GITHUB_SHA" --title "$title" --notes-file notes.md "${flags[@]}"
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "$title" \
-              --notes-file notes.md "${flags[@]}"
-          fi
-          if [ "$tag" = continuous ]; then
-            # This single asset is replaced last, only after immutable assets exist.
-            cp dist/commit.txt tested-commit.txt
-            gh release upload continuous tested-commit.txt --clobber
-          fi
+        run: python3 scripts/publish-release.py dist

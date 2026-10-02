@@ -164,7 +164,8 @@ class ConnectionManager(
             val writer = FrameWriter(AccessoryOutput(FileOutputStream(fd.fileDescriptor)))
             controlWriter = writer
             cameraWriter = writer
-            sendHello(writer)
+            // AOA is host-requested, including reconnects with the cable attached.
+            // ADB announces itself when its control socket connects.
             callbacks.onConnected()
             var buffer = ByteArray(512 * 1024)
             while (running.get()) {

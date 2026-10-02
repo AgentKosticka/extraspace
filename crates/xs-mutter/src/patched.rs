@@ -68,7 +68,7 @@ pub fn scaled_modes_allowed() -> bool {
     })
 }
 
-/// Installed mutter is the ExtraSpace rebuild *and* gnome-shell has mapped it.
+/// Installed mutter is the Extraspace rebuild *and* gnome-shell has mapped it.
 ///
 /// `ApplyMonitorsConfig` on stock 50.4 races the virtual screen-cast source and
 /// SIGSEGVs gnome-shell, so layout changes go through this gate too.
