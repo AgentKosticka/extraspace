@@ -39,8 +39,6 @@ def publish(folder, tag, sha, version, companion, repo, gh=run_gh):
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("Invalid source commit")
     verify_bundle(folder, sha, companion)
-    if not json.loads(gh("api", f"repos/{repo}/immutable-releases"))["enabled"]:
-        raise ValueError("Enable GitHub release immutability before publishing")
     metadata = gh("api", f"repos/{repo}/releases/tags/{tag}", missing_ok=True)
     release = json.loads(metadata) if metadata else None
     if release and not release["draft"] and not release["immutable"]:
@@ -78,10 +76,14 @@ CI run: https://github.com/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', 
             if (downloaded / name).read_bytes() != (folder / name).read_bytes():
                 raise ValueError(f"Uploaded asset differs from CI: {name}")
         if release is None or release["draft"]:
-            gh("release", "edit", tag, "--draft=false", "--latest", "--notes-file", str(notes))
+            gh("release", "edit", tag, "--draft=false", "--latest=false", "--notes-file", str(notes))
         published = json.loads(gh("api", f"repos/{repo}/releases/tags/{tag}"))
         if published["draft"] or not published["immutable"]:
-            raise ValueError("GitHub did not confirm an immutable published release")
+            raise ValueError("GitHub did not confirm an immutable published release; latest was not changed")
+        # The contents-scoped workflow token cannot read admin-only repository
+        # settings. Confirm the published release's protection before changing
+        # the public latest pointer. Metadata edits are allowed on immutable releases.
+        gh("release", "edit", tag, "--latest")
 
 
 if __name__ == "__main__":

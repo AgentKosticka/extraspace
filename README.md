@@ -658,9 +658,10 @@ not establish physical tablet compatibility or latency/power results.
 
 Version tags call the reusable release workflow with the exact tested artifact.
 It verifies that the tag matches `Cargo.toml` and belongs to `main`, uploads all
-assets to a draft, downloads and compares them with CI, then publishes. GitHub
-release immutability must be enabled, and the publisher checks it both before and
-after publication. Interrupted uploads stay drafts; published assets and tags
+assets to a draft, downloads and compares them with CI, then publishes with
+`latest` disabled. It confirms GitHub's published `immutable` metadata before
+promoting the complete version to latest. Release immutability must be enabled;
+the contents-scoped workflow token does not need administration permission. Interrupted uploads stay drafts; published assets and tags
 are never overwritten. Each release includes `extraspace.apk`, its SHA-256,
 `companion-version` and `commit.txt`. Installation resolves GitHub's latest release
 once and pins every download to its version tag; no moving source tag or release
