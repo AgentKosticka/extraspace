@@ -1,0 +1,6 @@
+{
+  "accent": "#1c71d8",
+  "accent_text": "#ffffff",
+  "light": {"window": "#fafafa", "card": "#ffffff", "text": "#2e3436", "muted": "#5e5c64", "border": "#deddda"},
+  "dark": {"window": "#242424", "card": "#303030", "text": "#ffffff", "muted": "#c0bfbc", "border": "#454545"}
+}

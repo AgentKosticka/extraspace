@@ -17,8 +17,8 @@ use xs_proto::{Channel, ControlKind, Header, HEADER_LEN};
 const USB_PACKET: usize = 16 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(1);
-const MANUFACTURER: &str = "ExtraSpace";
-const MODEL: &str = "ExtraSpace Display";
+const MANUFACTURER: &str = "Extraspace";
+const MODEL: &str = "Extraspace Display";
 
 pub(crate) struct AccessoryHandle {
     stopped: Arc<AtomicBool>,

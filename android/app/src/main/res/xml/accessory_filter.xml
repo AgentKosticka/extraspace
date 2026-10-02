@@ -1,2 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources><usb-accessory manufacturer="ExtraSpace" model="ExtraSpace Display" version="1" /></resources>
+<resources>
+    <usb-accessory manufacturer="Extraspace" model="Extraspace Display" version="1" />
+    <!-- Keep accepting hosts released before the product spelling was unified. -->
+    <usb-accessory manufacturer="ExtraSpace" model="ExtraSpace Display" version="1" />
+</resources>

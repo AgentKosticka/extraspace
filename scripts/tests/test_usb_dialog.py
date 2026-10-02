@@ -11,7 +11,8 @@ with tempfile.TemporaryDirectory(prefix="extraspace-usb-menu-") as d:
     settings.mkdir()
     (settings / "config.json").write_text(json.dumps({"auto_connect": False}))
     with tempfile.TemporaryFile() as log:
-        process = subprocess.Popen([str(binary)], env=dict(os.environ, XDG_CONFIG_HOME=d),
+        process = subprocess.Popen([str(binary)], env=dict(os.environ, XDG_CONFIG_HOME=d, XDG_STATE_HOME=str(Path(d) / "state"),
+                                            XDG_DATA_HOME=str(Path(d) / "data")),
                                    stdout=log, stderr=subprocess.STDOUT)
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         def call(method, args=None):

@@ -40,7 +40,7 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly gstreamer1.0-pipewire \
-            libpipewire-0.3-dev libclang-dev desktop-file-utils python3-gi
+            libpipewire-0.3-dev libclang-dev desktop-file-utils python3-gi xvfb xauth shellcheck
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable action implementation
         with:
@@ -51,9 +51,12 @@ jobs:
 
       - name: Installer and setup checks
         run: |
-          bash -n scripts/*.sh
+          bash -n scripts/*.sh packaging/mutter-patch/*.sh
+          shellcheck scripts/*.sh packaging/mutter-patch/*.sh packaging/mutter-patch/extraspace-mutter-patch-check
+          python3 scripts/tests/test_release.py
           python3 scripts/tests/test_install.py
           python3 scripts/sync-icon.py --check
+          python3 scripts/sync-theme.py --check
 
       - name: Formatting
         if: matrix.toolchain == 'stable'
@@ -71,6 +74,15 @@ jobs:
       - name: Build
         if: matrix.toolchain == 'stable'
         run: cargo build --release --locked
+
+      - name: GTK lifecycle tests
+        if: matrix.toolchain == 'stable'
+        env:
+          GSK_RENDERER: cairo
+          GTK_A11Y: none
+        run: |
+          xvfb-run -a dbus-run-session -- /usr/bin/python3 scripts/tests/test_usb_dialog.py target/release/extraspace
+          xvfb-run -a dbus-run-session -- /usr/bin/python3 scripts/tests/test_tray.py target/release/extraspace
 
   android:
     name: Android
@@ -109,7 +121,7 @@ jobs:
 
       - name: Build APK
         working-directory: android
-        run: ./gradlew assembleRelease lintRelease --no-daemon
+        run: ./gradlew assembleRelease lintRelease testReleaseUnitTest --no-daemon
 
       - name: Verify and stage APK
         run: |
@@ -131,9 +143,9 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish tested APK
+    name: Publish versioned release
     needs: [rust, android]
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
       actions: read

@@ -50,6 +50,13 @@ fn main() -> glib::ExitCode {
             .expect("valid bundled icon resource");
         gtk::Window::set_default_icon_name(APP_ID);
         if let Some(display) = gtk::gdk::Display::default() {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_data(include_str!("theme.css"));
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
             gtk::IconTheme::for_display(&display)
                 .add_resource_path("/io/github/tymonoman/Extraspace/icons");
         }

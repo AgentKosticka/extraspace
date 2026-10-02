@@ -66,6 +66,10 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     let header = adw::HeaderBar::builder()
         .title_widget(&window_title)
         .build();
+    let brand = gtk::Image::from_icon_name(APP_ID);
+    brand.set_pixel_size(28);
+    brand.set_tooltip_text(Some("Your desktop, with more space"));
+    header.pack_start(&brand);
     header.pack_end(&menu_button);
 
     let (page, widgets) = build_content(window_title.clone());
@@ -104,9 +108,9 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
         let dialog = adw::PreferencesDialog::builder().title("USB Connection").build();
         let page = adw::PreferencesPage::new();
         let group = adw::PreferencesGroup::builder()
-            .description("ADB installs and refreshes the app automatically. Accessory uses Android’s Allow/Deny prompt and needs the app installed first.") .build();
+            .description("Use the same connection method on your computer and tablet. ADB installs and updates the app automatically. USB accessory needs the app installed first; Android handles USB permission.") .build();
         let row = adw::ComboRow::builder().title("Connection method")
-            .model(&gtk::StringList::new(&["Automatic", "ADB", "USB accessory (AOA)"])).build();
+            .model(&gtk::StringList::new(&["Automatic", "ADB (USB debugging)", "USB accessory (AOA)"])).build();
         row.set_selected(match settings.borrow().transport { xs_core::TransportMode::Auto => 0, xs_core::TransportMode::Adb => 1, xs_core::TransportMode::Accessory => 2 });
         let settings = settings.clone(); let engine = usb_engine.clone();
         row.connect_selected_notify(move |r| {
@@ -212,7 +216,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
 
     // ---- the "nothing to control yet" face ----
     let status_button = gtk::Button::builder()
-        .label("Check Again")
+        .label("Connect")
         .halign(gtk::Align::Center)
         .build();
     status_button.add_css_class("pill");
@@ -233,8 +237,9 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
     status_extra.append(&status_button);
 
     let status = adw::StatusPage::builder()
-        .icon_name("computer-symbolic")
-        .title("Looking for your tablet")
+        .icon_name(APP_ID)
+        .title("Ready")
+        .description("Your desktop, with more space. Connect your tablet to start streaming.")
         .child(&status_extra)
         .build();
     stack.add_named(&status, Some("status"));
@@ -244,7 +249,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
 
     let display_group = adw::PreferencesGroup::builder()
         .title("Display")
-        .description("Use the tablet as an extra monitor")
+        .description("Your desktop, with more space")
         .build();
 
     let display_switch = adw::SwitchRow::builder()
@@ -642,9 +647,9 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>
         State::Idle => {
             widgets.window_title.set_subtitle("Not connected");
             show_status(
-                "video-display-symbolic",
+                APP_ID,
                 "Ready",
-                "Turn on Extra Display to start streaming to your tablet.",
+                "Your desktop, with more space. Connect your tablet to start streaming.",
                 Some("Connect"),
             );
         }
@@ -655,9 +660,9 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>
                 "phone-disconnected-symbolic",
                 "No tablet found",
                 if config.borrow().transport == xs_core::TransportMode::Accessory {
-                    "Connect an AOA-compatible tablet over USB with the companion installed. Unlock it and tap Allow. USB debugging is optional."
+                    "Connect an AOA-compatible tablet over USB with the companion installed. Unlock it and open Extraspace from Android’s USB prompt. USB debugging is optional."
                 } else {
-                    "Connect your tablet with a data cable. For ADB, enable USB debugging and accept Android’s authorization prompt. For AOA, choose USB accessory in the USB Connection menu and tap Allow on the tablet."
+                    "Connect your tablet with a data cable. For ADB, enable USB debugging and accept Android’s authorization prompt. For AOA, choose USB accessory in the USB Connection menu and open Extraspace from Android’s USB prompt."
                 },
                 Some("Check Again"),
             );

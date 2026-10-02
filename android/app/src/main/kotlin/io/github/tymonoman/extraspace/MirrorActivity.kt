@@ -13,7 +13,7 @@ import android.widget.Button
 import android.widget.Spinner
 import android.widget.ArrayAdapter
 import android.widget.AdapterView
-import android.widget.Switch
+import androidx.appcompat.widget.SwitchCompat
 import android.app.AlertDialog
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.addCallback
@@ -29,7 +29,7 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
-import androidx.activity.ComponentActivity
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -38,7 +38,7 @@ import androidx.core.view.WindowInsetsControllerCompat
  * A direct decoder surface with the host cursor in the app layer above it.
  * TextureView remains available for devices with broken surface composition.
  */
-class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
+class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
 
     private lateinit var videoView: View
     private var textureView: TextureView? = null
@@ -95,6 +95,16 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         setContentView(R.layout.activity_mirror)
         statusView = findViewById(R.id.status)
         lobby = findViewById(R.id.lobby)
+        // Match the desktop's readable preferences column on wide tablets.
+        lobby.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
+            if (right - left != oldRight - oldLeft) {
+                val content = findViewById<View>(R.id.lobby_content)
+                val params = content.layoutParams as FrameLayout.LayoutParams
+                params.width = minOf(right - left, (640 * resources.displayMetrics.density).toInt())
+                params.gravity = android.view.Gravity.CENTER_HORIZONTAL
+                content.layoutParams = params
+            }
+        }
         setupLobby()
         accessories = AccessoryController(this,
             enabled = { preferences.getString("transport", "auto") != "adb"
@@ -190,10 +200,10 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
 
     private fun setupLobby() {
         findViewById<TextView>(R.id.device_details).text =
-            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · ${DeviceInfo.width}×${DeviceInfo.height} · ${DeviceInfo.refreshRate.toInt()} Hz\nDevice ID: ${DeviceInfo.deviceId}"
+            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · ${DeviceInfo.width}×${DeviceInfo.height} · ${DeviceInfo.refreshRate.toInt()} Hz\nDisplay ID: ${DeviceInfo.deviceId}"
         val spinner = findViewById<Spinner>(R.id.connection_method)
         spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
-            listOf("Automatic", "ADB (USB debugging)", "USB accessory (AOA)"))
+            resources.getStringArray(R.array.connection_methods).toList())
         val modes = listOf("auto", "adb", "accessory")
         spinner.setSelection(modes.indexOf(preferences.getString("transport", "auto")).coerceAtLeast(0))
         spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -206,7 +216,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
                 retryConnection()
             }
         }
-        findViewById<Switch>(R.id.device_processing).apply {
+        findViewById<SwitchCompat>(R.id.device_processing).apply {
             isChecked = preferences.getBoolean("device_processing", false)
             setOnCheckedChangeListener { _, enabled ->
                 preferences.edit().putBoolean("device_processing", enabled).apply()
@@ -216,7 +226,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         findViewById<Button>(R.id.retry).setOnClickListener { retryConnection() }
         findViewById<Button>(R.id.resume).setOnClickListener { lobby.visibility = View.GONE }
         findViewById<Button>(R.id.display_test).setOnClickListener {
-            AlertDialog.Builder(this).setTitle("Display / touch check")
+            AlertDialog.Builder(this).setTitle(R.string.display_test)
                 .setView(DisplayCheckView(this)).setPositiveButton("Close", null)
                 .create().also { dialog ->
                     dialog.show()

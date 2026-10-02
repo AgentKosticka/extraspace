@@ -1,6 +1,6 @@
 # Mutter crash patch
 
-ExtraSpace's sharp display path asks mutter for a virtual monitor at the
+Extraspace's sharp display path asks mutter for a virtual monitor at the
 tablet's full panel resolution, passing the UI scale as the mode's
 `preferred-scale`. On stock mutter 50.4 and 50.5 that logs you out.
 
@@ -62,7 +62,7 @@ crash comes back, so two things watch for it:
 - `install-hook.sh` records the patched version under
   `$XDG_DATA_HOME/extraspace/patched-mutter` and installs a pacman hook that
   warns after any `mutter` transaction where the two disagree.
-- ExtraSpace checks the same marker itself (`scaled_modes_allowed()`) and
+- Extraspace checks the same marker itself (`scaled_modes_allowed()`) and
   refuses the scaled path unless the installed version matches and the running
   shell is not still using a deleted `libmutter`. The result is a softer-looking
   tablet rather than a logout.
