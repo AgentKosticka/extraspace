@@ -25,6 +25,7 @@ use zbus::Connection;
 use zvariant::{OwnedObjectPath, Value};
 
 mod display;
+mod input;
 pub mod keys;
 mod patched;
 mod proxies;
@@ -166,6 +167,7 @@ pub struct Session {
     config: DisplayConfig,
     width: u32,
     height: u32,
+    input_coordinates: input::InputCoordinates,
     layout_before: Option<display::DisplayLayout>,
     use_modes: bool,
     // Atomic rather than a bool so the session can be shared behind an `Arc` --
@@ -330,6 +332,7 @@ impl Session {
             "virtual monitor is live"
         );
 
+        let input_coordinates = input::InputCoordinates::new(&conn, &config.source).await?;
         Ok(Self {
             _conn: conn,
             remote_desktop: rd_session,
@@ -339,6 +342,7 @@ impl Session {
             config,
             width,
             height,
+            input_coordinates,
             layout_before: original_layout,
             use_modes,
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -363,6 +367,9 @@ impl Session {
             if let Err(e) = display::persistence::restore(&self._conn, device).await {
                 warn!(error = %e, "saved tablet placement could not be restored");
             }
+        }
+        if matches!(self.config.source, CaptureSource::Virtual) {
+            self.input_coordinates.refresh(&self._conn).await;
         }
     }
 
@@ -426,10 +433,11 @@ impl Session {
     }
 
     // --- input -----------------------------------------------------------
-    // Coordinates are in stream space (0..width, 0..height), so they map onto the
-    // virtual monitor directly.
+    // Android sends video pixels. RecordVirtual only adds the stage-view origin,
+    // so convert to logical pixels here. RecordMonitor divides by scale itself.
 
     pub async fn touch_down(&self, slot: u32, x: f64, y: f64) -> Result<()> {
+        let (x, y) = self.input_coordinates.map(x, y);
         self.remote_desktop
             .notify_touch_down(&self.stream_path, slot, x, y)
             .await?;
@@ -437,6 +445,7 @@ impl Session {
     }
 
     pub async fn touch_motion(&self, slot: u32, x: f64, y: f64) -> Result<()> {
+        let (x, y) = self.input_coordinates.map(x, y);
         self.remote_desktop
             .notify_touch_motion(&self.stream_path, slot, x, y)
             .await?;
@@ -449,6 +458,7 @@ impl Session {
     }
 
     pub async fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<()> {
+        let (x, y) = self.input_coordinates.map(x, y);
         self.remote_desktop
             .notify_pointer_motion_absolute(&self.stream_path, x, y)
             .await?;

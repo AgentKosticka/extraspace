@@ -421,6 +421,23 @@ async fn get_current_state(conn: &Connection) -> Result<CurrentState> {
     })
 }
 
+pub(crate) async fn virtual_input_scale(conn: &Connection) -> Result<f64> {
+    let (_, _, logical, properties) = get_current_state(conn).await?;
+    Ok(input_scale(&logical, &properties))
+}
+
+fn input_scale(logical: &[LogicalMonitor], properties: &HashMap<String, OwnedValue>) -> f64 {
+    if prop_u32(properties, "layout-mode").unwrap_or(LAYOUT_LOGICAL) != LAYOUT_LOGICAL {
+        return 1.0;
+    }
+    logical
+        .iter()
+        .find(|(.., specs, _)| specs.iter().any(is_virtual))
+        .map(|(_, _, scale, ..)| *scale)
+        .filter(|scale| scale.is_finite() && *scale >= 1.0)
+        .unwrap_or(1.0)
+}
+
 fn new_virtual_monitor<'a>(monitors: &'a [Monitor], before: &DisplayLayout) -> Option<&'a Monitor> {
     monitors.iter().find(|(spec, ..)| {
         is_virtual(spec)
@@ -780,6 +797,32 @@ mod tests {
         spec: MonitorSpec,
     ) -> LogicalMonitor {
         (x, 0, 1.0, transform, primary, vec![spec], HashMap::new())
+    }
+
+    #[test]
+    fn input_scale_uses_the_virtual_output_and_layout_coordinate_space() {
+        let physical = ("eDP-1".into(), "AUO".into(), "panel".into(), "1".into());
+        let virtual_spec = (
+            "Meta-0".into(),
+            "MetaVendor".into(),
+            "Virtual remote monitor".into(),
+            "2".into(),
+        );
+        let mut physical = logical_monitor(1536, 0, true, physical);
+        physical.2 = 2.0;
+        let mut tablet = logical_monitor(0, 0, false, virtual_spec);
+        tablet.1 = 120;
+        tablet.2 = 1.25;
+        let mut logical = vec![physical, tablet];
+        let mut props = HashMap::from([("layout-mode".into(), OwnedValue::from(1u32))]);
+        assert_eq!(input_scale(&logical, &props), 1.25);
+        props.insert("layout-mode".into(), OwnedValue::from(2u32));
+        assert_eq!(input_scale(&logical, &props), 1.0);
+        props.insert("layout-mode".into(), OwnedValue::from(1u32));
+        logical[1].2 = f64::NAN;
+        assert_eq!(input_scale(&logical, &props), 1.0);
+        logical.pop();
+        assert_eq!(input_scale(&logical, &props), 1.0);
     }
 
     fn xml_layout(width: u32, scale: f64) -> String {
