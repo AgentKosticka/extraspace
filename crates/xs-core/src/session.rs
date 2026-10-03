@@ -17,11 +17,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::WriteHalf;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use xs_mutter::{CaptureSource, CursorMode, DisplayConfig};
-use xs_proto::{flags, Channel, ControlKind, Hello, TouchAction, TouchEvent, VideoConfig};
+use xs_proto::{flags, Channel, ControlKind, TouchAction, TouchEvent, VideoConfig};
 use xs_transport::{FrameReader, FrameWriter, Transport, TransportHandle};
 use xs_video::{VideoConfig as PipelineConfig, VideoPipeline};
 
@@ -197,6 +197,21 @@ struct Active {
     encoder_name: String,
     width: u32,
     height: u32,
+    camera_request: watch::Sender<CameraRequest>,
+    camera_status: watch::Receiver<xs_proto::CameraStatus>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CameraRequest {
+    pub(crate) enabled: bool,
+    pub(crate) revision: u64,
+}
+
+fn request_camera(sender: &watch::Sender<CameraRequest>, enabled: bool) {
+    sender.send_modify(|request| {
+        request.enabled = enabled;
+        request.revision += 1;
+    });
 }
 
 impl Active {
@@ -277,7 +292,20 @@ pub async fn run(
                         emit(State::NoTablet);
                         tokio::time::sleep(TEARDOWN_SETTLE).await;
                     }
-                    if let Some(session) = &active { session.mutter.remember_display_layout().await; }
+                    if let Some(session) = &mut active {
+                        if session.camera_status.has_changed().unwrap_or(false) {
+                            let status = session.camera_status.borrow_and_update().clone();
+                            if status.state == xs_proto::CameraState::Failed && config.camera_enabled {
+                                config.camera_enabled = false;
+                                if let Some(id) = &config.last_device_id { crate::device_settings::remember(&config, id); }
+                                request_camera(&session.camera_request, false);
+                                let _ = send_camera_control(&session.control_writer, false, &config.camera_id).await;
+                            }
+                            let _ = events.send(Event::CameraStatus(status));
+                        }
+                        session.mutter.remember_display_layout().await;
+                    }
+                    if let Ok(monitors) = xs_mutter::monitor_choices().await { let _ = events.send(Event::Monitors(monitors)); }
                     if wanted && active.is_none() { Command::Connect } else { continue; }
                 }
             }
@@ -313,6 +341,39 @@ pub async fn run(
             // so the session is rebuilt. Never mid-stream: changing PipeWire
             // params on a live virtual node re-enters the mutter code path that
             // logs the user out.
+            Command::RefreshMonitors => match xs_mutter::monitor_choices().await {
+                Ok(monitors) => {
+                    let _ = events.send(Event::Monitors(monitors));
+                }
+                Err(e) => {
+                    let _ = events.send(Event::Warning(format!("Cannot list monitors: {e}")));
+                }
+            },
+            Command::Configure(settings) => {
+                if crate::DeviceSettings::from_config(&config) == settings {
+                    continue;
+                }
+                settings.apply(&mut config);
+                if let Some(id) = &config.last_device_id {
+                    crate::device_settings::remember(&config, id);
+                }
+                let _ = events.send(Event::DeviceSettings(crate::DeviceSettings::from_config(
+                    &config,
+                )));
+                if let Some(session) = active.take() {
+                    session.shutdown().await;
+                    tokio::time::sleep(TEARDOWN_SETTLE).await;
+                    let (session, retry) = connect_interruptible(
+                        &mut config,
+                        &events,
+                        &mut commands,
+                        &mut pending_command,
+                    )
+                    .await;
+                    active = session;
+                    wanted = retry;
+                }
+            }
             Command::SetTransport(mode) => {
                 config.transport = mode;
                 if let Some(session) = active.take() {
@@ -419,11 +480,42 @@ pub async fn run(
                     crate::device_settings::remember(&config, id);
                 }
                 if let Some(session) = active.as_ref() {
+                    request_camera(&session.camera_request, enabled);
+                    let status = xs_proto::CameraStatus {
+                        state: if enabled {
+                            xs_proto::CameraState::Pending
+                        } else {
+                            xs_proto::CameraState::Off
+                        },
+                        message: if enabled {
+                            "Starting camera…"
+                        } else {
+                            "Camera off"
+                        }
+                        .into(),
+                    };
+                    let _ = events.send(Event::CameraStatus(status));
                     if let Err(e) =
                         send_camera_control(&session.control_writer, enabled, &camera_id).await
                     {
                         warn!(error = %e, "camera control failed");
-                        let _ = events.send(Event::Warning(format!("Camera: {e}")));
+                        config.camera_enabled = false;
+                        if let Some(id) = &config.last_device_id {
+                            crate::device_settings::remember(&config, id);
+                        }
+                        let _ = events.send(Event::CameraStatus(xs_proto::CameraStatus {
+                            state: xs_proto::CameraState::Failed,
+                            message: format!(
+                                "Camera control failed: {e}. Reconnect the display and retry."
+                            ),
+                        }));
+                        // A cancelled write may leave a partial frame on the
+                        // control stream. Close it before sending anything else.
+                        if let Some(session) = active.take() {
+                            session.shutdown().await;
+                        }
+                        wanted = false;
+                        emit(State::Failed { message: format!("Connection stopped while changing the camera: {e}. Connect again to retry.") });
                     }
                 }
             }
@@ -442,6 +534,12 @@ pub async fn run(
     debug!("engine loop exited");
 }
 
+#[derive(Default)]
+struct ConnectionSetup {
+    session: std::sync::Mutex<Option<Arc<xs_mutter::Session>>>,
+    mutter: xs_mutter::SessionSetup,
+}
+
 /// Cancel setup promptly when the UI disconnects, quits or changes connection method.
 async fn connect_interruptible(
     config: &mut SessionConfig,
@@ -449,21 +547,32 @@ async fn connect_interruptible(
     commands: &mut mpsc::UnboundedReceiver<Command>,
     pending: &mut Option<Command>,
 ) -> (Option<Active>, bool) {
-    tokio::select! {
-        result = try_connect(config, events) => result,
+    let setup = ConnectionSetup::default();
+    let result = tokio::select! {
+        result = try_connect(config, events, &setup) => result,
         command = commands.recv() => {
             *pending = Some(command.unwrap_or(Command::Shutdown));
             (None, true)
         }
+    };
+    let created = setup.session.lock().unwrap().take();
+    if result.0.is_none() {
+        setup.mutter.close().await;
+        if let Some(session) = created {
+            let _ = session.close().await;
+            tokio::time::sleep(TEARDOWN_SETTLE).await;
+        }
     }
+    result
 }
 
 /// Connects and reports the outcome, returning the session on success.
 async fn try_connect(
     config: &mut SessionConfig,
     events: &broadcast::Sender<Event>,
+    setup: &ConnectionSetup,
 ) -> (Option<Active>, bool) {
-    match connect(config, events).await {
+    match connect(config, events, setup).await {
         Ok(session) => {
             let _ = events.send(Event::State(session.streaming_state()));
             (Some(session), true)
@@ -502,6 +611,7 @@ fn state_for_error(e: &anyhow::Error) -> State {
 async fn connect(
     config: &mut SessionConfig,
     events: &broadcast::Sender<Event>,
+    setup: &ConnectionSetup,
 ) -> anyhow::Result<Active> {
     let step = |s: &str| {
         let _ = events.send(Event::State(State::Connecting {
@@ -509,16 +619,17 @@ async fn connect(
         }));
     };
 
-    step("Looking for your tablet…");
-    let transport = Transport::connect_with_mode(
+    step("Checking tablet connection methods…");
+    let transport = Transport::connect_with_mode_and_progress(
         config.apk_path.as_deref(),
         config.apk_version,
         config.transport,
+        step,
     )
     .await?;
     let cleanup = transport.teardown_handle();
     let mut guard = xs_transport::PendingConnection::new(cleanup.clone());
-    let result = connect_streams(config, events, transport).await;
+    let result = connect_streams(config, events, transport, setup).await;
     if result.is_err() {
         cleanup.disconnect().await;
     }
@@ -529,13 +640,15 @@ async fn connect(
 async fn connect_streams(
     config: &mut SessionConfig,
     events: &broadcast::Sender<Event>,
-    transport: Transport,
+    mut transport: Transport,
+    setup: &ConnectionSetup,
 ) -> anyhow::Result<Active> {
     let step = |s: &str| {
         let _ = events.send(Event::State(State::Connecting { step: s.into() }));
     };
     let accessory = transport.is_accessory();
     let fallback_device_name = transport.device.display_name();
+    let negotiated_hello = transport.hello.take();
     let (handle, control, video, camera) = transport.split();
     // Only the control channel is bidirectional, so only it is split. This is not
     // tidiness: dropping tokio's `OwnedWriteHalf` calls shutdown(Write), and adb's
@@ -552,16 +665,20 @@ async fn connect_streams(
     } else {
         "Waiting for the tablet to introduce itself…"
     });
-    let hello = tokio::time::timeout(
-        Duration::from_secs(if accessory { 60 } else { 5 }),
-        read_hello(&mut control_reader),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "tablet handshake timed out; unlock the tablet and tap Allow, then reconnect"
+    let hello = if let Some(hello) = negotiated_hello {
+        hello
+    } else {
+        tokio::time::timeout(
+            Duration::from_secs(if accessory { 60 } else { 5 }),
+            xs_transport::read_hello(&mut control_reader),
         )
-    })??;
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "tablet handshake timed out; unlock the tablet and tap Allow, then reconnect"
+            )
+        })??
+    };
     let device_name = if hello.device_name.trim().is_empty() {
         fallback_device_name
     } else {
@@ -583,6 +700,7 @@ async fn connect_streams(
     let _ = events.send(Event::DeviceSettings(crate::DeviceSettings::from_config(
         config,
     )));
+    let _ = events.send(Event::Cameras(hello.cameras.clone()));
     let scale = clamp_ui_scale(config.scale);
     let (asked_width, asked_height) = if modes_enabled() {
         scaled_size_for(hello.width, hello.height, scale)
@@ -616,32 +734,40 @@ async fn connect_streams(
     let source = match (config.mode, &config.mirror_source) {
         (DisplayMode::Mirror, Some(connector)) => CaptureSource::Monitor(connector.clone()),
         (DisplayMode::Mirror, None) => {
-            // Asked to mirror with nothing chosen: use the first monitor rather
-            // than failing outright.
-            match xs_mutter::list_monitors().await.unwrap_or_default().first() {
-                Some(c) => CaptureSource::Monitor(c.clone()),
-                None => CaptureSource::Virtual,
-            }
+            let monitors = xs_mutter::monitor_choices()
+                .await
+                .map_err(|e| anyhow::anyhow!("Cannot enumerate monitors for Mirror mode: {e}"))?;
+            let connector = monitors.first().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No monitor is available to mirror; select a monitor or use Extend mode"
+                )
+            })?;
+            CaptureSource::Monitor(connector.connector.clone())
         }
         (DisplayMode::Extend, _) => CaptureSource::Virtual,
     };
 
     let mutter = Arc::new(
-        xs_mutter::Session::open(DisplayConfig {
-            width: asked_width,
-            height: asked_height,
-            refresh_rate: config.framerate as f64,
-            scale,
-            fallback_sizes: fallback_sizes(hello.width, hello.height),
-            layout_key: (config.mode == DisplayMode::Extend).then(|| device_id.clone()),
-            // Metadata, not Embedded: mutter only paints an embedded cursor
-            // when the virtual monitor is damaged, so a still window freezes
-            // the pointer. Cursor sprite/position is forwarded to the tablet.
-            cursor_mode: CursorMode::Metadata,
-            source,
-        })
+        xs_mutter::Session::open_tracked(
+            DisplayConfig {
+                width: asked_width,
+                height: asked_height,
+                refresh_rate: config.framerate as f64,
+                scale,
+                fallback_sizes: fallback_sizes(hello.width, hello.height),
+                layout_key: (config.mode == DisplayMode::Extend).then(|| device_id.clone()),
+                // Metadata, not Embedded: mutter only paints an embedded cursor
+                // when the virtual monitor is damaged, so a still window freezes
+                // the pointer. Cursor sprite/position is forwarded to the tablet.
+                cursor_mode: CursorMode::Metadata,
+                source,
+            },
+            &setup.mutter,
+        )
         .await?,
     );
+
+    *setup.session.lock().unwrap() = Some(mutter.clone());
 
     // Whatever mutter settled on wins: the PipeWire node only ever produces that
     // size, so negotiating anything else would leave the tablet black.
@@ -753,6 +879,23 @@ async fn connect_streams(
         config.bounds,
         start_kbps,
     )));
+    let (camera_request, camera_requests) = watch::channel(CameraRequest {
+        enabled: config.camera_enabled,
+        revision: 0,
+    });
+    let (camera_status_tx, camera_status) = watch::channel(xs_proto::CameraStatus {
+        state: if config.camera_enabled {
+            xs_proto::CameraState::Pending
+        } else {
+            xs_proto::CameraState::Off
+        },
+        message: if config.camera_enabled {
+            "Starting camera…"
+        } else {
+            "Camera off"
+        }
+        .into(),
+    });
     let (bitrate_tx, mut bitrate_rx) = mpsc::unbounded_channel::<u32>();
     // Round-trip latency in microseconds, written by the pong handler and read by
     // the stats handler. Atomic rather than a channel: only the freshest value
@@ -769,11 +912,9 @@ async fn connect_streams(
         let recovery_pipeline = Arc::clone(&pipeline);
         tasks.push(tokio::spawn(async move {
             let mut last_start = Instant::now();
-            let mut recovery_poll = tokio::time::interval(Duration::from_millis(100));
-            recovery_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let frame = tokio::select! {
-                    _ = recovery_poll.tick() => { recovery_pipeline.recover_dropped_frames(); continue; }
+                    _ = recovery_pipeline.recover_dropped_frames() => continue,
                     frame = frames.recv() => match frame { Some(frame) => frame, None => break },
                 };
                 let inter = last_start.elapsed();
@@ -847,6 +988,8 @@ async fn connect_streams(
         let rtt_us = Arc::clone(&rtt_us);
         let bitrate_tx = bitrate_tx.clone();
         let last_contact_us = Arc::clone(&last_contact_us);
+        let camera_status_tx = camera_status_tx.clone();
+        let camera_request = camera_request.subscribe();
 
         tasks.push(tokio::spawn(async move {
             let mut fps = FpsCounter::new();
@@ -897,6 +1040,21 @@ async fn connect_streams(
                         }
                     }
 
+                    Channel::Control if frame.header.kind == ControlKind::CameraStatus as u8 => {
+                        if camera_request.borrow().enabled {
+                            if let Ok(status) =
+                                serde_json::from_slice::<xs_proto::CameraStatus>(&frame.payload)
+                            {
+                                camera_status_tx.send_if_modified(|current| {
+                                    if current.state == xs_proto::CameraState::Failed {
+                                        return false;
+                                    }
+                                    *current = status;
+                                    true
+                                });
+                            }
+                        }
+                    }
                     Channel::Control if frame.header.kind == ControlKind::Pong as u8 => {
                         // The tablet echoes our timestamp verbatim, so this is a
                         // true round trip and needs no clock synchronisation.
@@ -1000,45 +1158,28 @@ async fn connect_streams(
         }));
     }
 
-    // Read the camera socket even when disabled. Opening V4L2 lazily lets
-    // the camera be enabled mid-session without rebuilding the display.
+    // The camera worker owns V4L2. Disable takes priority over buffered frames.
     {
-        let events = events.clone();
-        let mut camera_reader = FrameReader::new(camera);
+        let (camera_frames, incoming_camera) = mpsc::channel(2);
         tasks.push(tokio::spawn(async move {
-            let mut writer = None;
-            let mut warned = false;
-            while let Ok(frame) = camera_reader.read_frame().await {
-                if writer.is_none() {
-                    match xs_camera::V4l2Writer::open_default() {
-                        Ok(w) => {
-                            writer = Some(w);
-                            warned = false;
-                        }
-                        Err(e) => {
-                            if !warned {
-                                warn!(error = %e, "virtual camera unavailable");
-                                let _ = events.send(Event::Warning(format!(
-                                    "Camera: {e}. Run scripts/setup.sh --camera."
-                                )));
-                                warned = true;
-                            }
-                            continue;
-                        }
-                    }
-                }
-                let is_config = frame.header.flags & flags::CODEC_CONFIG != 0;
-                if let Err(e) =
-                    writer
-                        .as_mut()
-                        .unwrap()
-                        .push(&frame.payload, frame.header.pts_us, is_config)
-                {
-                    warn!(error = %e, "writing to the virtual camera failed");
-                    writer = None;
+            let mut reader = FrameReader::new(camera);
+            loop {
+                let frame = reader.read_frame().await;
+                let ended = frame.is_err();
+                if camera_frames.send(frame).await.is_err() || ended {
+                    break;
                 }
             }
         }));
+        tasks.push(tokio::spawn(crate::camera::run(
+            camera_requests,
+            camera_status_tx,
+            incoming_camera,
+            || {
+                xs_camera::V4l2Writer::open_default()
+                    .map_err(|error| format!("{error}. See Camera Setup in Settings."))
+            },
+        )));
     }
 
     Ok(Active {
@@ -1053,6 +1194,8 @@ async fn connect_streams(
         encoder_name,
         width,
         height,
+        camera_request,
+        camera_status,
     })
 }
 
@@ -1074,7 +1217,9 @@ impl WritePace {
         fetch_max(&self.max_write_us, write_us);
         fetch_max(&self.max_inter_us, inter_us);
         if write >= Duration::from_millis(20) || inter >= Duration::from_millis(50) {
-            warn!(
+            // Damage-driven capture has normal idle gaps; retain them in debug
+            // diagnostics without writing a warning on every sparse update.
+            debug!(
                 write_ms = write.as_millis() as u64,
                 inter_ms = inter.as_millis() as u64,
                 bytes,
@@ -1103,29 +1248,6 @@ fn fetch_max(slot: &AtomicU64, value: u64) {
     }
 }
 
-/// Reads frames until the tablet's `Hello` turns up.
-async fn read_hello<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut FrameReader<R>,
-) -> anyhow::Result<Hello> {
-    // A few frames of slack in case anything is queued ahead of it.
-    for _ in 0..128 {
-        let frame = reader.read_frame().await?;
-        if frame.header.channel == Channel::Control && frame.header.kind == ControlKind::Hello as u8
-        {
-            let hello: Hello = serde_json::from_slice(&frame.payload)?;
-            anyhow::ensure!(
-                hello.protocol_version == xs_proto::PROTOCOL_VERSION,
-                "the tablet app speaks protocol v{} but this build speaks v{}. \
-                 Reinstall the companion app.",
-                hello.protocol_version,
-                xs_proto::PROTOCOL_VERSION
-            );
-            return Ok(hello);
-        }
-    }
-    anyhow::bail!("tablet never sent a Hello message")
-}
-
 async fn send_camera_control(
     writer: &SharedWriter,
     enabled: bool,
@@ -1139,17 +1261,22 @@ async fn send_camera_control(
         framerate: 30,
         bitrate_kbps: 8_000,
     };
-    writer
-        .lock()
-        .await
-        .write_frame(
-            Channel::Control,
-            ControlKind::CameraControl as u8,
-            0,
-            0,
-            serde_json::to_string(&control)?.as_bytes(),
-        )
-        .await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        writer
+            .lock()
+            .await
+            .write_frame(
+                Channel::Control,
+                ControlKind::CameraControl as u8,
+                0,
+                0,
+                serde_json::to_string(&control)?.as_bytes(),
+            )
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Camera control timed out"))??;
     Ok(())
 }
 

@@ -42,6 +42,9 @@ struct Widgets {
     stat_latency: adw::ActionRow,
     stat_encoder: adw::ActionRow,
     updating_display: Cell<bool>,
+    cancelling: Cell<bool>,
+    monitors: Rc<RefCell<Vec<xs_core::MonitorInfo>>>,
+    cameras: Rc<RefCell<Vec<xs_core::CameraInfo>>>,
 }
 
 pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Config>>) {
@@ -120,6 +123,30 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
         group.add(&row); page.add(&group); dialog.add(&page); dialog.present(Some(&parent));
     });
     app.add_action(&usb_action);
+    let settings_action = gtk::gio::SimpleAction::new("display-settings", None);
+    let parent = window.clone();
+    let saved = config.clone();
+    let settings_engine = engine.clone();
+    let monitors = widgets.monitors.clone();
+    let cameras = widgets.cameras.clone();
+    settings_action.connect_activate(move |_, _| {
+        crate::settings::present(&parent, &settings_engine, &saved, &monitors, &cameras)
+    });
+    app.add_action(&settings_action);
+    let camera_setup = gtk::gio::SimpleAction::new("camera-setup", None);
+    let parent = window.clone();
+    camera_setup.connect_activate(move |_, _| {
+        let dialog = adw::AlertDialog::builder().heading("Set up the tablet webcam")
+            .body("The display works without this optional setup.
+
+On Ubuntu, install v4l2loopback-dkms and gstreamer1.0-libav, then load v4l2loopback with video_nr=10, card_label=\"Extraspace Tablet Camera\", and exclusive_caps=1. Restarting needs the same module options. If /dev/video10 already belongs to another camera, resolve that conflict first.
+
+If you have the Extraspace source folder, ./scripts/setup.sh --camera prepares this for you. Then enable Tablet Camera and allow camera access on Android.
+
+A webcam named Extraspace Tablet Camera will appear in your calling app. You can choose the front or back camera in Display & Camera Settings.") .build();
+        dialog.add_response("close", "Close"); dialog.set_close_response("close"); dialog.present(Some(&parent));
+    });
+    app.add_action(&camera_setup);
     wire_controls(&widgets, &engine, &config);
     listen_to_engine(&widgets, &engine, &config);
 
@@ -235,6 +262,11 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         .build();
     status_extra.append(&spinner);
     status_extra.append(&status_button);
+    let settings_button = gtk::Button::builder()
+        .label("Display & Camera Settings")
+        .action_name("app.display-settings")
+        .build();
+    status_extra.append(&settings_button);
 
     let status = adw::StatusPage::builder()
         .icon_name(APP_ID)
@@ -282,6 +314,15 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         .build();
     encoding_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     display_group.add(&encoding_row);
+    let settings_row = adw::ActionRow::builder()
+        .title("Display & Camera Settings")
+        .use_markup(false)
+        .subtitle("Choose a monitor, camera, frame rate and quality")
+        .activatable(true)
+        .action_name("app.display-settings")
+        .build();
+    settings_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    display_group.add(&settings_row);
     prefs.add(&display_group);
 
     let camera_group = adw::PreferencesGroup::builder()
@@ -336,6 +377,9 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         stat_latency,
         stat_encoder,
         updating_display: Cell::new(false),
+        cancelling: Cell::new(false),
+        monitors: Rc::new(RefCell::new(Vec::new())),
+        cameras: Rc::new(RefCell::new(Vec::new())),
     };
     (stack.upcast(), widgets)
 }
@@ -354,6 +398,10 @@ fn gio_menu() -> gtk::gio::Menu {
         Some("app.keep-running-in-tray"),
     );
     menu.append(Some("_Hide Window"), Some("app.hide-window"));
+    menu.append(
+        Some("_Display & Camera Settings"),
+        Some("app.display-settings"),
+    );
     menu.append(Some("_USB Connection"), Some("app.usb-connection"));
     menu.append(Some("_Video Encoding"), Some("app.video-encoding"));
     menu.append(Some("_About Extraspace"), Some("app.about"));
@@ -550,8 +598,13 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
 
     {
         let engine = engine.clone();
+        let view = widgets.clone();
         widgets.status_button.connect_clicked(move |_| {
-            engine.send(Command::Connect);
+            engine.send(if view.cancelling.get() {
+                Command::Disconnect
+            } else {
+                Command::Connect
+            });
         });
     }
 }
@@ -605,6 +658,19 @@ fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<Re
                     widgets.camera_switch.set_active(s.camera_enabled);
                     widgets.updating_display.set(false);
                     update_scale_subtitle(&widgets, &config);
+                    config.borrow().save();
+                }
+                Ok(Event::Monitors(monitors)) => *widgets.monitors.borrow_mut() = monitors,
+                Ok(Event::Cameras(cameras)) => *widgets.cameras.borrow_mut() = cameras,
+                Ok(Event::CameraStatus(status)) => {
+                    widgets.camera_switch.set_subtitle(&status.message);
+                    if status.state == xs_core::CameraState::Failed {
+                        config.borrow_mut().camera_enabled = false;
+                        config.borrow().save();
+                        widgets.updating_display.set(true);
+                        widgets.camera_switch.set_active(false);
+                        widgets.updating_display.set(false);
+                    }
                 }
                 Ok(Event::Stats(stats)) => apply_stats(&widgets, &stats),
                 Ok(Event::Warning(message)) => {
@@ -620,6 +686,10 @@ fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<Re
 }
 
 fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>>) {
+    widgets.cancelling.set(matches!(
+        state,
+        State::Connecting { .. } | State::NoTablet | State::Unauthorized { .. }
+    ));
     if matches!(state, State::Idle | State::Streaming { .. }) {
         widgets.updating_display.set(true);
         widgets
@@ -664,7 +734,7 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>
                 } else {
                     "Connect your tablet with a data cable. For ADB, enable USB debugging and accept Android’s authorization prompt. For AOA, choose USB accessory in the USB Connection menu and open Extraspace from Android’s USB prompt."
                 },
-                Some("Check Again"),
+                Some("Stop Waiting"),
             );
         }
 
@@ -678,7 +748,7 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>
                      Unlock the tablet and tap “Allow” on the USB debugging prompt. \
                      Tick “Always allow from this computer” so you are not asked again.",
                 ),
-                Some("Try Again"),
+                Some("Stop Waiting"),
             );
         }
 
@@ -689,7 +759,8 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>
                 .set_icon_name(Some("content-loading-symbolic"));
             widgets.status.set_title("Connecting");
             widgets.status.set_description(Some(step));
-            widgets.status_button.set_visible(false);
+            widgets.status_button.set_label("Cancel");
+            widgets.status_button.set_visible(true);
             widgets.spinner.set_visible(true);
             widgets.spinner.start();
             widgets.stack.set_visible_child_name("status");
@@ -742,4 +813,79 @@ fn apply_stats(widgets: &Rc<Widgets>, stats: &Stats) {
         "measuring…".to_owned()
     };
     widgets.stat_latency.set_subtitle(&latency);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires a graphical session and a private D-Bus"]
+    fn cancellation_and_recovery_controls_remain_available() {
+        adw::init().unwrap();
+        let (_content, widgets) = build_content(adw::WindowTitle::new("Extraspace", ""));
+        let widgets = Rc::new(widgets);
+        let config = Rc::new(RefCell::new(Config {
+            auto_connect: false,
+            ..Default::default()
+        }));
+        let engine = xs_core::spawn(xs_core::SessionConfig::default());
+        let mut events = engine.subscribe();
+        wire_controls(&widgets, &engine, &config);
+        for state in [
+            State::Connecting {
+                step: "Creating display".into(),
+            },
+            State::NoTablet,
+            State::Unauthorized {
+                device: "Test tablet".into(),
+            },
+        ] {
+            apply_state(&widgets, &state, &config);
+            assert!(widgets.cancelling.get());
+            assert!(widgets.status_button.is_visible());
+            assert!(
+                widgets
+                    .status
+                    .child()
+                    .unwrap()
+                    .last_child()
+                    .unwrap()
+                    .is_visible(),
+                "settings must remain reachable"
+            );
+            widgets.status_button.emit_clicked();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        loop {
+                            if matches!(events.recv().await.unwrap(), Event::State(State::Idle)) {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                });
+        }
+        apply_state(
+            &widgets,
+            &State::Failed {
+                message: "Unavailable encoder".into(),
+            },
+            &config,
+        );
+        assert!(!widgets.cancelling.get());
+        assert_eq!(widgets.status_button.label().as_deref(), Some("Try Again"));
+        assert!(widgets
+            .status
+            .child()
+            .unwrap()
+            .last_child()
+            .unwrap()
+            .is_visible());
+        gtk::glib::MainContext::default().block_on(engine.shutdown());
+    }
 }

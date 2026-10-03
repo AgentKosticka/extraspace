@@ -55,6 +55,9 @@ jobs:
           shellcheck scripts/*.sh packaging/mutter-patch/*.sh packaging/mutter-patch/extraspace-mutter-patch-check
           python3 scripts/tests/test_release.py
           python3 scripts/tests/test_install.py
+          python3 scripts/tests/test_apk.py
+          python3 scripts/tests/test_system_setup.py
+          python3 scripts/tests/test_companion_version.py
           python3 scripts/sync-icon.py --check
           python3 scripts/sync-theme.py --check
 
@@ -81,6 +84,10 @@ jobs:
           GSK_RENDERER: cairo
           GTK_A11Y: none
         run: |
+          dbus-run-session -- cargo test -p xs-mutter incomplete_setup_is_explicitly_stopped_before_connection_drop -- --ignored --test-threads=1
+          xvfb-run -a dbus-run-session -- cargo test -p xs-ui offline_settings_repair_invalid_sources_and_save_controls -- --ignored --test-threads=1
+          xvfb-run -a dbus-run-session -- cargo test -p xs-ui cancellation_and_recovery_controls_remain_available -- --ignored --test-threads=1
+          xvfb-run -a dbus-run-session -- cargo test -p xs-ui dialog_recovers_an_unavailable_pin_and_saves_the_cpu_choice -- --ignored --test-threads=1
           xvfb-run -a dbus-run-session -- /usr/bin/python3 scripts/tests/test_usb_dialog.py target/release/extraspace
           xvfb-run -a dbus-run-session -- /usr/bin/python3 scripts/tests/test_tray.py target/release/extraspace
 
@@ -89,6 +96,23 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Require companion version bump for Android changes
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          if [[ -n "$PR_BASE" ]]; then
+            BASE=$PR_BASE
+          elif [[ "$GITHUB_REF" == refs/heads/* && -n "$PUSH_BASE" && "$PUSH_BASE" != 0000000000000000000000000000000000000000 ]]; then
+            BASE=$PUSH_BASE
+          else
+            # Tags/manual runs compare with the preceding release when available.
+            BASE=$(git describe --tags --match 'v*' --abbrev=0 HEAD^ 2>/dev/null || git rev-parse HEAD^)
+          fi
+          python3 scripts/check-companion-version.py "$BASE" "$GITHUB_SHA"
 
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:

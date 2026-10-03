@@ -28,15 +28,21 @@ with tempfile.TemporaryDirectory(prefix="extraspace-usb-menu-") as d:
                 except GLib.Error: pass
                 time.sleep(.1)
             assert "usb-connection" in actions
+            assert "display-settings" in actions and "camera-setup" in actions
             def action(name): call("Activate", GLib.Variant("(sava{sv})", (name, [], {})))
             action("usb-connection")
             time.sleep(.5)
+            action("display-settings")
+            time.sleep(.3)
+            action("camera-setup")
+            time.sleep(.3)
             assert process.poll() is None
             action("quit")
             assert process.wait(timeout=8) == 0
             log.seek(0)
             output = log.read().decode()
             assert "CRITICAL" not in output, output
-            print("PASS: disconnected USB dialog and Quit with the dialog open")
+            assert "Failed to set text" not in output, output
+            print("PASS: disconnected USB, display settings and camera setup dialogs; Quit with dialogs open")
         finally:
             if process.poll() is None: process.terminate(); process.wait(timeout=5)

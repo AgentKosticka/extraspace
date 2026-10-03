@@ -33,6 +33,7 @@ if ((UNINSTALL)); then
     "$CONFIG_DIR/autostart/$APP_ID.desktop" "$DATA_DIR/extraspace/extraspace.apk"
   rmdir "$DATA_DIR/extraspace" 2>/dev/null || true
   update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+  echo 'To remove optional system setup, run ./scripts/setup.sh --uninstall --camera --accessory (use --check to preview).'
   echo "Extraspace removed. Settings and logs remain under $CONFIG_DIR/extraspace and the XDG state directory."
   exit 0
 fi
@@ -71,6 +72,15 @@ if [[ -z $APK_SRC ]]; then
     "$REPO_ROOT/android/app/build/outputs/apk/debug/app-debug.apk"; do
     if [[ -f $candidate ]]; then APK_SRC=$candidate; break; fi
   done
+fi
+# Reject stale APKs before replacing any installed application files.
+APK_TO_CHECK=$APK_SRC
+if [[ -z $APK_TO_CHECK && -f $DATA_DIR/extraspace/extraspace.apk ]]; then
+  APK_TO_CHECK=$DATA_DIR/extraspace/extraspace.apk
+fi
+if [[ -n $APK_TO_CHECK ]]; then
+  command -v python3 >/dev/null || { echo 'Install Python 3 to verify the companion APK.' >&2; exit 1; }
+  python3 "$REPO_ROOT/scripts/check-apk.py" "$APK_TO_CHECK" "$(cat "$REPO_ROOT/companion-version")"
 fi
 if ((NO_BUILD == 0)); then (cd "$REPO_ROOT" && cargo build --release --locked); fi
 TARGET_DIR=${CARGO_TARGET_DIR:-$REPO_ROOT/target}

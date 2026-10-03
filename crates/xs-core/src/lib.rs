@@ -13,9 +13,12 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, warn};
 
 pub mod adaptive;
+mod camera;
 mod device_settings;
 mod session;
 pub use device_settings::DeviceSettings;
+pub use xs_mutter::MonitorInfo;
+pub use xs_proto::{CameraInfo, CameraState, CameraStatus};
 pub use xs_transport::TransportMode;
 
 pub use xs_video::{available_encoders, EncoderOption, EncoderSelection, EncodingMode};
@@ -41,6 +44,9 @@ pub enum Command {
     SetTransport(TransportMode),
     /// Switch between extending and mirroring.
     SetMode(DisplayMode),
+    /// Apply all display preferences with at most one reconnect.
+    Configure(DeviceSettings),
+    RefreshMonitors,
     /// Apply an encoder policy; rebuild an active session safely.
     SetEncoder(EncoderSelection),
     /// Change the quality envelope the adaptive controller works within.
@@ -100,6 +106,9 @@ pub enum Event {
     DeviceSettings(DeviceSettings),
     /// Non-fatal; shown as a toast rather than replacing the whole view.
     Warning(String),
+    Monitors(Vec<MonitorInfo>),
+    Cameras(Vec<CameraInfo>),
+    CameraStatus(CameraStatus),
 }
 
 /// Handle the UI holds. Cloneable and cheap.

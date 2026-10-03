@@ -65,4 +65,8 @@
                 android:text="@string/setup_help" android:textColor="@color/xs_muted" android:textSize="14sp" />
         </LinearLayout>
     </ScrollView>
+    <androidx.appcompat.widget.AppCompatButton android:id="@+id/streaming_settings"
+        android:layout_width="wrap_content" android:layout_height="48dp"
+        android:layout_gravity="top|end" android:layout_margin="8dp"
+        android:text="@string/settings" android:visibility="gone" />
 </FrameLayout>

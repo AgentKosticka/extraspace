@@ -1,5 +1,5 @@
 //! Android Open Accessory: a single bulk stream carrying the existing XSPA frames.
-//! Only explicit Accessory selection probes devices; Auto prefers an authorized ADB device.
+//! Auto prefers an authorized ADB device when both selectors allow it.
 use crate::{Adb, Device, DeviceState, Error, Result, Transport, TransportStream};
 use rusb::{DeviceHandle, Direction, GlobalContext, TransferType};
 use std::{
@@ -70,11 +70,26 @@ fn accessory(vid: u16, pid: u16) -> bool {
     vid == 0x18d1 && [0x2d00, 0x2d01].contains(&pid)
 }
 
-fn open_usb() -> Result<(DeviceHandle<GlobalContext>, u8, u8, String)> {
+fn discovery_active(cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::Accessory("USB discovery cancelled".into()));
+    }
+    Ok(())
+}
+struct DiscoveryGuard(Arc<AtomicBool>);
+impl Drop for DiscoveryGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+fn open_usb(cancelled: &AtomicBool) -> Result<(DeviceHandle<GlobalContext>, u8, u8, String)> {
+    discovery_active(cancelled)?;
     let devices = rusb::devices().map_err(usb_error)?;
     let mut ready = Vec::new();
     let mut candidates = Vec::new();
     for device in devices.iter() {
+        discovery_active(cancelled)?;
         let descriptor = device.device_descriptor().map_err(usb_error)?;
         if accessory(descriptor.vendor_id(), descriptor.product_id()) {
             ready.push(device);
@@ -105,6 +120,7 @@ fn open_usb() -> Result<(DeviceHandle<GlobalContext>, u8, u8, String)> {
         let mut supported = Vec::new();
         let mut denied = false;
         for device in candidates {
+            discovery_active(cancelled)?;
             let handle = match device.open() {
                 Ok(h) => h,
                 Err(rusb::Error::Access) => {
@@ -148,6 +164,7 @@ fn open_usb() -> Result<(DeviceHandle<GlobalContext>, u8, u8, String)> {
         .iter()
         .enumerate()
         {
+            discovery_active(cancelled)?;
             let mut bytes = value.as_bytes().to_vec();
             bytes.push(0);
             let written = handle
@@ -159,12 +176,14 @@ fn open_usb() -> Result<(DeviceHandle<GlobalContext>, u8, u8, String)> {
                 ));
             }
         }
+        discovery_active(cancelled)?;
         handle
             .write_control(0x40, 53, 0, 0, &[], SETUP_TIMEOUT)
             .map_err(usb_error)?;
         drop(handle);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            discovery_active(cancelled)?;
             let found = rusb::devices().map_err(usb_error)?.iter().find(|d| {
                 d.bus_number() == bus
                     && d.port_numbers().ok().as_ref() == Some(&ports)
@@ -183,6 +202,7 @@ fn open_usb() -> Result<(DeviceHandle<GlobalContext>, u8, u8, String)> {
             std::thread::sleep(Duration::from_millis(100));
         }
     };
+    discovery_active(cancelled)?;
     let descriptor = device.device_descriptor().map_err(usb_error)?;
     let handle = device.open().map_err(usb_error)?;
     let serial = handle
@@ -212,13 +232,23 @@ fn open_usb() -> Result<(DeviceHandle<GlobalContext>, u8, u8, String)> {
     Err(Error::Accessory("No accessory bulk endpoints found".into()))
 }
 
-pub(crate) async fn connect() -> Result<Transport> {
-    let (usb, input, output, serial) = tokio::task::spawn_blocking(open_usb)
+pub(crate) async fn connect(mode: crate::TransportMode) -> Result<Transport> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _guard = DiscoveryGuard(cancelled.clone());
+    let (usb, input, output, serial) = tokio::task::spawn_blocking(move || open_usb(&cancelled))
         .await
         .map_err(|e| Error::Accessory(e.to_string()))??;
     let mut transport = bridge(usb, input, output, serial)?;
     crate::FrameWriter::new(&mut transport.control)
-        .write_frame(Channel::Control, ControlKind::HelloRequest as u8, 0, 0, &[])
+        .write_frame(
+            Channel::Control,
+            ControlKind::HelloRequest as u8,
+            0,
+            0,
+            serde_json::json!({ "transport": mode })
+                .to_string()
+                .as_bytes(),
+        )
         .await?;
     Ok(transport)
 }
@@ -340,6 +370,7 @@ fn bridge(
         }
     });
     Ok(Transport {
+        hello: None,
         device: Device {
             serial,
             state: DeviceState::Ready,
@@ -412,6 +443,16 @@ impl Read for BulkReader {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancelled_discovery_stops_before_probing_or_switching_usb() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = super::DiscoveryGuard(cancelled.clone());
+        drop(guard);
+        assert!(
+            matches!(super::open_usb(&cancelled), Err(crate::Error::Accessory(message)) if message.contains("cancelled"))
+        );
+    }
+
     use super::*;
     fn frame(channel: Channel, payload: &[u8]) -> Vec<u8> {
         let mut v = Header {

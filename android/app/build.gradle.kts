@@ -51,6 +51,7 @@ android {
     kotlinOptions { jvmTarget = "17" }
 
     sourceSets["main"].java.srcDirs("src/main/kotlin")
+    sourceSets["test"].resources.srcDir("../../protocol")
 }
 
 dependencies {

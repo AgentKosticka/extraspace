@@ -168,7 +168,7 @@ pub struct Session {
     width: u32,
     height: u32,
     input_coordinates: input::InputCoordinates,
-    layout_before: Option<display::DisplayLayout>,
+    layout_before: Option<std::sync::Arc<display::DisplayLayout>>,
     use_modes: bool,
     // Atomic rather than a bool so the session can be shared behind an `Arc` --
     // the touch task and the teardown path both need it, and neither can take
@@ -176,9 +176,61 @@ pub struct Session {
     stopped: std::sync::atomic::AtomicBool,
 }
 
+/// Retains enough state to explicitly undo a cancelled or failed setup.
+#[derive(Default)]
+pub struct SessionSetup(std::sync::Mutex<Option<SetupState>>);
+struct SetupState {
+    conn: Connection,
+    remote_desktop: RemoteDesktopSessionProxy<'static>,
+    layout_before: Option<std::sync::Arc<display::DisplayLayout>>,
+    started: bool,
+}
+impl SessionSetup {
+    pub async fn close(&self) {
+        let state = self.0.lock().unwrap().take();
+        if let Some(state) = state {
+            let restore = if state.started {
+                if let Some(before) = state.layout_before.as_ref() {
+                    match display::capture_layout_for_cancelled_setup(&state.conn, before).await {
+                        Ok(layout) => layout,
+                        Err(error) => {
+                            warn!(%error, "could not capture cancelled setup monitor");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Err(error) = state.remote_desktop.stop().await {
+                debug!(%error, "cancelled setup session stop failed");
+            }
+            if let Some(layout) = restore {
+                if let Err(error) =
+                    display::restore_layout_after_virtual_removal(&state.conn, &layout).await
+                {
+                    warn!(%error, "could not restore layout after cancelled setup");
+                }
+            }
+        }
+    }
+}
+
 impl Session {
     /// Runs the full setup and returns once the PipeWire node exists.
     pub async fn open(config: DisplayConfig) -> Result<Self> {
+        let setup = SessionSetup::default();
+        let result = Self::open_tracked(config, &setup).await;
+        if result.is_err() {
+            setup.close().await;
+        }
+        result
+    }
+
+    /// The caller must close `setup` if this future is cancelled or returns an error.
+    pub async fn open_tracked(config: DisplayConfig, setup: &SessionSetup) -> Result<Self> {
         if matches!(config.source, CaptureSource::Virtual) {
             display::sanitize_saved_virtual_layouts(&config)?;
         }
@@ -190,7 +242,9 @@ impl Session {
         let original_layout = if matches!(config.source, CaptureSource::Virtual)
             && patched::patched_mutter_is_running()
         {
-            Some(display::capture_display_layout(&conn).await?)
+            Some(std::sync::Arc::new(
+                display::capture_display_layout(&conn).await?,
+            ))
         } else {
             None
         };
@@ -226,6 +280,12 @@ impl Session {
         // 1. Remote-desktop session, whose id links the screen-cast session to it.
         let rd_path: OwnedObjectPath = remote_desktop.create_session().await?;
         let rd_session = RemoteDesktopSessionProxy::new(&conn, rd_path.clone()).await?;
+        *setup.0.lock().unwrap() = Some(SetupState {
+            conn: conn.clone(),
+            remote_desktop: rd_session.clone(),
+            layout_before: original_layout.clone(),
+            started: false,
+        });
         let rd_id = rd_session.session_id().await?;
 
         // 2. Screen-cast session, linked.
@@ -280,12 +340,15 @@ impl Session {
         let mut added = stream.receive_pipe_wire_stream_added().await?;
 
         // 5. Start from the remote-desktop side; the linked screen-cast starts with it.
+        // The call can take effect before its reply arrives; retain cleanup first.
+        if let Some(state) = setup.0.lock().unwrap().as_mut() {
+            state.started = true;
+        }
         rd_session.start().await?;
 
         let node_id = match tokio::time::timeout(NEGOTIATION_TIMEOUT, added.next()).await {
             Ok(Some(signal)) => signal.args()?.node_id,
             Ok(None) | Err(_) => {
-                let _ = rd_session.stop().await;
                 return Err(Error::NegotiationTimeout);
             }
         };
@@ -295,10 +358,7 @@ impl Session {
         // after the video pipeline starts.
         if use_modes {
             if let Some(before) = original_layout.as_ref() {
-                if let Err(e) = display::enable_virtual_monitor(&conn, config.scale, before).await {
-                    let _ = rd_session.stop().await;
-                    return Err(e);
-                }
+                display::enable_virtual_monitor(&conn, config.scale, before).await?;
             }
         }
 
@@ -333,6 +393,7 @@ impl Session {
         );
 
         let input_coordinates = input::InputCoordinates::new(&conn, &config.source).await?;
+        setup.0.lock().unwrap().take();
         Ok(Self {
             _conn: conn,
             remote_desktop: rd_session,
@@ -558,4 +619,70 @@ impl InputOnlySession {
 pub async fn list_monitors() -> Result<Vec<String>> {
     let conn = Connection::session().await?;
     Ok(display::list_connectors_best_effort(&conn).await)
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitorInfo {
+    pub connector: String,
+    pub label: String,
+    pub primary: bool,
+}
+
+pub async fn monitor_choices() -> Result<Vec<MonitorInfo>> {
+    display::monitor_choices(&Connection::session().await?).await
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct RemoteSession(Arc<AtomicUsize>);
+    #[zbus::interface(name = "org.gnome.Mutter.RemoteDesktop.Session")]
+    impl RemoteSession {
+        fn start(&self) {}
+        fn stop(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires a private D-Bus; never run against the desktop bus"]
+    async fn incomplete_setup_is_explicitly_stopped_before_connection_drop() {
+        let stops = Arc::new(AtomicUsize::new(0));
+        let _server = zbus::connection::Builder::session()
+            .unwrap()
+            .name("org.gnome.Mutter.RemoteDesktop")
+            .unwrap()
+            .serve_at(
+                "/org/gnome/Mutter/RemoteDesktop/Session/test",
+                RemoteSession(stops.clone()),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let conn = Connection::session().await.unwrap();
+        let proxy = RemoteDesktopSessionProxy::new(
+            &conn,
+            OwnedObjectPath::try_from("/org/gnome/Mutter/RemoteDesktop/Session/test").unwrap(),
+        )
+        .await
+        .unwrap();
+        proxy.start().await.unwrap();
+        let setup = SessionSetup(std::sync::Mutex::new(Some(SetupState {
+            conn: conn.clone(),
+            remote_desktop: proxy,
+            layout_before: None,
+            started: true,
+        })));
+        // No completed Session exists yet, and the owning connection remains alive.
+        tokio::time::timeout(Duration::from_secs(2), setup.close())
+            .await
+            .unwrap();
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        setup.close().await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
 }

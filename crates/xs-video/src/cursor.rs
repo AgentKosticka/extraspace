@@ -64,6 +64,7 @@ pub struct CursorHub {
     pending: Mutex<PendingCursor>,
     cursor_tx: mpsc::Sender<()>,
     appsrc: Mutex<Option<AppSrc>>,
+    pacer: Mutex<Option<crate::frame_pacer::FramePacer<gst::Buffer>>>,
     origin: Instant,
     framerate: u32,
     seen_cursor: AtomicBool,
@@ -71,9 +72,9 @@ pub struct CursorHub {
     /// PipeWire process() callbacks that carried a video chunk.
     mutter_frames: AtomicU64,
     /// Frames successfully pushed into appsrc.
-    pushed_frames: AtomicU64,
+    pushed_frames: Arc<AtomicU64>,
     /// appsrc rejected the buffer (downstream full).
-    push_fail: AtomicU64,
+    push_fail: Arc<AtomicU64>,
     copy_max_us: AtomicU64,
 }
 
@@ -101,19 +102,51 @@ impl CursorHub {
             pending: Mutex::new(PendingCursor::default()),
             cursor_tx,
             appsrc: Mutex::new(None),
+            pacer: Mutex::new(None),
             origin: Instant::now(),
             framerate: framerate.max(1),
             seen_cursor: AtomicBool::new(false),
             seen_video: AtomicBool::new(false),
             mutter_frames: AtomicU64::new(0),
-            pushed_frames: AtomicU64::new(0),
-            push_fail: AtomicU64::new(0),
+            pushed_frames: Arc::new(AtomicU64::new(0)),
+            push_fail: Arc::new(AtomicU64::new(0)),
             copy_max_us: AtomicU64::new(0),
         })
     }
 
     pub fn attach_appsrc(&self, appsrc: AppSrc) {
         *self.appsrc.lock().expect("cursor appsrc lock") = Some(appsrc);
+    }
+
+    pub fn start_pacer(&self) -> Result<(), String> {
+        let mut pacer = self.pacer.lock().expect("frame pacer lock");
+        if pacer.is_some() {
+            return Ok(());
+        }
+        let appsrc = self
+            .appsrc
+            .lock()
+            .expect("cursor appsrc lock")
+            .clone()
+            .ok_or("capture appsrc is unavailable")?;
+        let pushed = Arc::clone(&self.pushed_frames);
+        let failed = Arc::clone(&self.push_fail);
+        *pacer = Some(
+            crate::frame_pacer::FramePacer::new(self.framerate, move |buffer| {
+                if let Err(err) = appsrc.push_buffer(buffer) {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    debug!(error = %err, "capture push dropped");
+                } else {
+                    pushed.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .map_err(|e| e.to_string())?,
+        );
+        Ok(())
+    }
+
+    pub fn stop_pacer(&self) {
+        self.pacer.lock().expect("frame pacer lock").take();
     }
 
     /// `(mutter_frames, pushed, push_fail, copy_max_us)` since the previous take.
@@ -326,7 +359,7 @@ impl CursorHub {
                 .field("drm-format", drm_format)
                 .field("width", width as i32)
                 .field("height", height as i32)
-                .field("framerate", gst::Fraction::new(0, 1))
+                .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
                 .field("colorimetry", "sRGB")
                 .build();
             if let Some(appsrc) = self.appsrc.lock().expect("cursor appsrc lock").clone() {
@@ -344,7 +377,7 @@ impl CursorHub {
             .field("format", "BGRx")
             .field("width", width as i32)
             .field("height", height as i32)
-            .field("framerate", gst::Fraction::new(0, 1))
+            .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
             .field("colorimetry", "sRGB")
             .build();
         appsrc.set_caps(Some(&caps));
@@ -355,9 +388,6 @@ impl CursorHub {
     }
 
     fn push_buffer(&self, mut buffer: gst::Buffer) {
-        let Some(appsrc) = self.appsrc.lock().expect("cursor appsrc lock").clone() else {
-            return;
-        };
         {
             let buffer = buffer.get_mut().expect("new capture buffer is writable");
             buffer.set_pts(self.now_pts());
@@ -365,11 +395,8 @@ impl CursorHub {
                 1_000_000_000 / u64::from(self.framerate),
             ));
         }
-        if let Err(err) = appsrc.push_buffer(buffer) {
-            self.push_fail.fetch_add(1, Ordering::Relaxed);
-            debug!(error = %err, "capture push dropped");
-        } else {
-            self.pushed_frames.fetch_add(1, Ordering::Relaxed);
+        if let Some(pacer) = self.pacer.lock().expect("frame pacer lock").as_ref() {
+            pacer.submit(buffer);
         }
     }
 
@@ -478,6 +505,7 @@ fn run_capture_stream(
     let allocator = dmabuf
         .as_ref()
         .map(|_| gstreamer_allocators::DmaBufAllocator::new());
+    let framerate = hub.framerate;
     let data = CaptureData {
         hub,
         format: spa::param::video::VideoInfoRaw::new(),
@@ -520,6 +548,7 @@ fn run_capture_stream(
                 format = ?data.format.format(),
                 width = data.format.size().width,
                 height = data.format.size().height,
+                max_framerate = ?data.format.max_framerate(),
                 "screen-cast format negotiated"
             );
         })
@@ -566,8 +595,8 @@ fn run_capture_stream(
     // system-memory format left in place as the fallback.
     let dmabuf_bytes = dmabuf
         .as_ref()
-        .map(|import| video_enum_format_dmabuf_pod(width, height, import));
-    let format_bytes = video_enum_format_pod(width, height);
+        .map(|import| video_enum_format_dmabuf_pod(width, height, framerate, import));
+    let format_bytes = video_enum_format_pod(width, height, framerate);
     let meta_bytes = cursor_meta_pod();
     let buffers_bytes = buffers_pod(dmabuf.is_some());
     let format_pod = spa::pod::Pod::from_bytes(&format_bytes).ok_or("video format pod")?;
@@ -596,7 +625,7 @@ fn run_capture_stream(
     Ok(())
 }
 
-fn video_enum_format_pod(width: u32, height: u32) -> Vec<u8> {
+fn video_enum_format_pod(width: u32, height: u32, framerate: u32) -> Vec<u8> {
     use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use spa::param::video::VideoFormat;
     use spa::pod::{object, property};
@@ -636,7 +665,17 @@ fn video_enum_format_pod(width: u32, height: u32) -> Vec<u8> {
             spa::utils::Fraction { num: 0, denom: 1 },
             spa::utils::Fraction { num: 0, denom: 1 },
             spa::utils::Fraction {
-                num: 1000,
+                num: framerate,
+                denom: 1
+            }
+        ),
+        // Limit at the producer, before GPU imports or CPU pixel copies. A
+        // variable framerate of 0/1 alone leaves Mutter's max rate unlimited.
+        property!(
+            FormatProperties::VideoMaxFramerate,
+            Fraction,
+            spa::utils::Fraction {
+                num: framerate,
                 denom: 1
             }
         ),
@@ -706,7 +745,12 @@ impl DmaBufImport {
 /// round of negotiation. The GPU can import one layout for this format, so
 /// there is nothing to choose between -- and if mutter cannot produce it, the
 /// system-memory EnumFormat that follows this one is used instead.
-fn video_enum_format_dmabuf_pod(width: u32, height: u32, import: &DmaBufImport) -> Vec<u8> {
+fn video_enum_format_dmabuf_pod(
+    width: u32,
+    height: u32,
+    framerate: u32,
+    import: &DmaBufImport,
+) -> Vec<u8> {
     use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use spa::pod::{Object, Property, PropertyFlags, Value};
     use spa::utils::Id;
@@ -741,6 +785,13 @@ fn video_enum_format_dmabuf_pod(width: u32, height: u32, import: &DmaBufImport) 
             Property::new(
                 FormatProperties::VideoFramerate.as_raw(),
                 Value::Fraction(spa::utils::Fraction { num: 0, denom: 1 }),
+            ),
+            Property::new(
+                FormatProperties::VideoMaxFramerate.as_raw(),
+                Value::Fraction(spa::utils::Fraction {
+                    num: framerate,
+                    denom: 1,
+                }),
             ),
         ],
     };
@@ -1175,6 +1226,29 @@ mod tests {
         assert_eq!(msg.position, Some((15, 25)));
         assert!(msg.bitmap.is_none());
         assert!(msg.hotspot.is_none());
+    }
+
+    #[test]
+    fn capture_formats_keep_variable_rate_and_cap_producer_work() {
+        let import = DmaBufImport {
+            spa_format: "BGRA",
+            fourcc: "AR24",
+            modifier: 0,
+        };
+        for fps in [1, 30, 60, 90, 240] {
+            let memory = video_enum_format_pod(1920, 1200, fps);
+            let gpu = video_enum_format_dmabuf_pod(1920, 1200, fps, &import);
+            // Both offers must carry a scalar max rate so it survives negotiation
+            // independently of the variable-rate and pixel-format choices.
+            for bytes in [memory, gpu] {
+                let pod = spa::pod::Pod::from_bytes(&bytes).unwrap();
+                let mut format = spa::param::video::VideoInfoRaw::new();
+                format.parse(pod).unwrap();
+                assert_eq!(format.framerate().num, 0, "idle must remain damage-driven");
+                assert_eq!(format.max_framerate().num, fps);
+                assert_eq!(format.max_framerate().denom, 1);
+            }
+        }
     }
 
     #[test]

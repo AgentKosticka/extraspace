@@ -17,7 +17,7 @@ COMMIT=$(cat "$PUBLISHED_DIR/commit.txt")
 [[ $COMMIT =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid published source commit.' >&2; exit 1; }
 echo "Installing tested source $COMMIT with its matching APK…"
 # Fetch objects without switching branches or changing the user's working files.
-git -C "$REPO_ROOT" fetch --no-tags origin "$COMMIT"
+git -C "$REPO_ROOT" fetch --no-tags https://github.com/AgentKosticka/extraspace.git "$COMMIT"
 mkdir "$PUBLISHED_DIR/source"
 git -C "$REPO_ROOT" archive "$COMMIT" | tar -x -C "$PUBLISHED_DIR/source"
 # Reuse compiled dependencies across published installs instead of discarding

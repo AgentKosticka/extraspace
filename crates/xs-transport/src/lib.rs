@@ -19,15 +19,7 @@ use xs_proto::ports;
 pub mod adb;
 mod aoa;
 
-/// Automatic prefers ADB, then tries USB accessory mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransportMode {
-    #[default]
-    Auto,
-    Adb,
-    Accessory,
-}
+pub use xs_proto::TransportMode;
 
 pub trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Stream for T {}
@@ -55,6 +47,12 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    Incompatible(String),
+
+    #[error("The shared connection method is USB accessory")]
+    SwitchToAccessory,
+
     #[error("USB accessory: {0}")]
     Accessory(String),
 
@@ -83,6 +81,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A connected tablet with all three channels established.
 pub struct Transport {
     pub device: Device,
+    pub hello: Option<xs_proto::Hello>,
     pub control: TransportStream,
     pub video: TransportStream,
     pub camera: TransportStream,
@@ -156,6 +155,89 @@ fn fake_tablet_requested() -> bool {
     std::env::var_os(FAKE_TABLET_ENV).is_some_and(|v| v != "0" && !v.is_empty())
 }
 
+pub async fn read_hello<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut FrameReader<R>,
+) -> Result<xs_proto::Hello> {
+    for _ in 0..128 {
+        let frame = reader.read_frame().await?;
+        if frame.header.channel != xs_proto::Channel::Control {
+            continue;
+        }
+        if frame.header.kind == xs_proto::ControlKind::Error as u8 {
+            return Err(Error::Companion(
+                String::from_utf8_lossy(&frame.payload).into_owned(),
+            ));
+        }
+        if frame.header.kind == xs_proto::ControlKind::Hello as u8 {
+            let hello: xs_proto::Hello = serde_json::from_slice(&frame.payload)
+                .map_err(|error| Error::Companion(format!("Invalid tablet Hello: {error}")))?;
+            if hello.protocol_version != xs_proto::PROTOCOL_VERSION {
+                return Err(Error::Companion(format!("The tablet app speaks protocol v{} but this build speaks v{}. Reinstall the companion app.", hello.protocol_version, xs_proto::PROTOCOL_VERSION)));
+            }
+            return Ok(hello);
+        }
+    }
+    Err(Error::Companion("Tablet never sent a Hello message".into()))
+}
+
+async fn read_hello_timeout(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    timeout: Duration,
+) -> Result<xs_proto::Hello> {
+    tokio::time::timeout(timeout, read_hello(&mut FrameReader::new(stream)))
+        .await
+        .map_err(|_| {
+            Error::Companion(
+                "Tablet handshake timed out; unlock the tablet and tap Allow, then reconnect"
+                    .into(),
+            )
+        })?
+}
+
+async fn negotiate_adb(
+    control: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    mode: TransportMode,
+) -> Result<xs_proto::Hello> {
+    let hello = read_hello_timeout(control, Duration::from_secs(5)).await?;
+    let selected = match mode.select(hello.transport) {
+        Ok(selected) => selected,
+        Err(message) => {
+            FrameWriter::new(&mut *control)
+                .write_frame(
+                    xs_proto::Channel::Control,
+                    xs_proto::ControlKind::Error as u8,
+                    0,
+                    0,
+                    message.as_bytes(),
+                )
+                .await?;
+            return Err(Error::Incompatible(message.into()));
+        }
+    };
+    let request = serde_json::json!({ "transport": mode });
+    FrameWriter::new(&mut *control)
+        .write_frame(
+            xs_proto::Channel::Control,
+            xs_proto::ControlKind::HelloRequest as u8,
+            0,
+            0,
+            request.to_string().as_bytes(),
+        )
+        .await?;
+    // Wait for Android to acknowledge before connecting media channels
+    // or switching USB functions. A mismatch is also visible on Android.
+    let confirmed = read_hello_timeout(control, Duration::from_secs(5)).await?;
+    if confirmed.transport != hello.transport {
+        return Err(Error::Companion(
+            "Tablet changed connection methods during negotiation; reconnect".into(),
+        ));
+    }
+    if selected == TransportMode::Accessory {
+        return Err(Error::SwitchToAccessory);
+    }
+    Ok(confirmed)
+}
+
 impl Transport {
     /// Full connect sequence: find the device, make sure the companion app is
     /// installed and running, forward the ports, and connect all three channels.
@@ -170,26 +252,41 @@ impl Transport {
         apk_version: u32,
         mode: TransportMode,
     ) -> Result<Self> {
+        Self::connect_with_mode_and_progress(apk, apk_version, mode, |_| {}).await
+    }
+
+    pub async fn connect_with_mode_and_progress(
+        apk: Option<&Path>,
+        apk_version: u32,
+        mode: TransportMode,
+        progress: impl Fn(&str),
+    ) -> Result<Self> {
         if fake_tablet_requested() {
             return Self::connect_fake().await;
         }
-        if mode == TransportMode::Accessory {
-            return aoa::connect().await;
+        // An explicit ADB choice must not change the tablet's USB function.
+        if mode == TransportMode::Adb {
+            return Self::connect_adb(apk, apk_version, mode).await;
         }
-        match Self::connect_adb(apk, apk_version).await {
+        // ADB control is also a discovery channel when either selector only
+        // permits accessory. This lets us detect incompatible selections before
+        // switching the device's USB mode or waiting for video sockets.
+        match Self::connect_adb(apk, apk_version, mode).await {
             Ok(t) => Ok(t),
+            Err(Error::SwitchToAccessory) => Self::connect_accessory(mode, &progress).await,
             Err(e)
-                if mode == TransportMode::Auto
-                    && matches!(
-                        &e,
-                        Error::Adb(
-                            adb::Error::NoDevice
-                                | adb::Error::Unauthorized(_)
-                                | adb::Error::AdbNotFound
-                        )
-                    ) =>
+                if matches!(
+                    &e,
+                    Error::Adb(
+                        adb::Error::NoDevice
+                            | adb::Error::Unauthorized(_)
+                            | adb::Error::AdbNotFound
+                    )
+                ) =>
             {
-                match aoa::connect().await {
+                // Automatic and accessory choices permit accessory discovery.
+                // An explicit ADB selector returned before reaching this fallback.
+                match Self::connect_accessory(mode, &progress).await {
                     Err(Error::Adb(adb::Error::NoDevice)) => Err(e),
                     result => result,
                 }
@@ -197,7 +294,31 @@ impl Transport {
             Err(e) => Err(e),
         }
     }
-    async fn connect_adb(apk: Option<&Path>, apk_version: u32) -> Result<Self> {
+    async fn connect_accessory(mode: TransportMode, progress: &impl Fn(&str)) -> Result<Self> {
+        let mut transport = aoa::connect(mode).await?;
+        let cleanup = transport.teardown_handle();
+        let mut guard = PendingConnection::new(cleanup.clone());
+        progress("Tap Allow on your tablet to check USB connection methods…");
+        let result = async {
+            let hello = read_hello_timeout(&mut transport.control, Duration::from_secs(60)).await?;
+            mode.select_for_link(hello.transport, TransportMode::Accessory)
+                .map_err(|message| Error::Incompatible(message.into()))?;
+            transport.hello = Some(hello);
+            Ok(transport)
+        }
+        .await;
+        if result.is_err() {
+            cleanup.disconnect().await;
+        }
+        guard.disarm();
+        result
+    }
+
+    async fn connect_adb(
+        apk: Option<&Path>,
+        apk_version: u32,
+        mode: TransportMode,
+    ) -> Result<Self> {
         if fake_tablet_requested() {
             return Self::connect_fake().await;
         }
@@ -216,9 +337,9 @@ impl Transport {
         } else if adb
             .package_version(&device.serial, PACKAGE)
             .await?
-            .is_none()
+            .is_none_or(|version| version < apk_version)
         {
-            return Err(Error::Companion("Companion app is not installed. Build it with scripts/install.sh --build-apk, or bundle an APK with --apk PATH.".into()));
+            return Err(Error::Companion("Companion app is missing or older than this host. Build it with scripts/install.sh --build-apk, or bundle an APK with --apk PATH.".into()));
         }
         let cleanup = TransportHandle {
             device: device.clone(),
@@ -244,13 +365,15 @@ impl Transport {
 
             // Control first, and only once it has actually spoken -- see
             // `connect_once_listening` for why connecting is not enough.
-            let control = connect_once_listening(ports::CONTROL).await?;
+            let mut control = connect_once_listening(ports::CONTROL).await?;
+            let hello = negotiate_adb(&mut control, mode).await?;
             let video = connect_with_retry(ports::VIDEO).await?;
             let camera = connect_with_retry(ports::CAMERA).await?;
             info!("all three channels connected");
 
             Ok(Self {
                 device,
+                hello: Some(hello),
                 control: Box::new(control),
                 video: Box::new(video),
                 camera: Box::new(camera),
@@ -277,6 +400,7 @@ impl Transport {
         let video = connect_with_retry(ports::VIDEO).await?;
         let camera = connect_with_retry(ports::CAMERA).await?;
         Ok(Self {
+            hello: None,
             device: Device {
                 serial: "fake".into(),
                 state: DeviceState::Ready,
@@ -341,6 +465,24 @@ async fn ensure_app_installed(
     apk: &Path,
     bundled_version: u32,
 ) -> Result<()> {
+    let checked = tokio::process::Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("../../../scripts/check-apk.py"))
+        .arg(apk)
+        .arg(bundled_version.to_string())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| {
+            Error::Companion(format!(
+                "Could not verify companion APK (Python 3 required): {e}"
+            ))
+        })?;
+    if !checked.status.success() {
+        return Err(Error::Companion(
+            String::from_utf8_lossy(&checked.stderr).trim().into(),
+        ));
+    }
     match adb.package_version(serial, PACKAGE).await? {
         Some(installed) if installed >= bundled_version => {
             debug!(installed, "companion app is up to date");
@@ -352,11 +494,21 @@ async fn ensure_app_installed(
                 "upgrading companion app"
             );
             adb.install(serial, apk).await?;
+            verify_installed_version(adb, serial, bundled_version).await?;
         }
         None => {
             info!("companion app not installed, installing");
             adb.install(serial, apk).await?;
+            verify_installed_version(adb, serial, bundled_version).await?;
         }
+    }
+    Ok(())
+}
+
+async fn verify_installed_version(adb: &Adb, serial: &str, expected: u32) -> Result<()> {
+    let actual = adb.package_version(serial, PACKAGE).await?;
+    if actual != Some(expected) {
+        return Err(Error::Companion(format!("The companion upgrade did not install version {expected} (found {actual:?}). Install a matching APK and reconnect.")));
     }
     Ok(())
 }
@@ -426,5 +578,115 @@ async fn connect_with_retry(port: u16) -> Result<TcpStream> {
             }
             Err(_) => return Err(Error::ConnectTimeout { port }),
         }
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use xs_proto::{Channel, ControlKind};
+
+    fn hello(mode: TransportMode) -> xs_proto::Hello {
+        serde_json::from_value(serde_json::json!({
+            "protocol_version": xs_proto::PROTOCOL_VERSION,
+            "transport": mode, "device_name": "Tablet", "device_id": "test-id",
+            "android_release": "16", "width": 1920, "height": 1200,
+            "density_dpi": 240, "refresh_rate": 60, "cameras": []
+        }))
+        .unwrap()
+    }
+
+    async fn send_hello(stream: &mut tokio::io::DuplexStream, mode: TransportMode) {
+        FrameWriter::new(stream)
+            .write_frame(
+                Channel::Control,
+                ControlKind::Hello as u8,
+                0,
+                0,
+                &serde_json::to_vec(&hello(mode)).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn adb_discovery_negotiates_every_selector_pair_and_reports_mismatch_to_android() {
+        for host in [
+            TransportMode::Auto,
+            TransportMode::Adb,
+            TransportMode::Accessory,
+        ] {
+            for device in [
+                TransportMode::Auto,
+                TransportMode::Adb,
+                TransportMode::Accessory,
+            ] {
+                let (mut client, mut tablet) = tokio::io::duplex(4096);
+                let peer = tokio::spawn(async move {
+                    send_hello(&mut tablet, device).await;
+                    let request = FrameReader::new(&mut tablet).read_frame().await.unwrap();
+                    assert_eq!(request.header.channel, Channel::Control);
+                    if host.select(device).is_err() {
+                        assert_eq!(request.header.kind, ControlKind::Error as u8);
+                        assert!(String::from_utf8_lossy(&request.payload)
+                            .starts_with("Incompatible connection methods:"));
+                    } else {
+                        assert_eq!(request.header.kind, ControlKind::HelloRequest as u8);
+                        let json: serde_json::Value =
+                            serde_json::from_slice(&request.payload).unwrap();
+                        assert_eq!(json["transport"], serde_json::to_value(host).unwrap());
+                        send_hello(&mut tablet, device).await;
+                    }
+                });
+                let result = negotiate_adb(&mut client, host).await;
+                match host.select(device) {
+                    Ok(TransportMode::Adb) => assert_eq!(result.unwrap().transport, device),
+                    Ok(TransportMode::Accessory) => {
+                        assert!(matches!(result, Err(Error::SwitchToAccessory)))
+                    }
+                    Err(_) => assert!(matches!(result, Err(Error::Incompatible(_)))),
+                    _ => panic!("selection must resolve to one concrete method"),
+                }
+                peer.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiation_rejects_changed_selection_in_acknowledgement() {
+        let (mut client, mut tablet) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            send_hello(&mut tablet, TransportMode::Auto).await;
+            FrameReader::new(&mut tablet).read_frame().await.unwrap();
+            send_hello(&mut tablet, TransportMode::Accessory).await;
+        });
+        assert!(negotiate_adb(&mut client, TransportMode::Auto)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("changed connection methods"));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_preserves_peer_error_instead_of_waiting_for_timeout() {
+        let (mut client, mut tablet) = tokio::io::duplex(4096);
+        FrameWriter::new(&mut tablet)
+            .write_frame(
+                Channel::Control,
+                ControlKind::Error as u8,
+                0,
+                0,
+                b"Incompatible connection methods: test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read_hello_timeout(&mut client, Duration::from_millis(100))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Incompatible connection methods: test"
+        );
     }
 }

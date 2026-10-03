@@ -10,9 +10,9 @@ import java.nio.ByteOrder
 /**
  * Wire protocol, mirroring `xs-proto` on the host.
  *
- * Both sides must agree byte for byte. The magic number in every header means a
- * mismatch fails loudly on the first frame instead of quietly decoding garbage,
- * so if you change anything here, change `crates/xs-proto/src/lib.rs` too.
+ * Both sides consume shared golden vectors under `protocol/` in CI. Update both
+ * implementations and the vectors for wire changes; magic alone cannot detect
+ * layout or message-kind drift.
  */
 object Protocol {
     /** Reads as the ASCII bytes `XSPA` little-endian. */
@@ -44,6 +44,7 @@ object Protocol {
         const val CURSOR: Byte = 7
         const val HELLO_REQUEST: Byte = 8
         const val SESSION_END: Byte = 9
+        const val CAMERA_STATUS: Byte = 10
     }
 
     object CursorFlags {
