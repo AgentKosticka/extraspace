@@ -54,8 +54,9 @@ or the EVDI kernel module.
 It turns out mutter can already do it. `org.gnome.Mutter.ScreenCast` has a
 `RecordVirtual` method that creates a monitor with no backing hardware, and
 `org.gnome.Mutter.RemoteDesktop` can inject touch events whose coordinates are
-*relative to that stream* — so input lands on the right monitor with no geometry
-maths at all. Extraspace is a well-behaved GNOME app wrapped around those two APIs.
+*relative to that stream*. Extraspace converts virtual-display input from video
+pixels to GNOME logical pixels using the current Ubuntu monitor scale, so touch
+stays aligned when that scale changes. Extraspace wraps those two APIs.
 
 ## Status
 

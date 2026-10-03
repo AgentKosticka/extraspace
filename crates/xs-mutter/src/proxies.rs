@@ -118,8 +118,8 @@ pub trait RemoteDesktopSession {
 
     // --- input injection -------------------------------------------------
     // `stream` is the stream's object path *as a string*; coordinates are
-    // relative to that stream, so they land on the virtual monitor with no
-    // geometry maths on our side.
+    // relative to that stream. RecordVirtual requires logical pixels, while
+    // RecordMonitor converts video pixels to logical pixels inside Mutter.
 
     fn notify_touch_down(&self, stream: &str, slot: u32, x: f64, y: f64) -> zbus::Result<()>;
     fn notify_touch_motion(&self, stream: &str, slot: u32, x: f64, y: f64) -> zbus::Result<()>;
