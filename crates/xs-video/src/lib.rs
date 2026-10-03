@@ -3,7 +3,7 @@
 //! The pipeline is deliberately boring:
 //!
 //! ```text
-//! rust PipeWire capture -> appsrc -> videorate(drop-only)
+//! rust PipeWire capture -> latest-frame pacer -> appsrc -> videorate(drop-only)
 //!            -> videoconvert -> I420   -> x264enc      -> h264parse -> appsink
 //!            -> vapostproc   -> VAMem  -> vah264lpenc  ->     "     ->    "
 //!
@@ -18,30 +18,30 @@
 //! node (for example `pipewiresrc` plus a cursor listener) makes gst-plugin-pipewire
 //! abort on unfixed caps.
 //!
-//! `videorate` is configured **drop-only**: it caps the stream at the configured
-//! rate and must never manufacture frames. The default `videorate` duplicates
-//! the last buffer to fill holes, which on a damage-driven mutter capture
-//! (idle ~11 fps) builds seconds of fake "catch-up" latency. Mutter only emits
-//! a frame when something on the monitor actually changes; that is correct --
-//! an idle screen costs almost no bandwidth -- but it means frame-count-based
-//! reasoning is unreliable: see the keyframe note below.
+//! The raw-frame pacer enforces the selected rate using actual dispatch time.
+//! It sleeps when idle, sends the first update immediately, and retains only
+//! the newest pending image until the next frame interval. Idle time never
+//! earns credit for a later burst. `videorate` alone cannot enforce that bound
+//! after an idle gap; it remains **drop-only** so it never manufactures frames.
+//! Sparse desktop damage stays sparse, without duplicating the last image.
 //!
 //! Encoded frames leave through a bounded channel. If the transport cannot keep
 //! up, frames are dropped here rather than allowed to accumulate -- for a live
 //! display, a stale frame has no value.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app::{AppSink, AppSrc};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, error, info, warn};
 
 mod cursor;
 mod encoder;
+mod frame_pacer;
 mod pacing;
 mod recovery;
 mod selection;
@@ -244,7 +244,7 @@ pub struct VideoPipeline {
     encoder: Encoder,
     encoder_label: String,
     failure: Arc<Mutex<Option<String>>>,
-    keyframe_needed: Arc<AtomicBool>,
+    keyframe_needed: Arc<Notify>,
     stats: Arc<VideoStats>,
     config: VideoConfig,
     capture_pace: Arc<StagePace>,
@@ -309,9 +309,9 @@ impl VideoPipeline {
             .field("format", "BGRx")
             .field("width", config.width as i32)
             .field("height", config.height as i32)
-            // Damage-driven capture is variable-rate and may arrive in bursts.
-            // Advertising the target here lets videorate negotiate passthrough.
-            .field("framerate", gst::Fraction::new(0, 1))
+            // FramePacer enforces the nominal rate before appsrc. Sparse damage
+            // remains sparse: drop-only videorate never fills idle gaps.
+            .field("framerate", gst::Fraction::new(config.framerate as i32, 1))
             .field("colorimetry", RGB_COLORIMETRY)
             .build();
         let overlay_src = AppSrc::builder()
@@ -327,7 +327,7 @@ impl VideoPipeline {
         let kind = pipeline_kind();
         let encoder_element = option.build(config.bitrate_kbps, config.framerate)?;
         let (tx, rx) = mpsc::channel(FRAME_QUEUE_DEPTH);
-        let keyframe_needed = Arc::new(AtomicBool::new(false));
+        let keyframe_needed = Arc::new(Notify::new());
 
         match kind {
             PipelineKind::Full => {
@@ -448,7 +448,7 @@ impl VideoPipeline {
                                 }
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     recovery.dropped();
-                                    recovery_request.store(true, Ordering::Relaxed);
+                                    recovery_request.notify_one();
                                     sink_stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -592,6 +592,11 @@ impl VideoPipeline {
             .map_err(|e| Error::Pipeline(e.to_string()))?;
         let mut capture = self.capture.lock().expect("capture lock");
         if capture.is_none() {
+            if let Err(e) = self.hub.start_pacer() {
+                drop(capture);
+                let _ = self.pipeline.set_state(gst::State::Null);
+                return Err(Error::Capture(e));
+            }
             match cursor::Capture::start(
                 self.node_id,
                 self.config.width,
@@ -602,6 +607,7 @@ impl VideoPipeline {
                 Ok(started) => *capture = Some(started),
                 Err(e) => {
                     drop(capture);
+                    self.hub.stop_pacer();
                     let _ = self.pipeline.set_state(gst::State::Null);
                     return Err(Error::Capture(e));
                 }
@@ -615,6 +621,7 @@ impl VideoPipeline {
         if let Ok(mut capture) = self.capture.lock() {
             *capture = None;
         }
+        self.hub.stop_pacer();
         debug!("stopping GStreamer encoder");
         if let Err(e) = self.pipeline.set_state(gst::State::Null) {
             warn!(error = %e, "pipeline did not stop cleanly");
@@ -665,11 +672,12 @@ impl VideoPipeline {
         self.encoder
     }
 
-    /// Request recovery outside the appsink callback to avoid re-entering the encoder.
-    pub fn recover_dropped_frames(&self) {
-        if self.keyframe_needed.swap(false, Ordering::Relaxed) {
-            self.request_keyframe();
-        }
+    /// Wait for a dropped reference frame without idle polling. Notify retains
+    /// one pending request even when the transport task is busy writing a frame.
+    /// Request recovery outside appsink to avoid re-entering the encoder.
+    pub async fn recover_dropped_frames(&self) {
+        self.keyframe_needed.notified().await;
+        self.request_keyframe();
     }
 
     pub fn encoder_label(&self) -> &str {
@@ -757,72 +765,167 @@ mod config_tests {
     #[test]
     fn burst_capture_is_capped_without_creating_frames_during_idle() {
         gst::init().unwrap();
-        for timestamps in [
-            (0..120)
-                .map(|i| i * 1_000_000_000 / 120)
-                .collect::<Vec<u64>>(),
-            vec![0, 10_000_000_000],
-        ] {
-            let pipeline = gst::Pipeline::new();
-            let source = AppSrc::builder()
-                .format(gst::Format::Time)
-                .caps(
-                    &gst::Caps::builder("video/x-raw")
+        for dmabuf in [false, true] {
+            for timestamps in [
+                (0..120)
+                    .map(|i| i * 1_000_000_000 / 120)
+                    .collect::<Vec<u64>>(),
+                vec![0, 10_000_000_000],
+            ] {
+                let pipeline = gst::Pipeline::new();
+                // videorate only inspects timestamps; dummy storage exercises GPU
+                // caps negotiation without importing or mapping a real dma-buf.
+                let source_caps = if dmabuf {
+                    gst::Caps::builder("video/x-raw")
+                        .features(["memory:DMABuf"])
+                        .field("format", "DMA_DRM")
+                        .field("drm-format", "AR24:0x0100000000000002")
+                        .field("width", 16i32)
+                        .field("height", 16i32)
+                        .field("framerate", gst::Fraction::new(0, 1))
+                        .build()
+                } else {
+                    gst::Caps::builder("video/x-raw")
                         .field("format", "BGRx")
                         .field("width", 16i32)
                         .field("height", 16i32)
                         .field("framerate", gst::Fraction::new(0, 1))
-                        .build(),
-                )
-                .build();
-            let rate = rate_limiter(60).unwrap();
-            let caps = gst::ElementFactory::make("capsfilter")
-                .property(
-                    "caps",
-                    gst::Caps::builder("video/x-raw")
-                        .field("framerate", gst::Fraction::new(60, 1))
-                        .build(),
-                )
-                .build()
-                .unwrap();
-            let sink = AppSink::builder().sync(false).wait_on_eos(false).build();
-            let elements = [source.upcast_ref(), &rate, &caps, sink.upcast_ref()];
-            pipeline.add_many(elements).unwrap();
-            gst::Element::link_many(elements).unwrap();
-            pipeline.set_state(gst::State::Playing).unwrap();
-            for pts in &timestamps {
-                let mut buffer = gst::Buffer::with_size(16 * 16 * 4).unwrap();
-                let b = buffer.get_mut().unwrap();
-                b.set_pts(gst::ClockTime::from_nseconds(*pts));
-                b.set_duration(gst::ClockTime::from_nseconds(1_000_000_000 / 60));
-                source.push_buffer(buffer).unwrap();
-            }
-            source.end_of_stream().unwrap();
-            let done = pipeline.bus().unwrap().timed_pop_filtered(
-                gst::ClockTime::from_seconds(3),
-                &[gst::MessageType::Eos, gst::MessageType::Error],
-            );
-            let count = rate.property::<u64>("out");
-            let duplicates = rate.property::<u64>("duplicate");
-            pipeline.set_state(gst::State::Null).unwrap();
-            assert!(
-                matches!(
-                    done.as_ref().map(|m| m.view()),
-                    Some(gst::MessageView::Eos(_))
-                ),
-                "{done:?}"
-            );
-            assert_eq!(duplicates, 0);
-            if timestamps.len() == 120 {
-                assert!(
-                    (59..=61).contains(&count),
-                    "passed {count} frames from a 120 fps burst"
+                        .build()
+                };
+                let source = AppSrc::builder()
+                    .format(gst::Format::Time)
+                    .caps(&source_caps)
+                    .build();
+                let rate = rate_limiter(60).unwrap();
+                let caps = gst::ElementFactory::make("capsfilter")
+                    .property(
+                        "caps",
+                        gst::Caps::builder("video/x-raw")
+                            .any_features()
+                            .field("framerate", gst::Fraction::new(60, 1))
+                            .build(),
+                    )
+                    .build()
+                    .unwrap();
+                let sink = AppSink::builder().sync(false).wait_on_eos(false).build();
+                let elements = [source.upcast_ref(), &rate, &caps, sink.upcast_ref()];
+                pipeline.add_many(elements).unwrap();
+                gst::Element::link_many(elements).unwrap();
+                pipeline.set_state(gst::State::Playing).unwrap();
+                for pts in &timestamps {
+                    let mut buffer = gst::Buffer::with_size(16 * 16 * 4).unwrap();
+                    let b = buffer.get_mut().unwrap();
+                    b.set_pts(gst::ClockTime::from_nseconds(*pts));
+                    // appsrc marks the next raw frame discontinuous whenever
+                    // its bounded queue drops a stale capture under load.
+                    b.set_flags(gst::BufferFlags::DISCONT);
+                    b.set_duration(gst::ClockTime::from_nseconds(1_000_000_000 / 60));
+                    source.push_buffer(buffer).unwrap();
+                }
+                source.end_of_stream().unwrap();
+                let done = pipeline.bus().unwrap().timed_pop_filtered(
+                    gst::ClockTime::from_seconds(3),
+                    &[gst::MessageType::Eos, gst::MessageType::Error],
                 );
-            } else {
-                assert_eq!(count, 2, "an idle gap must not manufacture frames");
+                let count = rate.property::<u64>("out");
+                let duplicates = rate.property::<u64>("duplicate");
+                pipeline.set_state(gst::State::Null).unwrap();
+                assert!(
+                    matches!(
+                        done.as_ref().map(|m| m.view()),
+                        Some(gst::MessageView::Eos(_))
+                    ),
+                    "{done:?}"
+                );
+                assert_eq!(duplicates, 0);
+                if timestamps.len() == 120 {
+                    assert!(
+                        (59..=61).contains(&count),
+                        "passed {count} frames from a 120 fps burst"
+                    );
+                } else {
+                    assert_eq!(count, 2, "an idle gap must not manufacture frames");
+                }
             }
         }
     }
+    #[tokio::test]
+    async fn a_full_encoder_queue_wakes_recovery_and_delivers_a_fresh_keyframe() {
+        use std::time::Duration;
+        gst::init().unwrap();
+        let option = EncoderOption {
+            factory: "x264enc".into(),
+            label: "test x264".into(),
+            encoder: Encoder::X264,
+            postproc: None,
+        };
+        // This test exercises appsink overflow and the production recovery
+        // signal, using synthetic pixels without a compositor or PipeWire node.
+        if gst::ElementFactory::find(&option.factory).is_none() {
+            return; // x264 is optional on hardware-only installations.
+        }
+        let (pipeline, mut frames, _) = VideoPipeline::new_with_encoder(
+            0,
+            VideoConfig {
+                width: 16,
+                height: 16,
+                ..Default::default()
+            },
+            &option,
+        )
+        .unwrap();
+        let source = pipeline
+            .pipeline
+            .by_name("cursor-overlay")
+            .unwrap()
+            .downcast::<AppSrc>()
+            .unwrap();
+        pipeline.pipeline.set_state(gst::State::Playing).unwrap();
+        let push = |i: u64| {
+            let mut buffer = gst::Buffer::with_size(16 * 16 * 4).unwrap();
+            buffer
+                .get_mut()
+                .unwrap()
+                .set_pts(gst::ClockTime::from_nseconds(i * 20_000_000));
+            source.push_buffer(buffer).unwrap();
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pipeline.recover_dropped_frames())
+                .await
+                .is_err()
+        );
+        for i in 0..2 {
+            push(i);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while pipeline.stats.frames_encoded.load(Ordering::Relaxed)
+                    + pipeline.stats.frames_dropped.load(Ordering::Relaxed)
+                    < i + 1
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(pipeline.stats.frames_dropped.load(Ordering::Relaxed), 1);
+        assert!(frames.recv().await.unwrap().keyframe);
+        // Recovery was signaled before we started waiting, and survives the
+        // cancelled idle wait above. No 100 ms timer is needed to recover.
+        tokio::time::timeout(Duration::from_secs(1), pipeline.recover_dropped_frames())
+            .await
+            .unwrap();
+        push(2);
+        let recovered = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            recovered.keyframe,
+            "dependent frames must wait for a fresh IDR"
+        );
+        assert_eq!(pipeline.stats.frames_dropped.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn rejects_invalid_capture_modes_before_building_or_dividing_by_fps() {
         assert!(validate_config(&VideoConfig::default()).is_ok());

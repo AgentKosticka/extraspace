@@ -18,8 +18,9 @@
 //! 12..20  pts_us  u64  presentation timestamp, microseconds
 //! ```
 //!
-//! The Kotlin side mirrors this in `Protocol.kt`; changing either without the other
-//! will fail the [`MAGIC`] check on the first frame rather than corrupt silently.
+//! The Kotlin side mirrors this in `Protocol.kt`. Shared golden vectors under
+//! `protocol/` check both implementations. Magic only detects a
+//! different protocol identifier; it cannot detect every layout mismatch.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,44 @@ pub const HEADER_LEN: usize = 20;
 
 /// Refuse absurd frames early rather than trying to allocate them.
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
+
+/// Allowed USB methods. Auto permits both; ADB is preferred for its independent
+/// channels, which avoid queuing input behind video on the accessory bulk link.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    #[default]
+    Auto,
+    Adb,
+    Accessory,
+}
+
+impl TransportMode {
+    pub fn allows(self, method: Self) -> bool {
+        method != Self::Auto && (self == Self::Auto || self == method)
+    }
+
+    pub fn select(self, peer: Self) -> Result<Self, &'static str> {
+        match (self, peer) {
+            (Self::Auto, Self::Auto) => Ok(Self::Adb),
+            (Self::Auto, mode) | (mode, Self::Auto) => Ok(mode),
+            (a, b) if a == b => Ok(a),
+            _ => Err("Incompatible connection methods: one app allows only ADB and the other only USB accessory. Select a shared method or Automatic in both apps."),
+        }
+    }
+
+    /// ADB may discover an accessory-only choice. Accessory fallback must still
+    /// be allowed by both selectors, including when ADB discovery is unavailable.
+    pub fn select_for_link(self, peer: Self, link: Self) -> Result<Self, &'static str> {
+        let selected = self.select(peer)?;
+        match link {
+            Self::Adb => Ok(selected),
+            Self::Accessory if self.allows(link) && peer.allows(link) => Ok(link),
+            Self::Accessory => Err("Incompatible connection methods: the shared method is ADB, but the device is in USB accessory mode. Reconnect with USB debugging enabled."),
+            Self::Auto => Err("Discovery requires a concrete connection method"),
+        }
+    }
+}
 
 /// Default TCP ports, forwarded over adb. Chosen to sit just above scrcpy's 27183
 /// so the two can run side by side.
@@ -97,6 +136,8 @@ pub enum ControlKind {
     HelloRequest = 8,
     /// Host -> accessory: stop displaying without physically unplugging USB.
     SessionEnd = 9,
+    /// Device -> host: camera permission, capture and error state.
+    CameraStatus = 10,
 }
 
 impl ControlKind {
@@ -112,6 +153,7 @@ impl ControlKind {
             7 => Self::Cursor,
             8 => Self::HelloRequest,
             9 => Self::SessionEnd,
+            10 => Self::CameraStatus,
             _ => return None,
         })
     }
@@ -269,6 +311,9 @@ impl CursorMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_version: u32,
+    /// The Android selector, independent of the link used for discovery.
+    #[serde(default)]
+    pub transport: TransportMode,
     pub device_name: String,
     /// Installation UUID shared across ADB and accessory transports. Older apps omit it.
     #[serde(default)]
@@ -326,6 +371,21 @@ pub struct CameraControl {
     pub height: u32,
     pub framerate: u32,
     pub bitrate_kbps: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraState {
+    Off,
+    Pending,
+    Running,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraStatus {
+    pub state: CameraState,
+    pub message: String,
 }
 
 /// A single touch point, sent on [`Channel::Touch`].
@@ -456,6 +516,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_transport_selector_matrix() {
+        let rows: Vec<_> = include_str!("../../../protocol/transport-selection.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        assert_eq!(rows.len(), 9);
+        let parse =
+            |value: &str| serde_json::from_str::<TransportMode>(&format!("\"{value}\"")).unwrap();
+        for row in rows {
+            let fields: Vec<_> = row.split('\t').collect();
+            let selected = parse(fields[0]).select(parse(fields[1]));
+            if fields[2] == "incompatible" {
+                assert!(
+                    selected
+                        .unwrap_err()
+                        .starts_with("Incompatible connection methods:"),
+                    "{row}"
+                );
+            } else {
+                assert_eq!(selected.unwrap(), parse(fields[2]), "{row}");
+            }
+        }
+        assert!(serde_json::from_str::<TransportMode>("\"bogus\"").is_err());
+    }
+
+    #[test]
+    fn accessory_fallback_never_bypasses_an_adb_only_selector() {
+        for host in [
+            TransportMode::Auto,
+            TransportMode::Adb,
+            TransportMode::Accessory,
+        ] {
+            for device in [
+                TransportMode::Auto,
+                TransportMode::Adb,
+                TransportMode::Accessory,
+            ] {
+                let actual = host.select_for_link(device, TransportMode::Accessory);
+                if host.allows(TransportMode::Accessory) && device.allows(TransportMode::Accessory)
+                {
+                    assert_eq!(actual.unwrap(), TransportMode::Accessory);
+                } else {
+                    assert!(actual
+                        .unwrap_err()
+                        .starts_with("Incompatible connection methods:"));
+                }
+            }
+        }
+        assert_eq!(
+            TransportMode::Auto
+                .select_for_link(TransportMode::Accessory, TransportMode::Adb)
+                .unwrap(),
+            TransportMode::Accessory
+        );
+        assert_eq!(
+            TransportMode::Accessory
+                .select_for_link(TransportMode::Auto, TransportMode::Adb)
+                .unwrap(),
+            TransportMode::Accessory
+        );
+    }
+
+    #[test]
     fn header_roundtrips() {
         let h = Header {
             channel: Channel::VideoDown,
@@ -556,5 +679,118 @@ mod tests {
             }),
         };
         assert_eq!(CursorMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn shared_wire_vectors() {
+        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(
+            [
+                Channel::Control as u8,
+                Channel::Touch as u8,
+                Channel::VideoDown as u8,
+                Channel::CameraUp as u8
+            ],
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            [
+                TouchAction::Down as u8,
+                TouchAction::Motion as u8,
+                TouchAction::Up as u8
+            ],
+            [0, 1, 2]
+        );
+        assert_eq!(
+            [
+                ControlKind::Hello as u8,
+                ControlKind::VideoConfig as u8,
+                ControlKind::Stats as u8,
+                ControlKind::CameraControl as u8,
+                ControlKind::Ping as u8,
+                ControlKind::Pong as u8,
+                ControlKind::Error as u8,
+                ControlKind::Cursor as u8,
+                ControlKind::HelloRequest as u8,
+                ControlKind::SessionEnd as u8,
+                ControlKind::CameraStatus as u8
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
+        assert_eq!([flags::KEYFRAME, flags::CODEC_CONFIG], [1, 2]);
+        assert_eq!(
+            [
+                cursor_flags::VISIBLE,
+                cursor_flags::POSITION,
+                cursor_flags::HOTSPOT,
+                cursor_flags::BITMAP
+            ],
+            [1, 2, 4, 8]
+        );
+        for line in include_str!("../../../protocol/golden-vectors.tsv")
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let f: Vec<_> = line.split('\t').collect();
+            let bytes = hex(f[2]);
+            match f[0] {
+                "header" => {
+                    let expected = Header {
+                        channel: Channel::from_u8(f[3].parse().unwrap()).unwrap(),
+                        kind: f[4].parse().unwrap(),
+                        flags: f[5].parse().unwrap(),
+                        len: f[6].parse().unwrap(),
+                        pts_us: f[7].parse().unwrap(),
+                    };
+                    assert_eq!(Header::decode(&bytes).unwrap(), expected, "{}", f[1]);
+                    assert_eq!(expected.encode().as_slice(), bytes, "{}", f[1]);
+                    if expected.channel == Channel::Control {
+                        assert_eq!(
+                            ControlKind::from_u8(expected.kind).unwrap() as u8,
+                            expected.kind
+                        );
+                    }
+                }
+                "touch" => {
+                    let expected = TouchEvent {
+                        action: TouchAction::from_u8(f[3].parse().unwrap()).unwrap(),
+                        slot: f[4].parse().unwrap(),
+                        x: f[5].parse().unwrap(),
+                        y: f[6].parse().unwrap(),
+                    };
+                    assert_eq!(TouchEvent::decode(&bytes).unwrap(), expected, "{}", f[1]);
+                    assert_eq!(expected.encode().as_slice(), bytes, "{}", f[1]);
+                }
+                "cursor" => {
+                    let expected = CursorMessage {
+                        visible: f[3].parse().unwrap(),
+                        position: (f[4] != "-")
+                            .then(|| (f[4].parse().unwrap(), f[5].parse().unwrap())),
+                        hotspot: (f[6] != "-")
+                            .then(|| (f[6].parse().unwrap(), f[7].parse().unwrap())),
+                        bitmap: (f[8] != "-").then(|| CursorBitmap {
+                            width: f[8].parse().unwrap(),
+                            height: f[9].parse().unwrap(),
+                            pixels: hex(f[10]),
+                        }),
+                    };
+                    assert_eq!(CursorMessage::decode(&bytes).unwrap(), expected, "{}", f[1]);
+                    assert_eq!(expected.encode(), bytes, "{}", f[1]);
+                }
+                unknown => panic!("unknown golden vector {unknown}"),
+            }
+        }
     }
 }

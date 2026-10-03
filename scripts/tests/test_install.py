@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from apk_fixture import apk
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -29,7 +30,7 @@ class Installation(unittest.TestCase):
                         CARGO_TARGET_DIR=str(self.root / "target"))
         self.env.pop("EXTRASPACE_APK", None)
         self.apk = self.root / "custom.apk"
-        self.apk.write_bytes(b"explicit-test-apk")
+        apk(self.apk, int((REPO / "companion-version").read_text()))
         self.desktop = self.root / "data/applications/io.github.tymonoman.Extraspace.desktop"
 
     def run_install(self, *args, success=True):
@@ -115,6 +116,29 @@ class Installation(unittest.TestCase):
         self.run_install("--download-apk", "--apk", str(self.apk), success=False)
         self.assertFalse(self.bin_dir.exists())
 
+    def test_stale_explicit_or_retained_apk_fails_before_binary_replacement(self):
+        self.run_install("--no-build", "--apk", str(self.apk))
+        installed = self.bin_dir / "extraspace"
+        before = installed.read_bytes()
+        self.binary.write_text("#!/bin/sh\necho newer\n")
+        apk(self.apk, int((REPO / "companion-version").read_text()) - 1)
+        result = self.run_install("--no-build", "--apk", str(self.apk), success=False)
+        self.assertIn("companion version", result.stderr)
+        self.assertEqual(installed.read_bytes(), before)
+        retained = self.root / "data/extraspace/extraspace.apk"
+        retained.write_bytes(self.apk.read_bytes())
+        # Isolate automatic build-output discovery from this source checkout.
+        source = self.root / "isolated-source"
+        (source / "scripts").mkdir(parents=True)
+        for name in ["install.sh", "check-apk.py"]:
+            shutil.copy2(REPO / "scripts" / name, source / "scripts" / name)
+        shutil.copy2(REPO / "companion-version", source)
+        result = subprocess.run([str(source / "scripts/install.sh"), "--no-build"],
+            env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("companion version", result.stderr)
+        self.assertEqual(installed.read_bytes(), before)
+
     def mock_release(self):
         assets = self.root / "release"
         assets.mkdir()
@@ -159,7 +183,7 @@ class Installation(unittest.TestCase):
         source = self.root / "published-source"
         source.mkdir()
         (source / "scripts").mkdir()
-        for name in ["install.sh", "install-published.sh", "resolve-release.sh"]:
+        for name in ["install.sh", "install-published.sh", "resolve-release.sh", "check-apk.py"]:
             shutil.copy2(REPO / "scripts" / name, source / "scripts" / name)
         (source / "packaging").mkdir()
         shutil.copy2(REPO / "packaging/io.github.tymonoman.Extraspace.svg", source / "packaging")
@@ -181,9 +205,22 @@ class Installation(unittest.TestCase):
         new_head = git("rev-parse", "HEAD")
         (source / "README.md").write_text("local edits must survive\n")
         (assets / "companion-version").write_text("9\n")
+        apk(self.apk, 9)
+        (assets / "extraspace.apk").write_bytes(self.apk.read_bytes())
+        (assets / "extraspace.apk.sha256").write_text(hashlib.sha256(self.apk.read_bytes()).hexdigest() + "  extraspace.apk\n")
         (assets / "commit.txt").write_text(commit + "\n")
         (assets / "latest").write_text(json.dumps({"tag_name": "v0.2.0", "immutable": True, "draft": False, "prerelease": False}))
         mocks = Path(self.env["PATH"].split(":")[0])
+        mock_git = mocks / "git"
+        mock_git.write_text('#!/usr/bin/env python3\nimport os, sys\n'
+                            'args = sys.argv[1:]\n'
+                            'if "fetch" in args:\n'
+                            '    assert "https://github.com/AgentKosticka/extraspace.git" in args\n'
+                            '    args[args.index("https://github.com/AgentKosticka/extraspace.git")] = os.environ["TEST_SOURCE_REPO"]\n'
+                            'os.execv(os.environ["TEST_REAL_GIT"], ["git", *args])\n')
+        mock_git.chmod(0o755)
+        self.env.update(TEST_SOURCE_REPO=str(source), TEST_REAL_GIT=shutil.which("git"))
+        git("remote", "set-url", "origin", "https://example.invalid/unrelated-fork.git")
         cargo = mocks / "cargo"
         cargo.write_text('#!/bin/sh\ncat companion-version > "$TEST_BUILT_VERSION"\n')
         cargo.chmod(0o755)

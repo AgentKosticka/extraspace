@@ -70,7 +70,7 @@ pub(crate) struct DisplayLayout {
 /// The physical layout as it stood at disconnect, plus the output to wait for.
 pub(crate) struct LayoutAfterRemoval {
     removed_spec: MonitorSpec,
-    layout: DisplayLayout,
+    layout: std::sync::Arc<DisplayLayout>,
 }
 
 pub(crate) async fn capture_display_layout(conn: &Connection) -> Result<DisplayLayout> {
@@ -96,8 +96,23 @@ pub(crate) async fn capture_layout_for_virtual_removal(
     let layout = layout_without_monitor(layout, &removed_spec)?;
     Ok(Some(LayoutAfterRemoval {
         removed_spec,
-        layout,
+        layout: std::sync::Arc::new(layout),
     }))
+}
+
+/// Setup may reset the physical layout before it finishes. Restore the snapshot
+/// taken before creating the virtual output, rather than recording that reset.
+pub(crate) async fn capture_layout_for_cancelled_setup(
+    conn: &Connection,
+    before: &std::sync::Arc<DisplayLayout>,
+) -> Result<Option<LayoutAfterRemoval>> {
+    let current = capture_display_layout(conn).await?;
+    Ok(
+        new_virtual_monitor(&current.monitors, before).map(|(spec, ..)| LayoutAfterRemoval {
+            removed_spec: spec.clone(),
+            layout: before.clone(),
+        }),
+    )
 }
 
 fn layout_without_monitor(
@@ -203,6 +218,34 @@ pub(crate) async fn restore_layout_after_virtual_removal(
 pub async fn list_connectors(conn: &Connection) -> Result<Vec<String>> {
     let (_serial, monitors, _logical, _properties) = get_current_state(conn).await?;
     Ok(monitors.into_iter().map(|(spec, ..)| spec.0).collect())
+}
+
+pub async fn monitor_choices(conn: &Connection) -> Result<Vec<crate::MonitorInfo>> {
+    let (_, monitors, logical, _) = get_current_state(conn).await?;
+    let mut result = Vec::new();
+    for (spec, _, props) in monitors {
+        let Some(layout) = logical.iter().find(|l| l.5.contains(&spec)) else {
+            continue;
+        };
+        if is_virtual(&spec) {
+            continue;
+        }
+        let name = props
+            .get("display-name")
+            .and_then(|v| <&str>::try_from(v).ok())
+            .unwrap_or(&spec.0);
+        result.push(crate::MonitorInfo {
+            connector: spec.0.clone(),
+            label: format!(
+                "{name} ({}){}",
+                spec.0,
+                if layout.4 { " · Primary" } else { "" }
+            ),
+            primary: layout.4,
+        });
+    }
+    result.sort_by_key(|m| (!m.primary, m.connector.clone()));
+    Ok(result)
 }
 
 /// What mutter configured for the virtual monitor.

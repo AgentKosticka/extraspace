@@ -1,0 +1,10 @@
+# Desktop selector\tAndroid selector\tselected method (ADB preferred)
+auto	auto	adb
+auto	adb	adb
+auto	accessory	accessory
+adb	auto	adb
+adb	adb	adb
+adb	accessory	incompatible
+accessory	auto	accessory
+accessory	adb	incompatible
+accessory	accessory	accessory

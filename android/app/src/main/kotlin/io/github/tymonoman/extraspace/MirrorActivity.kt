@@ -3,6 +3,8 @@ package io.github.tymonoman.extraspace
 import android.annotation.SuppressLint
 import android.graphics.SurfaceTexture
 import android.os.Bundle
+import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
@@ -46,9 +48,13 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     private var ownsDecoderSurface = false
     private lateinit var statusView: TextView
     private lateinit var cursorOverlay: CursorOverlay
-    private var decoder: VideoDecoder? = null
+    @Volatile private var decoder: VideoDecoder? = null
+    private data class VideoSession(val epoch: Int, val decoder: VideoDecoder)
+    @Volatile private var videoSession: VideoSession? = null
+    @Volatile private var connectionEpoch = 0
+    private val touches = TouchTracker()
     private var decoderSurface: Surface? = null
-    private var connection: ConnectionManager? = null
+    @Volatile private var connection: ConnectionManager? = null
     private var camera: CameraSource? = null
     private lateinit var lobby: View
     private lateinit var accessories: AccessoryController
@@ -60,7 +66,11 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         val start = waitingCamera; waitingCamera = null
         if (allowed) start?.invoke()
-        else showStatus("Camera access denied. Enable it in Android app permissions, then toggle Tablet Camera on the PC.")
+        else {
+            val message = getString(R.string.camera_denied)
+            connection?.sendCameraStatus("failed", message)
+            showStatus(message)
+        }
     }
     private val main = Handler(Looper.getMainLooper())
 
@@ -72,6 +82,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     private val statsTicker = object : Runnable {
         override fun run() {
             decoder?.let { d ->
+                d.presentationFailure()?.let { reason -> connection?.fail(reason); return }
                 connection?.sendStats(
                     d.queueDepth,
                     d.framesDecoded.get(),
@@ -107,8 +118,9 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         }
         setupLobby()
         accessories = AccessoryController(this,
-            enabled = { preferences.getString("transport", "auto") != "adb"
-                && intent.getStringExtra("connection_transport") != "adb" },
+            // Keep discovery available so a disallowed link can report why the
+            // selectors are incompatible. ConnectionManager gates streaming.
+            enabled = { !destroyed },
             status = { showStatus(it) },
             ready = { fd ->
                 resetConnection()
@@ -161,20 +173,28 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
                 override fun surfaceDestroyed(holder: SurfaceHolder) { stopDecoder() }
             })
         }
+        val root = videoView.parent as FrameLayout
+        root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> layoutVideo() }
+        findViewById<Button>(R.id.streaming_settings).setOnClickListener { showLobby() }
         cursorOverlay = CursorOverlay(videoView, findViewById<ImageView>(R.id.cursor))
         Log.i(TAG, "video output=${if (surfaceView != null) "surface" else "texture"}")
+    }
+
+    private fun layoutVideo() {
+        if (!::videoView.isInitialized || streamWidth <= 0) return
+        val parent = videoView.parent as FrameLayout
+        val (width, height) = fitVideo(parent.width, parent.height, streamWidth, streamHeight)
+        val params = videoView.layoutParams as FrameLayout.LayoutParams
+        if (params.width != width || params.height != height || params.gravity != android.view.Gravity.CENTER) {
+            params.width = width; params.height = height; params.gravity = android.view.Gravity.CENTER
+            videoView.layoutParams = params
+        }
     }
 
     private fun attachDecoder(surface: Surface, ownsSurface: Boolean) {
         stopDecoder()
         decoderSurface = surface
         ownsDecoderSurface = ownsSurface
-        decoder = VideoDecoder(surface, intent.getBooleanExtra("latency_trace", false),
-            preferences.getBoolean("device_processing", false))
-        if (streamWidth > 0 && streamHeight > 0) {
-            decoder?.start(streamWidth, streamHeight, null)
-            requestFrameRate()
-        }
         startConnection()
     }
 
@@ -191,16 +211,28 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     }
 
     private fun stopDecoder() {
+        val wasStreaming = videoSession != null
+        videoSession = null
         decoder?.stop()
         decoder = null
         if (ownsDecoderSurface) decoderSurface?.release()
         decoderSurface = null
         ownsDecoderSurface = false
+        if (wasStreaming) connection?.fail(getString(R.string.surface_replaced))
+    }
+
+    private fun createDecoder(surface: Surface): VideoDecoder {
+        // A delayed codec failure belongs to its original connection.
+        val manager = connection
+        return VideoDecoder(surface, intent.getBooleanExtra("latency_trace", false),
+            preferences.getBoolean("device_processing", false),
+            onFailure = { reason -> manager?.fail(reason) })
     }
 
     private fun setupLobby() {
         findViewById<TextView>(R.id.device_details).text =
-            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · ${DeviceInfo.width}×${DeviceInfo.height} · ${DeviceInfo.refreshRate.toInt()} Hz\nDisplay ID: ${DeviceInfo.deviceId}"
+            getString(R.string.device_details, android.os.Build.MANUFACTURER, android.os.Build.MODEL,
+                DeviceInfo.width, DeviceInfo.height, DeviceInfo.refreshRate.toInt(), DeviceInfo.deviceId)
         val spinner = findViewById<Spinner>(R.id.connection_method)
         spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
             resources.getStringArray(R.array.connection_methods).toList())
@@ -224,10 +256,13 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
             }
         }
         findViewById<Button>(R.id.retry).setOnClickListener { retryConnection() }
-        findViewById<Button>(R.id.resume).setOnClickListener { lobby.visibility = View.GONE }
+        findViewById<Button>(R.id.resume).setOnClickListener {
+            lobby.visibility = View.GONE
+            findViewById<Button>(R.id.streaming_settings).visibility = View.VISIBLE
+        }
         findViewById<Button>(R.id.display_test).setOnClickListener {
             AlertDialog.Builder(this).setTitle(R.string.display_test)
-                .setView(DisplayCheckView(this)).setPositiveButton("Close", null)
+                .setView(DisplayCheckView(this)).setPositiveButton(R.string.close, null)
                 .create().also { dialog ->
                     dialog.show()
                     dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT,
@@ -235,11 +270,19 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
                 }
         }
     }
+    private fun releaseTouches() {
+        touches.cancel().forEach { connection?.sendTouch(it) }
+    }
     private fun showLobby() {
+        releaseTouches()
         lobby.visibility = View.VISIBLE
+        findViewById<Button>(R.id.streaming_settings).visibility = View.GONE
         findViewById<Button>(R.id.resume).visibility = if (streamWidth > 0) View.VISIBLE else View.GONE
     }
     private fun resetConnection() {
+        connectionEpoch++
+        videoSession = null
+        touches.cancel()
         main.removeCallbacks(reconnect)
         main.removeCallbacks(statsTicker)
         connection?.close(); connection = null
@@ -265,14 +308,47 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         if (connection != null || decoderSurface == null || destroyed) return
         val fd = pendingAccessory
         pendingAccessory = null
-        if (fd == null && preferences.getString("transport", "auto") == "accessory") {
-            showStatus(getString(R.string.accessory_waiting))
-            return
-        }
         showStatus(getString(R.string.waiting_for_host))
-        runCatching { ConnectionManager(this, fd).also { it.start() } }
-            .onSuccess { connection = it }
-            .onFailure { fd?.close(); showStatus(it.message ?: "Unable to listen for the computer") }
+        val epoch = connectionEpoch
+        val owner = this
+        val callbacks = object : ConnectionManager.Callbacks {
+            override fun onVideoConfig(width: Int, height: Int, framerate: Int) {
+                // Retain the first IDR on the reader while the main thread sets
+                // up and publishes the decoder for this connection.
+                val task = FutureTask<Unit> {
+                    if (connectionEpoch == epoch && !destroyed) owner.onVideoConfig(width, height, framerate)
+                }
+                main.post(task)
+                try { task.get(5, TimeUnit.SECONDS) }
+                catch (e: Exception) { task.cancel(false); throw e }
+            }
+            override fun onVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean) {
+                owner.decodeVideoFrame(epoch, data, length, ptsUs, isConfig)
+            }
+            override fun onCameraControl(enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int, generation: Long) {
+                main.post {
+                    if (connectionEpoch == epoch && !destroyed) owner.onCameraControl(enabled, cameraId, width, height, framerate, bitrateKbps, generation)
+                }
+            }
+            override fun onCursor(update: CursorUpdate) {
+                main.post { if (connectionEpoch == epoch && !destroyed) owner.onCursor(update) }
+            }
+            override fun onConnected() {
+                main.post { if (connectionEpoch == epoch && !destroyed) owner.onConnected() }
+            }
+            override fun onDisconnected(reason: String) {
+                main.post { if (connectionEpoch == epoch && !destroyed) owner.onDisconnected(reason) }
+            }
+        }
+        runCatching {
+            ConnectionManager(callbacks, fd,
+                TransportMode.parse(preferences.getString("transport", "auto") ?: "auto"),
+                traceLatency = intent.getBooleanExtra("latency_trace", false))
+                .also { connection = it; it.start() }
+        }.onFailure {
+            connection?.close(); connection = null
+            fd?.close(); showStatus(it.message ?: getString(R.string.listen_failed))
+        }
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -294,58 +370,77 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
 
     /** Safe to call from any thread; hops to the main thread itself. */
     private fun showStatus(text: String?) {
-        main.post {
+        val update = {
             statusView.text = text ?: ""
             statusView.visibility = if (text == null) View.GONE else View.VISIBLE
             if (text != null) showLobby()
         }
+        if (Looper.myLooper() == Looper.getMainLooper()) update() else main.post { update() }
     }
 
     // ------------------------------------------------------- host callbacks
-    // All of these arrive on socket threads, so anything touching a view or the
-    // decoder is posted to the main thread.
+    // The per-connection adapter serializes UI callbacks on the main thread and
+    // rejects callbacks from obsolete sessions. Video inputs stay on the reader.
     override fun onVideoConfig(width: Int, height: Int, framerate: Int) {
-        main.post {
-            streamWidth = width
-            streamHeight = height
-            streamFramerate = framerate
-            textureView?.surfaceTexture?.setDefaultBufferSize(width, height)
-            surfaceView?.holder?.setFixedSize(width, height)
-            requestFrameRate()
-            cursorOverlay.setStreamSize(width, height)
-            decoder?.start(width, height, null)
-            main.removeCallbacks(statsTicker)
-            main.postDelayed(statsTicker, STATS_INTERVAL_MS)
-            statusView.text = "Streaming ${width}×${height} at $framerate fps over ${if (accessoryConnected) "USB accessory" else "ADB"}"
-            statusView.visibility = View.VISIBLE
-            lobby.visibility = View.GONE
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            Log.i(TAG, "stream configured ${width}x$height @$framerate")
-        }
+        require(width > 0 && height > 0 && framerate > 0) { "Invalid video configuration" }
+        videoSession = null
+        streamWidth = width
+        streamHeight = height
+        streamFramerate = framerate
+        textureView?.surfaceTexture?.setDefaultBufferSize(width, height)
+        surfaceView?.holder?.setFixedSize(width, height)
+        requestFrameRate()
+        layoutVideo()
+        cursorOverlay.setStreamSize(width, height)
+        decoder?.stop()
+        val surface = decoderSurface ?: throw ProtocolException("Video surface is unavailable")
+        val target = createDecoder(surface)
+        decoder = target
+        target.start(width, height, null)
+        videoSession = VideoSession(connectionEpoch, target)
+        main.removeCallbacks(statsTicker)
+        main.postDelayed(statsTicker, STATS_INTERVAL_MS)
+        statusView.text = getString(R.string.streaming_status, width, height, framerate,
+            getString(if (accessoryConnected) R.string.transport_accessory else R.string.transport_adb))
+        statusView.visibility = View.VISIBLE
+        lobby.visibility = View.GONE
+        findViewById<Button>(R.id.streaming_settings).visibility = View.VISIBLE
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        Log.i(TAG, "stream configured ${width}x$height @$framerate")
     }
 
     override fun onVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean) {
-        // Called on the video thread; MediaCodec is happy to be driven from here
-        // and hopping to the main thread would only add latency.
-        if (decoder == null) return
-        if (streamWidth == 0) return
-        decoder?.decode(data, length, ptsUs, isConfig)
+        decodeVideoFrame(connectionEpoch, data, length, ptsUs, isConfig)
+    }
 
+    private fun decodeVideoFrame(epoch: Int, data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean) {
+        if (epoch != connectionEpoch) return
+        val session = videoSession ?: throw ProtocolException("Video surface is unavailable; restart the stream")
+        if (session.epoch != epoch) return
+        session.decoder.decode(data, length, ptsUs, isConfig)
     }
 
     override fun onCameraControl(
-        enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int,
+        enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int, generation: Long,
     ) {
-        main.post {
-            camera?.stop(); camera = null; waitingCamera = null
-            if (!enabled) return@post
-            val start = {
-                camera = CameraSource(this) { data, length, ptsUs, isConfig, isKey ->
-                    connection?.sendCameraFrame(data, length, ptsUs, isConfig, isKey)
-                }.also { it.start(cameraId, width, height, framerate, bitrateKbps) }
+        camera?.stop(); camera = null; waitingCamera = null
+        val manager = connection
+        val epoch = connectionEpoch
+        if (!enabled) { manager?.sendCameraStatus("off", getString(R.string.camera_off), generation); return }
+        manager?.sendCameraStatus("pending", getString(R.string.camera_starting), generation)
+        val start = {
+            if (epoch == connectionEpoch && !destroyed) {
+                camera = CameraSource(this,
+                    onStatus = { state, message -> if (epoch == connectionEpoch) manager?.sendCameraStatus(state, message, generation) },
+                    onFrame = { data, length, ptsUs, isConfig, isKey ->
+                        if (epoch == connectionEpoch) manager?.sendCameraFrame(data, length, ptsUs, isConfig, isKey, generation)
+                    }).also { it.start(cameraId, width, height, framerate, bitrateKbps) }
             }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) start()
-            else { waitingCamera = start; cameraPermission.launch(Manifest.permission.CAMERA) }
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) start()
+        else {
+            manager?.sendCameraStatus("pending", getString(R.string.camera_permission_pending), generation)
+            waitingCamera = start; cameraPermission.launch(Manifest.permission.CAMERA)
         }
     }
 
@@ -354,25 +449,27 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     }
 
     override fun onConnected() {
-        showStatus("Connected. Waiting for the desktop stream…")
+        showStatus(getString(R.string.connected_waiting))
     }
 
     override fun onDisconnected(reason: String) {
         Log.w(TAG, "disconnected: $reason")
-        main.post {
-            if (destroyed) return@post
-            val wasAccessory = accessoryConnected
-            resetConnection()
-            if (!wasAccessory) intent.removeExtra("connection_transport")
-            showStatus(getString(R.string.disconnected, reason))
-            // Existing accessory consent survives host restarts until the cable is detached.
-            main.postDelayed(reconnect, 1500)
-        }
+        if (destroyed) return
+        val wasAccessory = accessoryConnected
+        resetConnection()
+        if (!wasAccessory) intent.removeExtra("connection_transport")
+        showStatus(getString(R.string.disconnected, reason))
+        // Existing accessory consent survives host restarts until the cable is detached.
+        if (!reason.startsWith("Incompatible connection methods:")) main.postDelayed(reconnect, 1500)
     }
 
     // --------------------------------------------------------------- touch
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            releaseTouches()
+            return true
+        }
         if (lobby.visibility == View.VISIBLE) return super.onTouchEvent(event)
         val conn = connection ?: return false
         if (streamWidth == 0 || streamHeight == 0) return false
@@ -387,13 +484,16 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         val offsetX = (viewW - streamWidth * scale) / 2f
         val offsetY = (viewH - streamHeight * scale) / 2f
 
-        fun mapX(raw: Float) = ((raw - offsetX) / scale).toDouble().coerceIn(0.0, streamWidth - 1.0)
-        fun mapY(raw: Float) = ((raw - offsetY) / scale).toDouble().coerceIn(0.0, streamHeight - 1.0)
+        fun mapX(raw: Float) = ((raw - videoView.left - offsetX) / scale).toDouble().coerceIn(0.0, streamWidth - 1.0)
+        fun mapY(raw: Float) = ((raw - videoView.top - offsetY) / scale).toDouble().coerceIn(0.0, streamHeight - 1.0)
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val i = event.actionIndex
-                conn.sendTouch(
+                // A tap on the black bars must not become a click on a desktop edge.
+                if (event.getX(i) < videoView.left || event.getX(i) >= videoView.right ||
+                    event.getY(i) < videoView.top || event.getY(i) >= videoView.bottom) return true
+                sendTrackedTouch(conn,
                     TouchEvent(
                         Protocol.TouchAction.DOWN, event.getPointerId(i),
                         mapX(event.getX(i)), mapY(event.getY(i)),
@@ -403,7 +503,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
             MotionEvent.ACTION_MOVE -> {
                 // A MOVE batches every pointer that changed, so emit one per finger.
                 for (i in 0 until event.pointerCount) {
-                    conn.sendTouch(
+                    sendTrackedTouch(conn,
                         TouchEvent(
                             Protocol.TouchAction.MOTION, event.getPointerId(i),
                             mapX(event.getX(i)), mapY(event.getY(i)),
@@ -411,9 +511,9 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
                     )
                 }
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
                 val i = event.actionIndex
-                conn.sendTouch(
+                sendTrackedTouch(conn,
                     TouchEvent(
                         Protocol.TouchAction.UP, event.getPointerId(i),
                         mapX(event.getX(i)), mapY(event.getY(i)),
@@ -424,9 +524,13 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         return true
     }
 
+    private fun sendTrackedTouch(conn: ConnectionManager, event: TouchEvent) {
+        touches.record(event)?.let { conn.sendTouch(it) }
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) goFullscreen()
+        if (hasFocus) goFullscreen() else releaseTouches()
     }
 
     override fun onDestroy() {

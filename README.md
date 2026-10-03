@@ -192,14 +192,16 @@ git pull --ff-only
 
 To include the optional tablet webcam, add `--camera`. This installs v4l2loopback
 DKMS and headers for your running kernel. Secure Boot may require MOK enrollment.
-Display-only installation leaves camera modules alone.
+Display-only installation leaves camera modules alone. Camera setup and the host
+verify that `/dev/video10` is a virtual device named `Extraspace Tablet Camera`;
+a conflicting physical camera or differently labelled loopback is rejected.
 
 The [latest stable APK](https://github.com/AgentKosticka/extraspace/releases/latest/download/extraspace.apk)
 is available separately from the [versioned releases](https://github.com/AgentKosticka/extraspace/releases/latest).
 The recommended `--published` installer resolves the latest immutable `vX.Y.Z`
 release once, then downloads its source commit and matching APK from that fixed
 version. A new publication cannot mix assets from two versions during an install.
-Only a version tag matching the workspace version and pointing at a reviewed
+Only a version tag matching the workspace version and pointing at a
 `main` commit can publish, after Rust, GTK, installer and Android checks pass.
 Builds from `main` remain in GitHub Actions artifacts for development testing.
 Historical `continuous` and `build-<commit>` prereleases are legacy downloads;
@@ -251,8 +253,12 @@ companion code (currently 11) independently tracks APK upgrades and compatibilit
 Developer changes to the companion should increment
 that number, or be installed explicitly with `adb install -r -g PATH.apk`.
 
-Remove the user installation with `./scripts/install.sh --uninstall`. Your
-settings, placement profiles, and logs remain. No system packages are removed.
+Remove the user installation with `./scripts/install.sh --uninstall`. Remove
+optional root configuration separately with
+`./scripts/setup.sh --uninstall --camera --accessory`; add `--check` to preview.
+Removal verifies the installed files before deleting them and refuses modified
+administrator configuration. Dependencies remain installed and loaded modules
+remain active until reboot. Your settings, placement profiles, and logs remain.
 
 ### 4. Use it
 
@@ -299,16 +305,33 @@ support disappears while the window is hidden, Extraspace presents it again.
 
 ## Usage
 
+Open **Display & Camera Settings** from the connection screen, main menu, or
+Display section. These controls stay available while disconnected and after an
+error. Choose a replacement for an unavailable mirror source, or switch to
+Extend. **Apply** saves the device profile too and restarts a connected display
+once. **Cancel** and **Stop Waiting** end connection attempts without quitting.
+
 | Setting | What it does |
 |---|---|
 | **Mode** | *Extend* adds a new monitor. *Mirror* copies an existing one. |
+| **Mirror source** | Choose a named active monitor, or follow the primary monitor. |
 | **Scale** | How large the desktop is drawn on the tablet. Stock Mutter uses a smaller framebuffer; patched Mutter can use native GNOME scaling. |
+| **Frame rate** | Use 30 fps for lower power use or 60 fps for smoother movement. |
+| **Quality bitrate** | Set minimum and maximum Mbps; higher values preserve detail and use more USB bandwidth. |
 | **Tablet Camera** | Feeds the tablet camera into `/dev/video10`. |
+| **Camera source** | Choose a front, back, or external camera advertised by the connected tablet. |
 
 The camera appears as **“Extraspace Tablet Camera”** in Firefox, Zoom, OBS,
 Cheese and anything else that reads a webcam. It only shows up in those lists
-while Extraspace is actually running, so it does not clutter your camera picker
-the rest of the time.
+while the camera producer is active. Disabling Tablet Camera closes that
+producer. Camera errors turn the switch off and leave an explanation; use
+**Camera Setup**, correct the problem, then enable it again. Capture negotiates
+a resolution, frame rate and encoder supported by the selected camera.
+
+On Android, the visible **Settings** button opens the setup screen during
+streaming; **Return to desktop** resumes the display. Android Back also opens
+settings. Mirrored and rotated screens keep their aspect ratio, with black bars
+where needed; touches on those bars do not click the desktop.
 
 ### Choose an encoder
 
@@ -557,8 +580,12 @@ Android device before it switches into accessory mode. Extraspace reports USB
 permission failures; running the desktop app as root is unnecessary. Only one
 AOA-capable tablet may be attached when initiating accessory mode.
 
-The Android connection selector can restrict the companion to either method;
-leave both ends on Automatic unless you want to force one. AOA support varies by
+The selectors in both apps define which methods are allowed. Both on Automatic
+prefer ADB, whose separate channels keep input from waiting behind video; if ADB
+is unavailable, they can use USB accessory. If either app selects one method,
+both use that method when it is shared. ADB-only versus accessory-only reports
+an incompatibility error in both apps before creating a display. Selecting a
+method or pressing Retry on Android clears the error. AOA support varies by
 device/vendor and cable. Its single bulk link shares bandwidth between channels;
 ADB retains separate channels. USB accessory permission and APK installation
 remain Android/system operations, following the
@@ -668,11 +695,13 @@ are never overwritten. Each release includes `extraspace.apk`, its SHA-256,
 once and pins every download to its version tag; no moving source tag or release
 asset is needed.
 
-`main` requires the **Rust (1.85.0)**, **Rust (stable)** and **Android** status checks,
-an up-to-date pull request, and resolved conversations. Administrators are subject
-to these protections; force pushes and deletion are disabled. Release immutability
-and branch protection are repository settings, not properties a workflow can
-claim merely by choosing a name.
+Maintainers should configure `main` to require the **Rust (1.85.0)**,
+**Rust (stable)** and **Android** status checks, approved and up-to-date pull
+requests, and resolved conversations, with administrator enforcement and force
+pushes/deletion disabled. Human review is enforced by GitHub repository policy;
+the release workflow only proves main ancestry and passing checks. Branch
+protection and release immutability are external repository settings: source
+configuration alone cannot verify that they are enabled.
 
 To release 0.2.0, merge its checked pull request, tag that main commit `v0.2.0`,
 and push the tag. The tag pipeline publishes **Extraspace 0.2.0** only after all
@@ -697,6 +726,10 @@ Gradle accepts `EXTRASPACE_KEYSTORE`, `EXTRASPACE_KEYSTORE_PASSWORD`,
 certificate cannot replace an installed published APK without intentionally
 uninstalling the old app and losing its data. Increment `companion-version` when
 changing the Android implementation so the desktop app upgrades it automatically.
+CI requires a strictly increasing companion code when Android application sources,
+build configuration, shared protocol fixtures, or the public version change.
+Rust and Kotlin consume shared binary golden vectors under `protocol/` to check
+headers, touch points, and cursor messages across implementations.
 
 The desktop icon is generated from Android's adaptive-icon vector and background
 color. After changing those resources, run `python3 scripts/sync-icon.py` and

@@ -10,11 +10,8 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CountDownLatch
 import kotlin.concurrent.thread
 
 /**
@@ -31,6 +28,8 @@ import kotlin.concurrent.thread
 class ConnectionManager(
     private val callbacks: Callbacks,
     private val accessory: ParcelFileDescriptor? = null,
+    private val transportMode: TransportMode = TransportMode.AUTO,
+    private val traceLatency: Boolean = false,
 ) : Closeable {
 
     interface Callbacks {
@@ -39,27 +38,23 @@ class ConnectionManager(
         /** One access unit arrived. */
         fun onVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean)
         /** Host asked us to start or stop the camera. */
-        fun onCameraControl(enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int)
+        fun onCameraControl(enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int, generation: Long)
         fun onCursor(update: CursorUpdate)
         fun onConnected()
         fun onDisconnected(reason: String)
     }
 
-    private val running = AtomicBoolean(false)
-    // USB writes can block when the computer goes away. Keep them off the UI thread.
-    private val outputQueue = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
-        ArrayBlockingQueue<Runnable>(16), { job -> Thread(job, "xs-usb-output") })
-    private fun writeOutput(write: () -> Unit) {
-        if (!running.get()) return
-        if (accessory == null) { write(); return }
-        try { outputQueue.execute { if (running.get()) write() } }
-        catch (_: RejectedExecutionException) {
-            if (running.get()) {
-                close()
-                callbacks.onDisconnected("USB output stalled; reconnect the computer")
-            }
-        }
+    private val lifecycleLock = Any()
+    private val running = ConnectionState()
+    private val videoReady = CountDownLatch(1)
+    private var selectedTransport: TransportMode? = null
+    // Keep both ADB and accessory writes off the main and reader threads.
+    private val outputQueue = OutputDispatcher("xs-control-output", ::fail)
+    private val cameraQueue = if (accessory == null) OutputDispatcher("xs-camera-output", ::fail) else outputQueue
+    private fun writeOutput(key: String? = null, write: () -> Unit) {
+        if (running.get()) outputQueue.submit(key) { if (running.get()) write() }
     }
+    @Volatile private var cameraGeneration = 0L
     private var controlServer: LocalServerSocket? = null
     private var videoServer: LocalServerSocket? = null
     private var cameraServer: LocalServerSocket? = null
@@ -72,34 +67,46 @@ class ConnectionManager(
     @Volatile private var cameraWriter: FrameWriter? = null
 
     fun start() {
-        if (!running.compareAndSet(false, true)) return
-        if (accessory != null) {
-            thread(name = "xs-accessory") { runAccessory(accessory) }
-            return
-        }
-        try {
-            controlServer = LocalServerSocket(Protocol.Sockets.CONTROL)
-            videoServer = LocalServerSocket(Protocol.Sockets.VIDEO)
-            cameraServer = LocalServerSocket(Protocol.Sockets.CAMERA)
-        } catch (e: Exception) { close(); throw e }
+        synchronized(lifecycleLock) {
+            if (!running.start()) return
+            if (accessory != null) {
+                thread(name = "xs-accessory") { runAccessory(accessory) }
+                return
+            }
+            try {
+                controlServer = LocalServerSocket(Protocol.Sockets.CONTROL)
+                videoServer = LocalServerSocket(Protocol.Sockets.VIDEO)
+                cameraServer = LocalServerSocket(Protocol.Sockets.CAMERA)
+            } catch (e: Exception) { close(); throw e }
 
-        thread(name = "xs-control") { runControl() }
-        thread(name = "xs-video") { runVideo() }
-        thread(name = "xs-camera") { runCamera() }
-        Log.i(TAG, "listening on all three sockets")
+            thread(name = "xs-control") { runControl() }
+            thread(name = "xs-video") { runVideo() }
+            thread(name = "xs-camera") { runCamera() }
+            Log.i(TAG, "listening on all three sockets")
+        }
+    }
+
+    private fun accept(server: LocalServerSocket, publish: (LocalSocket) -> Unit): LocalSocket {
+        val socket = server.accept()
+        synchronized(lifecycleLock) {
+            if (!running.get()) {
+                socket.close()
+                throw ProtocolException("Connection has closed")
+            }
+            publish(socket)
+        }
+        return socket
     }
 
     // ------------------------------------------------------------- control
     private fun runControl() {
         try {
-            val socket = controlServer!!.accept()
-            controlSocket = socket
+            val socket = accept(controlServer!!) { controlSocket = it }
             val reader = FrameReader(socket.inputStream)
             val writer = FrameWriter(socket.outputStream)
             controlWriter = writer
 
             sendHello(writer)
-            callbacks.onConnected()
 
             while (running.get()) {
                 val header = reader.readHeader()
@@ -109,25 +116,42 @@ class ConnectionManager(
         } catch (e: Exception) {
             if (running.get()) {
                 Log.e(TAG, "control channel failed", e)
-                callbacks.onDisconnected(e.message ?: "control channel closed")
+                fail(e.message ?: "control channel closed")
             }
         }
     }
 
     private fun handleControl(header: FrameHeader, payload: ByteArray, writer: FrameWriter) {
         when (header.kind) {
-            Protocol.ControlKind.HELLO_REQUEST -> sendHello(writer)
+            Protocol.ControlKind.HELLO_REQUEST -> {
+                val host = if (payload.isEmpty()) TransportMode.AUTO else
+                    TransportMode.parse(JSONObject(String(payload)).getString("transport"))
+                // Hello always advertises the local selector, including when
+                // discovery arrived on a method that cannot carry the stream.
+                sendHello(writer)
+                selectedTransport = host.selectForLink(transportMode,
+                    if (accessory == null) TransportMode.ADB else TransportMode.ACCESSORY)
+                callbacks.onConnected()
+            }
+            Protocol.ControlKind.ERROR -> throw ProtocolException(String(payload))
             Protocol.ControlKind.SESSION_END -> throw ProtocolException("Computer stopped displaying")
             Protocol.ControlKind.VIDEO_CONFIG -> {
+                val actual = if (accessory == null) TransportMode.ADB else TransportMode.ACCESSORY
+                val selected = selectedTransport ?: transportMode
+                if (!transportMode.allows(actual) || (selected != TransportMode.AUTO && selected != actual)) {
+                    throw ProtocolException("Incompatible connection methods: the computer used an unselected method. Select a shared method or Automatic in both apps.")
+                }
                 val json = JSONObject(String(payload))
                 callbacks.onVideoConfig(
                     json.getInt("width"),
                     json.getInt("height"),
                     json.getInt("framerate"),
                 )
+                videoReady.countDown()
             }
             Protocol.ControlKind.CAMERA_CONTROL -> {
                 val json = JSONObject(String(payload))
+                cameraGeneration++
                 callbacks.onCameraControl(
                     json.getBoolean("enabled"),
                     json.optString("camera_id", "0"),
@@ -135,6 +159,7 @@ class ConnectionManager(
                     json.optInt("height", 1080),
                     json.optInt("framerate", 30),
                     json.optInt("bitrate_kbps", 8000),
+                    cameraGeneration,
                 )
             }
             Protocol.ControlKind.CURSOR -> {
@@ -148,10 +173,10 @@ class ConnectionManager(
             Protocol.ControlKind.PING -> {
                 // Echo the timestamp back untouched so the host can measure
                 // a true round trip without us needing a synced clock.
-                writer.write(
+                writeOutput { writer.write(
                     Protocol.Channel.CONTROL, Protocol.ControlKind.PONG,
                     0, header.ptsUs, ByteArray(0),
-                )
+                ) }
             }
             else -> Log.w(TAG, "unhandled control kind ${header.kind}")
         }
@@ -166,7 +191,6 @@ class ConnectionManager(
             cameraWriter = writer
             // AOA is host-requested, including reconnects with the cable attached.
             // ADB announces itself when its control socket connects.
-            callbacks.onConnected()
             var buffer = ByteArray(512 * 1024)
             while (running.get()) {
                 val header = reader.readHeader()
@@ -175,20 +199,26 @@ class ConnectionManager(
                     Protocol.Channel.VIDEO_DOWN -> {
                         if (header.length > buffer.size) buffer = ByteArray(header.length)
                         reader.readPayload(header, buffer)
-                        callbacks.onVideoFrame(buffer, header.length, header.ptsUs,
+                        deliverVideoFrame(buffer, header.length, header.ptsUs,
                             header.flags.toInt() and Protocol.Flags.CODEC_CONFIG.toInt() != 0)
                     }
                     else -> throw ProtocolException("unexpected accessory channel ${header.channel}")
                 }
             }
         } catch (e: Exception) {
-            if (running.get()) callbacks.onDisconnected(e.message ?: "USB accessory disconnected")
+            fail(e.message ?: "USB accessory disconnected")
         }
+    }
+
+    private fun deliverVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean) {
+        if (!videoReady.await(5, TimeUnit.SECONDS)) throw ProtocolException("Video configuration timed out")
+        if (running.get()) callbacks.onVideoFrame(data, length, ptsUs, isConfig)
     }
 
     private fun sendHello(writer: FrameWriter) {
         val json = JSONObject().apply {
             put("protocol_version", Protocol.VERSION)
+            put("transport", transportMode.wireName)
             put("device_id", DeviceInfo.deviceId)
             put("device_name", "${Build.MANUFACTURER} ${Build.MODEL}")
             put("android_release", Build.VERSION.RELEASE)
@@ -217,15 +247,24 @@ class ConnectionManager(
     /** Sends a touch event. Cheap enough to call straight from the input thread. */
     fun sendTouch(event: TouchEvent) {
         val writer = controlWriter ?: return
-        writeOutput {
+        val key = if (event.action == Protocol.TouchAction.MOTION) "motion:${event.slot}" else null
+        writeOutput(key) {
             try {
                 writer.write(
                     Protocol.Channel.TOUCH, 0, 0,
                     System.nanoTime() / 1000, event.encode(),
                 )
             } catch (e: Exception) {
-                if (running.get()) Log.w(TAG, "could not send touch", e)
+                fail(e.message ?: "could not send touch")
             }
+        }
+    }
+
+    fun sendCameraStatus(state: String, message: String, generation: Long = cameraGeneration) {
+        val writer = controlWriter ?: return
+        val json = JSONObject().put("state", state).put("message", message).toString().toByteArray()
+        writeOutput {
+            if (generation == cameraGeneration) writer.write(Protocol.Channel.CONTROL, Protocol.ControlKind.CAMERA_STATUS, 0, 0, json)
         }
     }
 
@@ -239,14 +278,14 @@ class ConnectionManager(
             put("last_frame_pts_us", lastPtsUs)
             put("rendered_at_us", renderedAtUs)
         }
-        writeOutput {
+        writeOutput("stats") {
             try {
                 writer.write(
                     Protocol.Channel.CONTROL, Protocol.ControlKind.STATS,
                     0, System.nanoTime() / 1000, json.toString().toByteArray(),
                 )
             } catch (e: Exception) {
-                if (running.get()) Log.w(TAG, "could not send stats", e)
+                fail(e.message ?: "could not send stats")
             }
         }
     }
@@ -254,26 +293,25 @@ class ConnectionManager(
     // --------------------------------------------------------------- video
     private fun runVideo() {
         try {
-            val socket = videoServer!!.accept()
-            videoSocket = socket
+            val socket = accept(videoServer!!) { videoSocket = it }
             val reader = FrameReader(socket.inputStream)
             // One reusable buffer: at 60fps, allocating per frame would keep the
             // GC busy for no reason.
             var buf = ByteArray(512 * 1024)
-            val recvPace = PaceWatch("recv")
+            val recvPace = PaceWatch("recv", traceLatency)
 
             while (running.get()) {
                 val header = reader.readHeader()
                 if (header.length > buf.size) buf = ByteArray(header.length.coerceAtLeast(buf.size * 2))
                 reader.readPayload(header, buf)
                 val isConfig = (header.flags.toInt() and Protocol.Flags.CODEC_CONFIG.toInt()) != 0
-                recvPace.observe("bytes=${header.length} pts_us=${header.ptsUs}")
-                callbacks.onVideoFrame(buf, header.length, header.ptsUs, isConfig)
+                if (traceLatency) recvPace.observe { "bytes=${header.length} pts_us=${header.ptsUs}" }
+                deliverVideoFrame(buf, header.length, header.ptsUs, isConfig)
             }
         } catch (e: Exception) {
             if (running.get()) {
                 Log.e(TAG, "video channel failed", e)
-                callbacks.onDisconnected(e.message ?: "video channel closed")
+                fail(e.message ?: "video channel closed")
             }
         }
     }
@@ -281,38 +319,59 @@ class ConnectionManager(
     // -------------------------------------------------------------- camera
     private fun runCamera() {
         try {
-            val socket = cameraServer!!.accept()
-            cameraSocket = socket
+            val socket = accept(cameraServer!!) { cameraSocket = it }
             cameraWriter = FrameWriter(socket.outputStream)
             Log.i(TAG, "camera channel connected")
-            // Host-bound only; nothing to read. Park until shutdown so the
-            // socket stays open.
-            while (running.get()) Thread.sleep(1000)
+            // Host-bound only. Block until EOF/close instead of waking every
+            // second; a disconnected host is detected immediately.
+            if (socket.inputStream.read() != -1) throw ProtocolException("Unexpected camera channel input")
+            if (running.get()) fail("camera channel closed")
         } catch (e: Exception) {
-            if (running.get()) Log.e(TAG, "camera channel failed", e)
+            fail(e.message ?: "camera channel closed")
         }
     }
 
     /** Sends one encoded camera access unit to the host. */
-    fun sendCameraFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean, isKeyframe: Boolean) {
+    fun sendCameraFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean, isKeyframe: Boolean, generation: Long) {
         val writer = cameraWriter ?: return
-        val owned = if (accessory != null) data.copyOf(length) else data
+        val owned = data.copyOf(length)
         var flags = 0
         if (isConfig) flags = flags or Protocol.Flags.CODEC_CONFIG.toInt()
         if (isKeyframe) flags = flags or Protocol.Flags.KEYFRAME.toInt()
-        writeOutput {
+        cameraQueue.submit {
+            if (!running.get() || generation != cameraGeneration) return@submit
             try {
                 writer.write(Protocol.Channel.CAMERA_UP, 0, flags.toShort(), ptsUs, owned, length)
             } catch (e: Exception) {
-                if (running.get()) Log.w(TAG, "could not send camera frame", e)
+                fail(e.message ?: "could not send camera frame")
             }
         }
     }
 
+    fun fail(reason: String) {
+        if (!running.finish()) return
+        closeResources()
+        callbacks.onDisconnected(reason)
+    }
+
     override fun close() {
-        running.set(false)
-        outputQueue.shutdownNow()
-        listOf<Closeable?>(controlServer, videoServer, cameraServer, controlSocket, videoSocket, cameraSocket, accessory)
+        running.finish()
+        closeResources()
+    }
+
+    private fun closeResources() = synchronized(lifecycleLock) {
+        videoReady.countDown()
+        outputQueue.close()
+        if (cameraQueue !== outputQueue) cameraQueue.close()
+        // Closing a descriptor alone can leave another thread's blocking read
+        // alive. Shut down both directions first to wake readers/writers and
+        // deliver EOF to the host, then release the descriptors.
+        listOf(controlSocket, videoSocket, cameraSocket).forEach { socket ->
+            runCatching { socket?.shutdownInput() }
+            runCatching { socket?.shutdownOutput() }
+            runCatching { socket?.close() }
+        }
+        listOf<Closeable?>(controlServer, videoServer, cameraServer, accessory)
             .forEach { runCatching { it?.close() } }
         controlWriter = null
         cameraWriter = null

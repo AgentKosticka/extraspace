@@ -17,16 +17,17 @@ import kotlin.concurrent.thread
  * Hardware H.264 decode straight onto a [Surface].
  *
  * Frames are handed to the codec as they arrive and released as soon as they are
- * decoded. Nothing is queued deliberately: for a live second display a late frame
- * is worthless, so the goal is to keep the codec's input queue as close to empty
- * as possible and report its depth back to the host, which lowers bitrate when it
- * starts to grow.
+ * decoded. Compressed inputs must retain their reference chain. Backpressure is
+ * bounded; failure ends the connection so the host restarts with a fresh IDR.
+ * Only decoded outputs may be discarded to reduce presentation latency.
  */
 class VideoDecoder(private val surface: Surface, private val traceLatency: Boolean = false,
-    @Volatile var selectNewestFrame: Boolean = false) {
+    @Volatile var selectNewestFrame: Boolean = false,
+    private val onFailure: (String) -> Unit = {}) {
     @Volatile private var codec: MediaCodec? = null
     @Volatile private var running = false
     private var drainThread: Thread? = null
+    private var drainWake: DecoderWake? = null
 
     /** Codec input queue depth -- the host's main signal that we are falling behind. */
     val queueDepth: Int get() = pendingInputs.get()
@@ -38,8 +39,10 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
 
     /** Frames submitted but not yet released for display. Touched by two threads. */
     private val pendingInputs = AtomicInteger(0)
-    private val inputPace = PaceWatch("decode_in")
-    private val outputPace = PaceWatch("decode_out")
+    private val inputPace = PaceWatch("decode_in", traceLatency)
+    private val outputPace = PaceWatch("decode_out", traceLatency)
+    @Volatile private var presentation: PresentationWatch? = null
+    fun presentationFailure(): String? = presentation?.failure(System.nanoTime(), framesDecoded.get(), pendingInputs.get())
     private val submittedPts = ConcurrentHashMap<Long, Long>()
 
     @Synchronized
@@ -73,21 +76,30 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
             csd?.let { setByteBuffer("csd-0", ByteBuffer.wrap(it)) }
         }
 
-        codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-            configure(format, surface, null, 0)
-            setOnFrameRenderedListener({ renderedCodec, localPtsUs, renderedNs ->
-                // A queued callback from an old codec must not update a new stream.
-                if (codec !== renderedCodec) return@setOnFrameRenderedListener
-                val hostPts = submittedPts.remove(localPtsUs)
-                if (renderedNs > 0) renderedAtUs.set(renderedNs / 1000)
-                if (hostPts != null) lastFramePtsUs.set(hostPts)
-                if (traceLatency) {
-                    Log.i(TAG, "latency stage=rendered local_pts_us=$localPtsUs render_us=${renderedNs / 1000 - localPtsUs} host_pts_us=$hostPts")
-                }
-            }, Handler(Looper.getMainLooper()))
-            Log.i(TAG, "decoder selected name=$name low_latency_supported=${codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).isFeatureSupported("low-latency")}")
-            start()
+        val created = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        codec = created
+        try {
+            created.apply {
+                configure(format, surface, null, 0)
+                setOnFrameRenderedListener({ renderedCodec, localPtsUs, renderedNs ->
+                    // A queued callback from an old codec must not update a new stream.
+                    if (codec !== renderedCodec) return@setOnFrameRenderedListener
+                    val hostPts = submittedPts.remove(localPtsUs)
+                    if (renderedNs > 0) renderedAtUs.set(renderedNs / 1000)
+                    if (hostPts != null) lastFramePtsUs.set(hostPts)
+                    if (traceLatency) {
+                        Log.i(TAG, "latency stage=rendered local_pts_us=$localPtsUs render_us=${renderedNs / 1000 - localPtsUs} host_pts_us=$hostPts")
+                    }
+                }, Handler(Looper.getMainLooper()))
+                Log.i(TAG, "decoder selected name=$name low_latency_supported=${codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).isFeatureSupported("low-latency")}")
+                start()
+            }
+        } catch (e: Exception) {
+            codec = null
+            runCatching { created.release() }
+            throw e
         }
+        presentation = PresentationWatch(System.nanoTime())
         framesDecoded.set(0)
         framesDropped.set(0)
         running = true
@@ -95,32 +107,28 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
         // Draining only when a new frame arrives means that when the desktop goes
         // idle -- which, since mutter only sends on damage, is most of the time --
         // the last frame sits decoded but unrendered until something else changes.
-        drainThread = thread(name = "xs-decode-drain") { drainLoop() }
+        val activeCodec = codec ?: error("Decoder creation failed")
+        val wake = DecoderWake()
+        drainWake = wake
+        drainThread = thread(name = "xs-decode-drain") { drainLoop(activeCodec, wake) }
         Log.i(TAG, "decoder started ${width}x$height low-latency=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.R}")
     }
 
     /**
-     * Submits one access unit. Returns false if the codec could not accept it,
-     * which means we are behind and the frame is discarded.
+     * Submits one complete access unit or throws to restart the stream. Continuing
+     * after losing a compressed input could corrupt every dependent picture.
      */
     @Synchronized
-    fun decode(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean): Boolean {
-        val mc = codec ?: return false
-        return try {
-            // Short timeout rather than blocking: if the codec is saturated we
-            // would rather drop this frame than stall the socket reader and let
-            // even more frames pile up behind it.
+    fun decode(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean) {
+        val mc = codec ?: throw ProtocolException("Decoder is unavailable; restart the stream")
+        if (!running) throw ProtocolException("Decoder stopped; restart the stream")
+        try {
+            // Allow the drain thread to free an input. A bounded stall is safer
+            // than silently dropping an H.264 reference picture.
             val waitStart = System.nanoTime()
-            val index = mc.dequeueInputBuffer(INPUT_TIMEOUT_US)
-            if (index < 0) {
-                framesDropped.incrementAndGet()
-                return false
-            }
-            val waitMs = (System.nanoTime() - waitStart) / 1_000_000L
-            mc.getInputBuffer(index)?.apply {
-                clear()
-                put(data, 0, length)
-            }
+            val index = DecoderInput.fill(data, length,
+                dequeue = { mc.dequeueInputBuffer(INPUT_TIMEOUT_US) },
+                buffer = { mc.getInputBuffer(it) })
             val flags = if (isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
             // Use a unique timestamp on the device clock to measure decode time.
             // Presentation remains explicit in releaseOutputBuffer; host PTS is
@@ -137,18 +145,19 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
             if (!isConfig) pendingInputs.incrementAndGet()
             try {
                 mc.queueInputBuffer(index, 0, length, localPtsUs, flags)
-            } catch (e: IllegalStateException) {
+            } catch (e: RuntimeException) {
                 if (!isConfig) {
                     submittedPts.remove(localPtsUs)
                     pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
                 }
                 throw e
             }
-            inputPace.observe("bytes=$length pts_us=$ptsUs wait_ms=$waitMs")
-            true
-        } catch (e: IllegalStateException) {
-            Log.e(TAG, "decoder rejected input", e)
-            false
+            drainWake?.signal()
+            if (traceLatency) inputPace.observe {
+                "bytes=$length pts_us=$ptsUs wait_ms=${(System.nanoTime() - waitStart) / 1_000_000L}"
+            }
+        } catch (e: RuntimeException) {
+            throw ProtocolException("Decoder rejected input; restart the stream").apply { initCause(e) }
         }
     }
 
@@ -158,17 +167,17 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
      * Blocks on the codec rather than spinning, so an idle desktop costs nothing
      * while a frame that does arrive is rendered immediately.
      */
-    private fun drainLoop() {
+    private fun drainLoop(mc: MediaCodec, wake: DecoderWake) {
         val info = MediaCodec.BufferInfo()
-        while (running) {
-            val mc = codec ?: break
+        while (running && codec === mc) {
+            // Once all submitted pictures have been released, only a new input
+            // can produce output. Signal after queueing, retaining early signals.
+            if (!wake.awaitWork { pendingInputs.get() > 0 }) break
             try {
                 when (val index = mc.dequeueOutputBuffer(info, DRAIN_TIMEOUT_US)) {
                     in 0..Int.MAX_VALUE -> {
                         var newestIndex = index
-                        var newestInfo = MediaCodec.BufferInfo().apply {
-                            set(info.offset, info.size, info.presentationTimeUs, info.flags)
-                        }
+                        var newestInfo = info
                         // Drop only decoded outputs, preserving all H.264 reference inputs.
                         // A bounded drain avoids starving presentation on fast producers.
                         if (selectNewestFrame) {
@@ -189,8 +198,12 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
                         Log.i(TAG, "output format now ${mc.outputFormat}")
                     else -> {} // INFO_TRY_AGAIN_LATER: nothing ready, loop again
                 }
-            } catch (e: IllegalStateException) {
-                if (running) Log.e(TAG, "decoder drain failed", e)
+            } catch (e: RuntimeException) {
+                if (running && codec === mc) {
+                    running = false
+                    Log.e(TAG, "decoder drain failed", e)
+                    onFailure("Decoder output failed; restart the stream for a fresh keyframe")
+                }
                 break
             }
         }
@@ -200,18 +213,21 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
         if (traceLatency) {
             Log.i(TAG, "latency stage=decoded local_pts_us=${info.presentationTimeUs} decode_us=${System.nanoTime() / 1000 - info.presentationTimeUs} render=$render")
         }
+        presentation?.lastOutputNs = System.nanoTime()
         if (render) mc.releaseOutputBuffer(index, System.nanoTime())
         else { mc.releaseOutputBuffer(index, false); submittedPts.remove(info.presentationTimeUs) }
         if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
             pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
             if (render) framesDecoded.incrementAndGet() else framesDropped.incrementAndGet()
         }
-        outputPace.observe("pts_us=${info.presentationTimeUs} size=${info.size}")
+        if (traceLatency) outputPace.observe { "pts_us=${info.presentationTimeUs} size=${info.size}" }
     }
 
     @Synchronized
     fun stop() {
         running = false
+        drainWake?.close()
+        drainWake = null
         drainThread?.join(500)
         drainThread = null
         codec?.let {
@@ -219,17 +235,18 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
             runCatching { it.release() }
         }
         codec = null
+        presentation = null
         pendingInputs.set(0)
         submittedPts.clear()
     }
 
     private companion object {
         const val TAG = "extraspace"
-        const val INPUT_TIMEOUT_US = 10_000L
+        const val INPUT_TIMEOUT_US = 250_000L
 
         // This is a maximum wait, not a presentation delay: the codec wakes the
-        // call as soon as an output is ready. An idle desktop needs only four
-        // timeout wakeups per second; stop() still joins within its 500 ms budget.
+        // call as soon as an output is ready. With no pending inputs DecoderWake
+        // parks indefinitely; stop() wakes it within the existing shutdown budget.
         const val DRAIN_TIMEOUT_US = 250_000L
     }
 }

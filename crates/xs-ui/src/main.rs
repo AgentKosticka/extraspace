@@ -11,6 +11,7 @@ mod config;
 mod diagnostics;
 mod encoding;
 mod private_driver;
+mod settings;
 mod tray;
 mod window;
 

@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use gst::prelude::*;
 use gstreamer as gst;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Visible hitch territory at 60 fps: a missed frame plus a little jitter.
 pub const GAP_WARN: std::time::Duration = std::time::Duration::from_millis(50);
@@ -44,7 +44,7 @@ impl StagePace {
         fetch_max(&self.max_gap_us, dt_us);
         if dt_us >= GAP_WARN.as_micros() as u64 {
             self.gaps.fetch_add(1, Ordering::Relaxed);
-            warn!(
+            debug!(
                 stage = self.name,
                 dt_ms = dt_us / 1000,
                 bytes,

@@ -50,7 +50,7 @@ class CursorOverlay(
     }
 
     fun submit(update: CursorUpdate) {
-        latest.set(update)
+        latest.updateAndGet { previous -> mergeCursor(previous, update) }
         if (posted.compareAndSet(false, true)) {
             main.post { flush() }
         }
@@ -71,19 +71,14 @@ class CursorOverlay(
 
     private fun flush() {
         posted.set(false)
-        val update = latest.get() ?: return
+        val update = latest.getAndSet(null) ?: return
         apply(update)
-        if (latest.get() !== update && posted.compareAndSet(false, true)) {
+        if (latest.get() != null && posted.compareAndSet(false, true)) {
             main.post { flush() }
         }
     }
 
     private fun apply(update: CursorUpdate) {
-        if (!update.visible) {
-            hasPosition = false
-            cursorView.visibility = View.GONE
-            return
-        }
         if (update.hasHotspot) {
             hotX = update.hotX
             hotY = update.hotY
@@ -91,6 +86,11 @@ class CursorOverlay(
         update.bitmap?.let { pixels ->
             if (update.bitmapWidth <= 0 || update.bitmapHeight <= 0) return@let
             installBitmap(pixels, update.bitmapWidth, update.bitmapHeight)
+        }
+        if (!update.visible) {
+            hasPosition = false
+            cursorView.visibility = View.GONE
+            return
         }
         if (update.hasPosition) {
             hasPosition = true
@@ -141,8 +141,8 @@ class CursorOverlay(
         val scale = minOf(viewW / streamWidth, viewH / streamHeight)
         val offsetX = (viewW - streamWidth * scale) / 2f
         val offsetY = (viewH - streamHeight * scale) / 2f
-        val x = offsetX + (streamX - hotX) * scale
-        val y = offsetY + (streamY - hotY) * scale
+        val x = videoView.left + offsetX + (streamX - hotX) * scale
+        val y = videoView.top + offsetY + (streamY - hotY) * scale
         val w = (bmp.width * scale).toInt().coerceAtLeast(1)
         val h = (bmp.height * scale).toInt().coerceAtLeast(1)
         if (w != lastW || h != lastH) {

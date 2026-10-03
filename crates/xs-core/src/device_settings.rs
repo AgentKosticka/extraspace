@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 use tracing::warn;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeviceSettings {
     pub scale: f64,
@@ -34,7 +34,7 @@ impl DeviceSettings {
             camera_id: c.camera_id.clone(),
         }
     }
-    fn apply(&self, c: &mut SessionConfig) {
+    pub(crate) fn apply(&self, c: &mut SessionConfig) {
         c.scale = crate::clamp_ui_scale(self.scale);
         c.mode = self.mode;
         c.mirror_source = self.mirror_source.clone();
