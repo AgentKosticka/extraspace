@@ -36,7 +36,7 @@ const PING_INTERVAL: Duration = Duration::from_millis(500);
 /// mutter reloads monitors asynchronously after the old Meta-0 goes away; a new
 /// `RecordVirtual` landing inside that window is how gnome-shell ends up reading
 /// a CRTC that has no configuration yet.
-const TEARDOWN_SETTLE: Duration = Duration::from_millis(1200);
+const TEARDOWN_SETTLE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DisplayMode {
@@ -353,6 +353,14 @@ pub async fn run(
                 if crate::DeviceSettings::from_config(&config) == settings {
                     continue;
                 }
+                let display_or_encoder_changed = config.mode != settings.mode
+                    || config.mirror_source != settings.mirror_source
+                    || (clamp_ui_scale(config.scale) - clamp_ui_scale(settings.scale)).abs()
+                        > 1e-6
+                    || config.framerate != settings.framerate
+                    || config.encoder != settings.encoder;
+                let camera_changed = config.camera_enabled != settings.camera_enabled
+                    || config.camera_id != settings.camera_id;
                 settings.apply(&mut config);
                 if let Some(id) = &config.last_device_id {
                     crate::device_settings::remember(&config, id);
@@ -360,18 +368,32 @@ pub async fn run(
                 let _ = events.send(Event::DeviceSettings(crate::DeviceSettings::from_config(
                     &config,
                 )));
-                if let Some(session) = active.take() {
-                    session.shutdown().await;
-                    tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    let (session, retry) = connect_interruptible(
-                        &mut config,
-                        &events,
-                        &mut commands,
-                        &mut pending_command,
-                    )
-                    .await;
-                    active = session;
-                    wanted = retry;
+                if display_or_encoder_changed {
+                    if let Some(session) = active.take() {
+                        session.shutdown().await;
+                        tokio::time::sleep(TEARDOWN_SETTLE).await;
+                        let (session, retry) = connect_interruptible(
+                            &mut config,
+                            &events,
+                            &mut commands,
+                            &mut pending_command,
+                        )
+                        .await;
+                        active = session;
+                        wanted = retry;
+                    }
+                } else if let Some(session) = active.as_ref() {
+                    {
+                        let mut controller = session.controller.lock().await;
+                        controller.set_bounds(config.bounds);
+                        session.pipeline.set_bitrate(controller.current_kbps());
+                    }
+                    if camera_changed {
+                        pending_command = Some(Command::SetCamera {
+                            enabled: config.camera_enabled,
+                            camera_id: config.camera_id.clone(),
+                        });
+                    }
                 }
             }
             Command::SetTransport(mode) => {
@@ -516,6 +538,17 @@ pub async fn run(
                         }
                         wanted = false;
                         emit(State::Failed { message: format!("Connection stopped while changing the camera: {e}. Connect again to retry.") });
+                    }
+                }
+            }
+
+            Command::OpenRemoteSettings => {
+                if let Some(session) = active.as_ref() {
+                    if let Err(e) = send_open_settings(&session.control_writer).await {
+                        warn!(error = %e, "could not open remote display settings");
+                        let _ = events.send(Event::Warning(format!(
+                            "Could not open remote display settings: {e}"
+                        )));
                     }
                 }
             }
@@ -852,7 +885,7 @@ async fn connect_streams(
         height,
         framerate: config.framerate,
         bitrate_kbps: start_kbps,
-        codec: "h264".into(),
+        codec: pipeline.encoder().codec_name().into(),
     };
     control_writer
         .lock()
@@ -1009,6 +1042,30 @@ async fn connect_streams(
 
                 last_contact_us.store(monotonic_us(), Ordering::Relaxed);
                 match frame.channel() {
+                    Channel::Touch if frame.header.kind == xs_proto::TOUCH_KIND_STYLUS => {
+                        let Some(stylus) = xs_proto::StylusEvent::decode(&frame.payload) else {
+                            warn!("malformed stylus event");
+                            continue;
+                        };
+                        if !matches!(
+                            stylus.action,
+                            xs_proto::StylusAction::Hover | xs_proto::StylusAction::Motion
+                        ) {
+                            debug!(
+                                action = ?stylus.action,
+                                tool = ?stylus.tool,
+                                buttons = stylus.buttons,
+                                x = stylus.x,
+                                y = stylus.y,
+                                pressure = stylus.pressure,
+                                "stylus"
+                            );
+                        }
+                        if let Err(e) = mutter.stylus_event(stylus).await {
+                            warn!(error = %e, "stylus injection failed");
+                        }
+                    }
+
                     Channel::Touch => {
                         let Some(touch) = TouchEvent::decode(&frame.payload) else {
                             warn!("malformed touch event");
@@ -1131,10 +1188,14 @@ async fn connect_streams(
                         first_sample = false;
                         last_bytes = bytes;
 
+                        let encode_ms = stats_source.encode_time_us() as f64 / 1000.0;
+                        let decode_ms = device.decode_time_us as f64 / 1000.0;
                         let _ = events.send(Event::Stats(Stats {
                             bitrate_kbps,
                             fps: fps.fps(),
                             control_rtt_ms: rtt.as_secs_f64() * 1000.0,
+                            encode_ms,
+                            decode_ms,
                             frames_decoded: device.frames_decoded,
                             frames_encoded: encoded,
                             frames_dropped: total_dropped,
@@ -1280,6 +1341,20 @@ async fn send_camera_control(
     Ok(())
 }
 
+async fn send_open_settings(writer: &SharedWriter) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        writer
+            .lock()
+            .await
+            .write_frame(Channel::Control, ControlKind::OpenSettings as u8, 0, 0, &[])
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Remote settings request timed out"))??;
+    Ok(())
+}
+
 /// Microseconds since an arbitrary fixed point. Only differences are meaningful,
 /// which is all ping/pong needs -- and it sidesteps clock skew entirely.
 fn monotonic_us() -> u64 {
@@ -1291,12 +1366,12 @@ fn monotonic_us() -> u64 {
 /// A sensible opening bitrate, so the first second does not look terrible while
 /// the controller finds its level.
 ///
-/// 0.2 bits per pixel per frame. The obvious 0.1 was measured starting a
+/// 0.3 bits per pixel per frame. The obvious 0.1 was measured starting a
 /// 1332x800@60 session at 6393 kbit/s -- barely above the 6000 floor, so the
 /// controller had nowhere to go but down and sat there. Screen content is mostly
 /// static and compresses well, but text and sharp edges are exactly what suffers
 /// when you starve it, and USB 2.0 has roughly 15x the headroom needed anyway.
-const BITS_PER_PIXEL_PER_FRAME: f64 = 0.2;
+const BITS_PER_PIXEL_PER_FRAME: f64 = 0.3;
 
 fn starting_bitrate(width: u32, height: u32, framerate: u32, bounds: BitrateBounds) -> u32 {
     let pixels_per_second = width as f64 * height as f64 * framerate as f64;

@@ -138,6 +138,8 @@ pub enum ControlKind {
     SessionEnd = 9,
     /// Device -> host: camera permission, capture and error state.
     CameraStatus = 10,
+    /// Host -> device: open the companion settings screen on the tablet.
+    OpenSettings = 11,
 }
 
 impl ControlKind {
@@ -154,6 +156,7 @@ impl ControlKind {
             8 => Self::HelloRequest,
             9 => Self::SessionEnd,
             10 => Self::CameraStatus,
+            11 => Self::OpenSettings,
             _ => return None,
         })
     }
@@ -361,6 +364,9 @@ pub struct Stats {
     /// Device clock reported by the codec for that surface render, in microseconds.
     /// This does not measure physical display scanout; callbacks may be delayed.
     pub rendered_at_us: u64,
+    /// Latest or rolling-average hardware decode time on the tablet, in microseconds.
+    #[serde(default)]
+    pub decode_time_us: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,7 +394,11 @@ pub struct CameraStatus {
     pub message: String,
 }
 
-/// A single touch point, sent on [`Channel::Touch`].
+/// Discriminator in [`Header::kind`] on [`Channel::Touch`].
+pub const TOUCH_KIND_FINGER: u8 = 0;
+pub const TOUCH_KIND_STYLUS: u8 = 1;
+
+/// A single touch point, sent on [`Channel::Touch`] with `kind == TOUCH_KIND_FINGER`.
 ///
 /// Encoded as a fixed 21-byte payload rather than JSON: these arrive at up to
 /// 120 Hz per finger and the parse cost matters.
@@ -447,6 +457,130 @@ impl TouchEvent {
             slot: u32::from_le_bytes(buf[1..5].try_into().ok()?),
             x: f64::from_le_bytes(buf[5..13].try_into().ok()?),
             y: f64::from_le_bytes(buf[13..21].try_into().ok()?),
+        })
+    }
+}
+
+/// Action for a stylus event sent on [`Channel::Touch`] with `kind == TOUCH_KIND_STYLUS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StylusAction {
+    Hover = 0,
+    Down = 1,
+    Motion = 2,
+    Up = 3,
+    HoverExit = 4,
+}
+
+impl StylusAction {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::Hover,
+            1 => Self::Down,
+            2 => Self::Motion,
+            3 => Self::Up,
+            4 => Self::HoverExit,
+            _ => return None,
+        })
+    }
+}
+
+/// Active stylus end (pen tip vs. eraser).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StylusTool {
+    Pen = 0,
+    Eraser = 1,
+}
+
+impl StylusTool {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::Pen,
+            1 => Self::Eraser,
+            _ => return None,
+        })
+    }
+}
+
+/// Bitmask flags for [`StylusEvent::buttons`].
+pub mod stylus_buttons {
+    pub const PRIMARY: u8 = 1 << 0;
+    pub const SECONDARY: u8 = 1 << 1;
+    pub const TERTIARY: u8 = 1 << 2;
+}
+
+pub const STYLUS_PAYLOAD_LEN: usize = 32;
+
+/// High-frequency stylus packet with hover, pressure, tilt, and barrel buttons.
+///
+/// ```text
+/// 0      action   u8   StylusAction
+/// 1      tool     u8   StylusTool
+/// 2      buttons  u8   stylus_buttons bitmask
+/// 3      reserved u8   0
+/// 4..12  x        f64  normalized 0.0..=1.0
+/// 12..20 y        f64  normalized 0.0..=1.0
+/// 20..24 pressure f32  normalized 0.0..=1.0
+/// 24..28 tilt_x   f32  normalized -1.0..=1.0 (-90..=+90 deg)
+/// 28..32 tilt_y   f32  normalized -1.0..=1.0 (-90..=+90 deg)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StylusEvent {
+    pub action: StylusAction,
+    pub tool: StylusTool,
+    pub buttons: u8,
+    pub x: f64,
+    pub y: f64,
+    pub pressure: f32,
+    pub tilt_x: f32,
+    pub tilt_y: f32,
+}
+
+impl StylusEvent {
+    pub fn encode(&self) -> [u8; STYLUS_PAYLOAD_LEN] {
+        let mut buf = [0u8; STYLUS_PAYLOAD_LEN];
+        buf[0] = self.action as u8;
+        buf[1] = self.tool as u8;
+        buf[2] = self.buttons;
+        buf[3] = 0;
+        buf[4..12].copy_from_slice(&self.x.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.y.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.pressure.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.tilt_x.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.tilt_y.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() != STYLUS_PAYLOAD_LEN || buf[3] != 0 {
+            return None;
+        }
+        let action = StylusAction::from_u8(buf[0])?;
+        let tool = StylusTool::from_u8(buf[1])?;
+        let buttons = buf[2];
+        let x = f64::from_le_bytes(buf[4..12].try_into().ok()?);
+        let y = f64::from_le_bytes(buf[12..20].try_into().ok()?);
+        let pressure = f32::from_le_bytes(buf[20..24].try_into().ok()?);
+        let tilt_x = f32::from_le_bytes(buf[24..28].try_into().ok()?);
+        let tilt_y = f32::from_le_bytes(buf[28..32].try_into().ok()?);
+        if !x.is_finite()
+            || !y.is_finite()
+            || !pressure.is_finite()
+            || !tilt_x.is_finite()
+            || !tilt_y.is_finite()
+        {
+            return None;
+        }
+        Some(Self {
+            action,
+            tool,
+            buttons,
+            x,
+            y,
+            pressure: pressure.clamp(0.0, 1.0),
+            tilt_x: tilt_x.clamp(-1.0, 1.0),
+            tilt_y: tilt_y.clamp(-1.0, 1.0),
         })
     }
 }
@@ -680,6 +814,45 @@ mod tests {
         };
         assert_eq!(CursorMessage::decode(&msg.encode()).unwrap(), msg);
     }
+
+    #[test]
+    fn stylus_roundtrips_with_pressure_and_tilt() {
+        let s = StylusEvent {
+            action: StylusAction::Motion,
+            tool: StylusTool::Pen,
+            buttons: stylus_buttons::PRIMARY | stylus_buttons::SECONDARY,
+            x: 0.5,
+            y: 0.25,
+            pressure: 0.75,
+            tilt_x: 0.125,
+            tilt_y: -0.25,
+        };
+        assert_eq!(StylusEvent::decode(&s.encode()).unwrap(), s);
+    }
+
+    #[test]
+    fn stylus_rejects_invalid_and_non_finite_payloads() {
+        let s = StylusEvent {
+            action: StylusAction::Hover,
+            tool: StylusTool::Eraser,
+            buttons: 0,
+            x: 0.25,
+            y: 0.75,
+            pressure: 0.0,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+        };
+        let encoded = s.encode();
+        for length in 0..STYLUS_PAYLOAD_LEN {
+            assert!(StylusEvent::decode(&encoded[..length]).is_none());
+        }
+        let mut bad_reserved = encoded;
+        bad_reserved[3] = 1;
+        assert!(StylusEvent::decode(&bad_reserved).is_none());
+        let mut bad_action = encoded;
+        bad_action[0] = 99;
+        assert!(StylusEvent::decode(&bad_action).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -715,6 +888,20 @@ mod golden_tests {
         );
         assert_eq!(
             [
+                StylusAction::Hover as u8,
+                StylusAction::Down as u8,
+                StylusAction::Motion as u8,
+                StylusAction::Up as u8,
+                StylusAction::HoverExit as u8
+            ],
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            [StylusTool::Pen as u8, StylusTool::Eraser as u8],
+            [0, 1]
+        );
+        assert_eq!(
+            [
                 ControlKind::Hello as u8,
                 ControlKind::VideoConfig as u8,
                 ControlKind::Stats as u8,
@@ -725,9 +912,10 @@ mod golden_tests {
                 ControlKind::Cursor as u8,
                 ControlKind::HelloRequest as u8,
                 ControlKind::SessionEnd as u8,
-                ControlKind::CameraStatus as u8
+                ControlKind::CameraStatus as u8,
+                ControlKind::OpenSettings as u8
             ],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
         assert_eq!([flags::KEYFRAME, flags::CODEC_CONFIG], [1, 2]);
         assert_eq!(
@@ -771,6 +959,20 @@ mod golden_tests {
                         y: f[6].parse().unwrap(),
                     };
                     assert_eq!(TouchEvent::decode(&bytes).unwrap(), expected, "{}", f[1]);
+                    assert_eq!(expected.encode().as_slice(), bytes, "{}", f[1]);
+                }
+                "stylus" => {
+                    let expected = StylusEvent {
+                        action: StylusAction::from_u8(f[3].parse().unwrap()).unwrap(),
+                        tool: StylusTool::from_u8(f[4].parse().unwrap()).unwrap(),
+                        buttons: f[5].parse().unwrap(),
+                        x: f[6].parse().unwrap(),
+                        y: f[7].parse().unwrap(),
+                        pressure: f[8].parse().unwrap(),
+                        tilt_x: f[9].parse().unwrap(),
+                        tilt_y: f[10].parse().unwrap(),
+                    };
+                    assert_eq!(StylusEvent::decode(&bytes).unwrap(), expected, "{}", f[1]);
                     assert_eq!(expected.encode().as_slice(), bytes, "{}", f[1]);
                 }
                 "cursor" => {

@@ -283,10 +283,12 @@ fn bridge(
         output,
         writer_lock: lock.clone(),
     });
-    for mut stream in [control_bridge, video_bridge] {
+    let control_waiting = Arc::new( std::sync::atomic::AtomicUsize::new(0));
+    for (is_control, mut stream) in [(true, control_bridge), (false, video_bridge)] {
         let usb = usb.clone();
         let stopped = stopped.clone();
         let lock = lock.clone();
+        let control_waiting = control_waiting.clone();
         let fail_sockets = session
             .sockets
             .iter()
@@ -300,9 +302,21 @@ fn bridge(
                         h.channel == Channel::Control && h.kind == ControlKind::HelloRequest as u8
                     });
                     let consent_deadline = Instant::now() + Duration::from_secs(60);
-                    let _guard = lock
-                        .lock()
-                        .map_err(|_| std::io::Error::other("USB writer lock poisoned"))?;
+                    if is_control {
+                        control_waiting.fetch_add(1, Ordering::AcqRel);
+                    } else {
+                        while control_waiting.load(Ordering::Acquire) > 0
+                            && !stopped.load(Ordering::Relaxed)
+                        {
+                            std::thread::yield_now();
+                        }
+                    }
+                    let guard = lock.lock();
+                    if is_control {
+                        control_waiting.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    let _guard =
+                        guard.map_err(|_| std::io::Error::other("USB writer lock poisoned"))?;
                     // Header and payload are one frame; competing channels cannot interleave.
                     for bytes in [head.as_slice(), payload.as_slice()] {
                         for chunk in bytes.chunks(USB_PACKET) {

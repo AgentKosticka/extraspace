@@ -76,4 +76,28 @@ class SecondPassTest {
             assertTrue(failed.await(1, TimeUnit.SECONDS))
         } finally { unblock.countDown(); output.close() }
     }
+    @Test fun multiFingerInterleavedMotionsCoalescePerSlotWithoutCrossingBarriers() {
+        val entered = CountDownLatch(1); val unblock = CountDownLatch(1); val done = CountDownLatch(1)
+        val results = Collections.synchronizedList(mutableListOf<String>())
+        val output = OutputDispatcher("test-multitouch", { fail(it) }, capacity = 8)
+        try {
+            output.submit { entered.countDown(); unblock.await() }
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            output.submit { results.add("down:0") }
+            output.submit { results.add("down:1") }
+            repeat(20) { i ->
+                output.submit("motion:0") { results.add("m0:$i") }
+                output.submit("motion:1") { results.add("m1:$i") }
+            }
+            output.submit { results.add("up:0") }
+            output.submit("motion:0") { results.add("m0:after-up") }
+            output.submit { results.add("up:1"); done.countDown() }
+            unblock.countDown()
+            assertTrue(done.await(2, TimeUnit.SECONDS))
+            assertEquals(
+                listOf("down:0", "down:1", "m0:19", "m1:19", "up:0", "m0:after-up", "up:1"),
+                results.toList(),
+            )
+        } finally { unblock.countDown(); output.close() }
+    }
 }

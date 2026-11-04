@@ -131,18 +131,35 @@ impl CursorHub {
             .ok_or("capture appsrc is unavailable")?;
         let pushed = Arc::clone(&self.pushed_frames);
         let failed = Arc::clone(&self.push_fail);
+        let origin = self.origin;
+        let duration_ns = 1_000_000_000 / u64::from(self.framerate);
         *pacer = Some(
-            crate::frame_pacer::FramePacer::new(self.framerate, move |buffer| {
-                if let Err(err) = appsrc.push_buffer(buffer) {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    debug!(error = %err, "capture push dropped");
-                } else {
-                    pushed.fetch_add(1, Ordering::Relaxed);
-                }
-            })
+            crate::frame_pacer::FramePacer::new_with_settle(
+                self.framerate,
+                std::time::Duration::from_millis(120),
+                move |mut buffer: gst::Buffer| {
+                    {
+                        let buf = buffer.make_mut();
+                        buf.set_pts(gst::ClockTime::from_nseconds(
+                            origin.elapsed().as_nanos() as u64
+                        ));
+                        buf.set_duration(gst::ClockTime::from_nseconds(duration_ns));
+                    }
+                    if let Err(err) = appsrc.push_buffer(buffer) {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(error = %err, "capture push dropped");
+                    } else {
+                        pushed.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+            )
             .map_err(|e| e.to_string())?,
         );
         Ok(())
+    }
+
+    pub fn now_us(&self) -> u64 {
+        self.origin.elapsed().as_micros() as u64
     }
 
     pub fn stop_pacer(&self) {

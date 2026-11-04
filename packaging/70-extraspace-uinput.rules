@@ -1,0 +1,2 @@
+# Extraspace virtual stylus (/dev/uinput): grant access to active local seat users and plugdev.
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess", GROUP="plugdev", MODE="0660"

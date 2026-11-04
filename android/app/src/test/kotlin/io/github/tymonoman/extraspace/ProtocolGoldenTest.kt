@@ -12,10 +12,22 @@ class ProtocolGoldenTest {
         val kinds = listOf(Protocol.ControlKind.HELLO, Protocol.ControlKind.VIDEO_CONFIG,
             Protocol.ControlKind.STATS, Protocol.ControlKind.CAMERA_CONTROL, Protocol.ControlKind.PING,
             Protocol.ControlKind.PONG, Protocol.ControlKind.ERROR, Protocol.ControlKind.CURSOR,
-            Protocol.ControlKind.HELLO_REQUEST, Protocol.ControlKind.SESSION_END, Protocol.ControlKind.CAMERA_STATUS)
+            Protocol.ControlKind.HELLO_REQUEST, Protocol.ControlKind.SESSION_END, Protocol.ControlKind.CAMERA_STATUS,
+            Protocol.ControlKind.OPEN_SETTINGS)
         assertEquals(listOf<Byte>(0, 1, 2, 3), listOf(Protocol.Channel.CONTROL, Protocol.Channel.TOUCH, Protocol.Channel.VIDEO_DOWN, Protocol.Channel.CAMERA_UP))
         assertEquals(listOf<Short>(1, 2), listOf(Protocol.Flags.KEYFRAME, Protocol.Flags.CODEC_CONFIG))
         assertEquals(listOf<Byte>(0, 1, 2), listOf(Protocol.TouchAction.DOWN, Protocol.TouchAction.MOTION, Protocol.TouchAction.UP))
+        assertEquals(
+            listOf<Byte>(0, 1, 2, 3, 4),
+            listOf(
+                Protocol.StylusAction.HOVER,
+                Protocol.StylusAction.DOWN,
+                Protocol.StylusAction.MOTION,
+                Protocol.StylusAction.UP,
+                Protocol.StylusAction.HOVER_EXIT,
+            ),
+        )
+        assertEquals(listOf<Byte>(0, 1), listOf(Protocol.StylusTool.PEN, Protocol.StylusTool.ERASER))
         assertEquals(listOf(1, 2, 4, 8), listOf(Protocol.CursorFlags.VISIBLE, Protocol.CursorFlags.POSITION, Protocol.CursorFlags.HOTSPOT, Protocol.CursorFlags.BITMAP))
         assertEquals(1, Protocol.VERSION)
         val vectors = javaClass.getResourceAsStream("/golden-vectors.tsv")!!.bufferedReader().readLines()
@@ -36,6 +48,20 @@ class ProtocolGoldenTest {
                     assertArrayEquals(f[1], bytes, out.toByteArray().copyOf(Protocol.HEADER_LEN))
                 }
                 "touch" -> assertArrayEquals(f[1], bytes, TouchEvent(f[3].toByte(), f[4].toInt(), f[5].toDouble(), f[6].toDouble()).encode())
+                "stylus" -> assertArrayEquals(
+                    f[1],
+                    bytes,
+                    StylusEvent(
+                        f[3].toByte(),
+                        f[4].toByte(),
+                        f[5].toInt(),
+                        f[6].toDouble(),
+                        f[7].toDouble(),
+                        f[8].toFloat(),
+                        f[9].toFloat(),
+                        f[10].toFloat(),
+                    ).encode(),
+                )
                 "cursor" -> {
                     val c = CursorUpdate.decode(bytes)!!
                     assertEquals(f[3].toBoolean(), c.visible)

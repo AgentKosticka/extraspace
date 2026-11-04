@@ -225,6 +225,7 @@ pub struct VideoStats {
     pub bytes_encoded: AtomicU64,
     pub last_au_bytes: AtomicU64,
     pub last_keyframe_bytes: AtomicU64,
+    pub encode_time_us: AtomicU64,
 }
 
 impl VideoStats {
@@ -235,6 +236,10 @@ impl VideoStats {
             self.frames_dropped.load(Ordering::Relaxed),
             self.bytes_encoded.load(Ordering::Relaxed),
         )
+    }
+
+    pub fn encode_time_us(&self) -> u64 {
+        self.encode_time_us.load(Ordering::Relaxed)
     }
 }
 
@@ -328,6 +333,9 @@ impl VideoPipeline {
         let encoder_element = option.build(config.bitrate_kbps, config.framerate)?;
         let (tx, rx) = mpsc::channel(FRAME_QUEUE_DEPTH);
         let keyframe_needed = Arc::new(Notify::new());
+        let (cursor_tx, cursor_rx) = mpsc::channel(1);
+        let hub = cursor::CursorHub::new(config.framerate, cursor_tx);
+        hub.attach_appsrc(overlay_src.clone());
 
         match kind {
             PipelineKind::Full => {
@@ -362,7 +370,7 @@ impl VideoPipeline {
                             gst::Caps::builder("video/x-raw")
                                 .field(
                                     "format",
-                                    if encoder == Encoder::NvH264 {
+                                    if matches!(encoder, Encoder::NvH264 | Encoder::NvH265) {
                                         "NV12"
                                     } else {
                                         "I420"
@@ -373,14 +381,15 @@ impl VideoPipeline {
                         )?,
                     )
                 };
-                let parse = gst::ElementFactory::make("h264parse")
+                let parser_name = encoder.parser_name();
+                let parse = gst::ElementFactory::make(parser_name)
                     .property("config-interval", -1i32)
                     .build()
                     .map_err(|_| Error::ElementMissing {
-                        element: "h264parse",
+                        element: parser_name,
                     })?;
                 let parse_caps = caps_filter(
-                    gst::Caps::builder("video/x-h264")
+                    gst::Caps::builder(encoder.caps_media_type())
                         .field("stream-format", "byte-stream")
                         .field("alignment", "au")
                         .build(),
@@ -406,9 +415,19 @@ impl VideoPipeline {
                 gst::Element::link_many(encode_elements)?;
                 pacing::attach_buffer_probe(overlay_src.upcast_ref(), "src", &capture_pace);
                 pacing::attach_buffer_probe(&rate, "src", &rate_pace);
+                let encode_in_us = Arc::new(AtomicU64::new(0));
+                if let Some(pad) = convert.static_pad("sink") {
+                    let probe_hub = Arc::clone(&hub);
+                    let probe_in_us = Arc::clone(&encode_in_us);
+                    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                        probe_in_us.store(probe_hub.now_us(), Ordering::Relaxed);
+                        gst::PadProbeReturn::Ok
+                    });
+                }
 
                 let sink_stats = Arc::clone(&stats);
                 let sink_pace = Arc::clone(&encode_pace);
+                let sink_hub = Arc::clone(&hub);
                 let recovery_request = Arc::clone(&keyframe_needed);
                 let mut recovery = recovery::FrameRecovery::default();
                 appsink.set_callbacks(
@@ -423,6 +442,23 @@ impl VideoPipeline {
                                 return Ok(gst::FlowSuccess::Ok);
                             }
                             let pts_us = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
+                            let started_us = encode_in_us.load(Ordering::Relaxed);
+                            if started_us > 0 {
+                                let encode_us = sink_hub
+                                    .now_us()
+                                    .saturating_sub(started_us)
+                                    .min(1_000_000);
+                                let prev_encode =
+                                    sink_stats.encode_time_us.load(Ordering::Relaxed);
+                                let smoothed = if prev_encode == 0 {
+                                    encode_us
+                                } else {
+                                    (prev_encode * 3 + encode_us) / 4
+                                };
+                                sink_stats
+                                    .encode_time_us
+                                    .store(smoothed, Ordering::Relaxed);
+                            }
                             let au_bytes = map.len();
                             let frame = EncodedFrame {
                                 data: Bytes::copy_from_slice(map.as_slice()),
@@ -516,10 +552,6 @@ impl VideoPipeline {
                 }
             }
         }
-
-        let (cursor_tx, cursor_rx) = mpsc::channel(1);
-        let hub = cursor::CursorHub::new(config.framerate, cursor_tx);
-        hub.attach_appsrc(overlay_src.clone());
 
         // Only worth asking for dma-bufs if the encoder can take them without a
         // trip through the CPU; a software encoder would have to map them back.

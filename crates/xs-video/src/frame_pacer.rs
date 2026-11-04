@@ -16,6 +16,7 @@ pub(crate) struct FramePacer<T> {
 }
 
 impl<T: Send + 'static> FramePacer<T> {
+    #[cfg(test)]
     pub fn new(fps: u32, mut deliver: impl FnMut(T) + Send + 'static) -> std::io::Result<Self> {
         let shared = Arc::new((
             Mutex::new(State {
@@ -74,6 +75,74 @@ impl<T: Send + 'static> FramePacer<T> {
     }
 }
 
+impl<T: Clone + Send + 'static> FramePacer<T> {
+    /// Like [`Self::new`], plus a single static-settle refinement re-push after
+    /// `settle_delay` of silence so the encoder can spend a full frame budget
+    /// sharpening static text once motion stops.
+    pub fn new_with_settle(
+        fps: u32,
+        settle_delay: Duration,
+        mut deliver: impl FnMut(T) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let shared = Arc::new((
+            Mutex::new(State::<T> {
+                pending: None,
+                stopped: false,
+            }),
+            Condvar::new(),
+        ));
+        let receiver = Arc::clone(&shared);
+        let period = Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(fps.max(1))));
+        let worker = thread::Builder::new()
+            .name("xs-frame-pacer".into())
+            .spawn(move || {
+                let (lock, changed) = &*receiver;
+                let mut next = Instant::now();
+                let mut settle_candidate: Option<T> = None;
+                loop {
+                    let mut state = lock.lock().expect("frame pacer lock");
+                    while !state.stopped && state.pending.is_none() {
+                        if let Some(ref candidate) = settle_candidate {
+                            let (waiting, timeout) = changed
+                                .wait_timeout(state, settle_delay)
+                                .expect("frame pacer settle wait");
+                            state = waiting;
+                            if !state.stopped && state.pending.is_none() && timeout.timed_out() {
+                                let settled = candidate.clone();
+                                settle_candidate = None;
+                                drop(state);
+                                next = Instant::now() + period;
+                                deliver(settled);
+                                state = lock.lock().expect("frame pacer lock");
+                            }
+                        } else {
+                            state = changed.wait(state).expect("frame pacer wait");
+                        }
+                    }
+                    if state.stopped {
+                        break;
+                    }
+                    if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                        let (waiting, _) = changed
+                            .wait_timeout(state, wait)
+                            .expect("frame pacer deadline");
+                        drop(waiting);
+                        continue;
+                    }
+                    let frame = state.pending.take().expect("pending frame");
+                    settle_candidate = Some(frame.clone());
+                    drop(state);
+                    next = Instant::now() + period;
+                    deliver(frame);
+                }
+            })?;
+        Ok(Self {
+            shared,
+            worker: Some(worker),
+        })
+    }
+}
+
 impl<T> Drop for FramePacer<T> {
     fn drop(&mut self) {
         let (lock, changed) = &*self.shared;
@@ -120,6 +189,22 @@ mod tests {
             third.duration_since(second) >= Duration::from_nanos(1_000_000_000u64.div_ceil(60))
         );
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(pacer);
+    }
+
+    #[test]
+    fn settle_pass_delivers_one_refinement_frame_after_motion_stops() {
+        let (tx, rx) = mpsc::channel();
+        let pacer = FramePacer::new_with_settle(60, Duration::from_millis(40), move |frame| {
+            tx.send(frame).unwrap();
+        })
+        .unwrap();
+        pacer.submit(42u32);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
+        // Settle refinement frame arrives once after ~40ms of silence.
+        assert_eq!(rx.recv_timeout(Duration::from_millis(200)).unwrap(), 42);
+        // And does not repeat while still idle.
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
         drop(pacer);
     }
 

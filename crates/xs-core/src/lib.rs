@@ -56,6 +56,8 @@ pub enum Command {
         enabled: bool,
         camera_id: String,
     },
+    /// Open the companion settings screen on the connected tablet.
+    OpenRemoteSettings,
     /// Shut the engine thread down.
     Shutdown,
 }
@@ -91,6 +93,10 @@ pub struct Stats {
     pub fps: f64,
     /// Round trip on the control socket; does not measure visual latency.
     pub control_rtt_ms: f64,
+    /// Rolling average host encode latency per frame in milliseconds.
+    pub encode_ms: f64,
+    /// Rolling average tablet decode latency per frame in milliseconds.
+    pub decode_ms: f64,
     /// Frames released by the tablet decoder, distinct from encoded frames.
     pub frames_decoded: u64,
     pub frames_encoded: u64,

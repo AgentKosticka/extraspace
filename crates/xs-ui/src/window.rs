@@ -133,6 +133,14 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
         crate::settings::present(&parent, &settings_engine, &saved, &monitors, &cameras)
     });
     app.add_action(&settings_action);
+    let open_remote_settings = gtk::gio::SimpleAction::new("open-remote-settings", None);
+    let remote_engine = engine.clone();
+    let remote_toasts = widgets.toasts.clone();
+    open_remote_settings.connect_activate(move |_, _| {
+        remote_engine.send(Command::OpenRemoteSettings);
+        remote_toasts.add_toast(adw::Toast::new("Opened remote display settings on tablet"));
+    });
+    app.add_action(&open_remote_settings);
     let camera_setup = gtk::gio::SimpleAction::new("camera-setup", None);
     let parent = window.clone();
     camera_setup.connect_activate(move |_, _| {
@@ -323,6 +331,14 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         .build();
     settings_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     display_group.add(&settings_row);
+    let remote_settings_row = adw::ActionRow::builder()
+        .title("Open remote display settings")
+        .subtitle("Show the companion settings screen on your tablet")
+        .activatable(true)
+        .action_name("app.open-remote-settings")
+        .build();
+    remote_settings_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    display_group.add(&remote_settings_row);
     prefs.add(&display_group);
 
     let camera_group = adw::PreferencesGroup::builder()
@@ -808,7 +824,14 @@ fn apply_stats(widgets: &Rc<Widgets>, stats: &Stats) {
         .set_subtitle(&format!("{:.0} fps", stats.fps));
     // Bound to a local: a `format!` temporary inside the call would not outlive it.
     let latency = if stats.control_rtt_ms > 0.0 {
-        format!("{:.1} ms", stats.control_rtt_ms)
+        if stats.encode_ms > 0.0 || stats.decode_ms > 0.0 {
+            format!(
+                "{:.1} ms (encode {:.1} ms · decode {:.1} ms)",
+                stats.control_rtt_ms, stats.encode_ms, stats.decode_ms
+            )
+        } else {
+            format!("{:.1} ms", stats.control_rtt_ms)
+        }
     } else {
         "measuring…".to_owned()
     };

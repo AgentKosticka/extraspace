@@ -105,12 +105,26 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
             len: payload.len() as u32,
             pts_us,
         };
-        // One write per frame where possible: two syscalls per video frame at
-        // 60fps is noise, but interleaving with another task's write is not.
-        let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-        out.extend_from_slice(&header.encode());
-        out.extend_from_slice(payload);
-        self.inner.write_all(&out).await?;
+        let head = header.encode();
+        let mut head_pos = 0;
+        let mut payload_pos = 0;
+        while head_pos < head.len() || payload_pos < payload.len() {
+            let n = if head_pos < head.len() {
+                let slices = [
+                    std::io::IoSlice::new(&head[head_pos..]),
+                    std::io::IoSlice::new(&payload[payload_pos..]),
+                ];
+                self.inner.write_vectored(&slices).await?
+            } else {
+                self.inner.write(&payload[payload_pos..]).await?
+            };
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            let from_head = n.min(head.len() - head_pos);
+            head_pos += from_head;
+            payload_pos += n - from_head;
+        }
         Ok(())
     }
 

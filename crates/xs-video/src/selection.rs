@@ -55,9 +55,15 @@ fn supported(name: &str, plugin: &str) -> Option<Encoder> {
         ("vah264lpenc", "va") => Some(Encoder::VaH264Lp),
         ("vah264enc", "va") => Some(Encoder::VaH264),
         ("nvh264enc", "nvcodec") => Some(Encoder::NvH264),
+        ("vah265lpenc", "va") => Some(Encoder::VaH265Lp),
+        ("vah265enc", "va") => Some(Encoder::VaH265),
+        ("nvh265enc", "nvcodec") => Some(Encoder::NvH265),
         (_, "va") if numbered(name, "varenderD", "h264lpenc") => Some(Encoder::VaH264Lp),
         (_, "va") if numbered(name, "varenderD", "h264enc") => Some(Encoder::VaH264),
         (_, "nvcodec") if numbered(name, "nvh264device", "enc") => Some(Encoder::NvH264),
+        (_, "va") if numbered(name, "varenderD", "h265lpenc") => Some(Encoder::VaH265Lp),
+        (_, "va") if numbered(name, "varenderD", "h265enc") => Some(Encoder::VaH265),
+        (_, "nvcodec") if numbered(name, "nvh265device", "enc") => Some(Encoder::NvH265),
         _ => None,
     }
 }
@@ -79,6 +85,7 @@ pub fn available_encoders() -> Vec<EncoderOption> {
         .iter()
         .filter_map(|f| f.clone().downcast().ok())
         .collect();
+    let has_h265parse = factories.iter().any(|f| f.name() == "h265parse");
     let postprocs: Vec<(String, Option<String>)> = factories
         .iter()
         .filter(|f| {
@@ -97,10 +104,16 @@ pub fn available_encoders() -> Vec<EncoderOption> {
         ) else {
             continue;
         };
-        let va = matches!(encoder, Encoder::VaH264 | Encoder::VaH264Lp);
+        if encoder.is_hevc() && !has_h265parse {
+            continue;
+        }
+        let va = matches!(
+            encoder,
+            Encoder::VaH264 | Encoder::VaH264Lp | Encoder::VaH265 | Encoder::VaH265Lp
+        );
         let device = if va { device_path(factory) } else { None };
         let postproc = if va {
-            // Do not cross devices, even when both can encode H.264.
+            // Do not cross devices, even when both can encode H.264/HEVC.
             let Some(path) = device.as_ref() else {
                 continue;
             };
@@ -151,8 +164,11 @@ pub fn available_encoders() -> Vec<EncoderOption> {
                 Encoder::VaH264Lp => 0,
                 Encoder::VaH264 => 1,
                 Encoder::NvH264 => 2,
-                Encoder::X264 => 3,
-                Encoder::OpenH264 => 4,
+                Encoder::VaH265Lp => 3,
+                Encoder::VaH265 => 4,
+                Encoder::NvH265 => 5,
+                Encoder::X264 => 6,
+                Encoder::OpenH264 => 7,
             },
             o.factory.clone(),
         )

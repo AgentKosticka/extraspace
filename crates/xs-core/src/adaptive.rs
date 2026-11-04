@@ -64,8 +64,8 @@ const DROPS_TOLERATED: u64 = 2;
 /// Consecutive bad samples before backing off. At 2 Hz this is one second --
 /// long enough to ignore a single hiccup, short enough to fix a real stall.
 const BAD_SAMPLES_BEFORE_DECREASE: u32 = 2;
-/// Consecutive good samples before probing upwards. Deliberately ~5 seconds.
-const GOOD_SAMPLES_BEFORE_INCREASE: u32 = 10;
+/// Consecutive good samples before probing upwards. At 2 Hz this is two seconds.
+const GOOD_SAMPLES_BEFORE_INCREASE: u32 = 4;
 
 // The asymmetry between these two is the whole point of AIMD: backing off must be
 // quicker than recovering, or the bitrate oscillates visibly. Enforced at compile
@@ -75,7 +75,7 @@ const _: () = assert!(BAD_SAMPLES_BEFORE_DECREASE < GOOD_SAMPLES_BEFORE_INCREASE
 /// Multiplicative decrease factor.
 const DECREASE_FACTOR: f64 = 0.75;
 /// Additive increase step.
-const INCREASE_STEP_KBPS: u32 = 1_000;
+const INCREASE_STEP_KBPS: u32 = 2_500;
 
 /// Never change bitrate more often than this, whatever the samples say.
 const MIN_CHANGE_INTERVAL: Duration = Duration::from_secs(1);
@@ -242,7 +242,7 @@ mod tests {
             );
         }
         let t = t0 + Duration::from_secs(60);
-        assert_eq!(c.observe(good(), t), Some(11_000));
+        assert_eq!(c.observe(good(), t), Some(12_500));
     }
 
     #[test]

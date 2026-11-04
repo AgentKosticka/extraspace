@@ -29,6 +29,7 @@ with tempfile.TemporaryDirectory(prefix="extraspace-usb-menu-") as d:
                 time.sleep(.1)
             assert "usb-connection" in actions
             assert "display-settings" in actions and "camera-setup" in actions
+            assert "open-remote-settings" in actions
             def action(name): call("Activate", GLib.Variant("(sava{sv})", (name, [], {})))
             action("usb-connection")
             time.sleep(.5)
@@ -36,6 +37,8 @@ with tempfile.TemporaryDirectory(prefix="extraspace-usb-menu-") as d:
             time.sleep(.3)
             action("camera-setup")
             time.sleep(.3)
+            action("open-remote-settings")
+            time.sleep(.2)
             assert process.poll() is None
             action("quit")
             assert process.wait(timeout=8) == 0

@@ -29,6 +29,7 @@ mod input;
 pub mod keys;
 mod patched;
 mod proxies;
+mod stylus;
 
 pub use keys::Chord;
 
@@ -168,6 +169,7 @@ pub struct Session {
     width: u32,
     height: u32,
     input_coordinates: input::InputCoordinates,
+    stylus: std::sync::Mutex<stylus::StylusInput>,
     layout_before: Option<std::sync::Arc<display::DisplayLayout>>,
     use_modes: bool,
     // Atomic rather than a bool so the session can be shared behind an `Arc` --
@@ -404,6 +406,7 @@ impl Session {
             width,
             height,
             input_coordinates,
+            stylus: std::sync::Mutex::new(stylus::StylusInput::new()),
             layout_before: original_layout,
             use_modes,
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -419,6 +422,7 @@ impl Session {
                 display::enable_virtual_monitor(&self._conn, 1.0, before).await?;
             }
         }
+        self.input_coordinates.refresh(&self._conn).await;
         Ok(())
     }
 
@@ -429,9 +433,7 @@ impl Session {
                 warn!(error = %e, "saved tablet placement could not be restored");
             }
         }
-        if matches!(self.config.source, CaptureSource::Virtual) {
-            self.input_coordinates.refresh(&self._conn).await;
-        }
+        self.input_coordinates.refresh(&self._conn).await;
     }
 
     /// Read-only display query, followed by an atomic write of our own profiles.
@@ -490,6 +492,7 @@ impl Session {
             display::restore_layout_after_virtual_removal(&self._conn, &layout).await?;
         }
         info!("virtual monitor removed");
+        input::clear_tablet_output();
         Ok(())
     }
 
@@ -542,6 +545,29 @@ impl Session {
         self.remote_desktop
             .notify_keyboard_keycode(keycode, pressed)
             .await?;
+        Ok(())
+    }
+
+    pub async fn stylus_event(&self, event: xs_proto::StylusEvent) -> Result<()> {
+        // Pinned to our monitor: the stylus range covers exactly the video frame.
+        let video_frame = display::StageGeometry {
+            monitor_x: 0.0,
+            monitor_y: 0.0,
+            monitor_scale: 1.0,
+            stage_width: self.width.max(1) as f64,
+            stage_height: self.height.max(1) as f64,
+        };
+        if !self.input_coordinates.tablet_mapped() {
+            self.input_coordinates.refresh(&self._conn).await;
+        }
+        let stage = if self.input_coordinates.tablet_mapped() {
+            video_frame
+        } else {
+            self.input_coordinates.stage_geometry().ok_or_else(|| {
+                Error::DisplayLayout("captured display is unavailable for stylus input".into())
+            })?
+        };
+        self.stylus.lock().unwrap().handle(event, stage);
         Ok(())
     }
 }

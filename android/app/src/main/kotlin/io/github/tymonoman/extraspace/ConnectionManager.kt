@@ -35,11 +35,14 @@ class ConnectionManager(
     interface Callbacks {
         /** Host has sent the stream parameters; set up the decoder. */
         fun onVideoConfig(width: Int, height: Int, framerate: Int)
+        fun onVideoConfig(width: Int, height: Int, framerate: Int, codec: String) =
+            onVideoConfig(width, height, framerate)
         /** One access unit arrived. */
         fun onVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean)
         /** Host asked us to start or stop the camera. */
         fun onCameraControl(enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int, generation: Long)
         fun onCursor(update: CursorUpdate)
+        fun onOpenSettings() = Unit
         fun onConnected()
         fun onDisconnected(reason: String)
     }
@@ -146,6 +149,7 @@ class ConnectionManager(
                     json.getInt("width"),
                     json.getInt("height"),
                     json.getInt("framerate"),
+                    json.optString("codec", "h264"),
                 )
                 videoReady.countDown()
             }
@@ -170,6 +174,7 @@ class ConnectionManager(
                     callbacks.onCursor(update)
                 }
             }
+            Protocol.ControlKind.OPEN_SETTINGS -> callbacks.onOpenSettings()
             Protocol.ControlKind.PING -> {
                 // Echo the timestamp back untouched so the host can measure
                 // a true round trip without us needing a synced clock.
@@ -251,11 +256,31 @@ class ConnectionManager(
         writeOutput(key) {
             try {
                 writer.write(
-                    Protocol.Channel.TOUCH, 0, 0,
+                    Protocol.Channel.TOUCH, Protocol.TouchKind.FINGER, 0,
                     System.nanoTime() / 1000, event.encode(),
                 )
             } catch (e: Exception) {
                 fail(e.message ?: "could not send touch")
+            }
+        }
+    }
+
+    /** Sends a stylus hover/tip/pressure/tilt/button event. */
+    fun sendStylus(event: StylusEvent) {
+        val writer = controlWriter ?: return
+        val key = if (event.action == Protocol.StylusAction.HOVER || event.action == Protocol.StylusAction.MOTION) {
+            "stylus:${event.action}:${event.tool}:${event.buttons}"
+        } else {
+            null
+        }
+        writeOutput(key) {
+            try {
+                writer.write(
+                    Protocol.Channel.TOUCH, Protocol.TouchKind.STYLUS, 0,
+                    System.nanoTime() / 1000, event.encode(),
+                )
+            } catch (e: Exception) {
+                fail(e.message ?: "could not send stylus")
             }
         }
     }
@@ -269,7 +294,14 @@ class ConnectionManager(
     }
 
     /** Periodic health report that drives the host's adaptive bitrate controller. */
-    fun sendStats(queueDepth: Int, decoded: Long, dropped: Long, lastPtsUs: Long, renderedAtUs: Long) {
+    fun sendStats(
+        queueDepth: Int,
+        decoded: Long,
+        dropped: Long,
+        lastPtsUs: Long,
+        renderedAtUs: Long,
+        decodeTimeUs: Int = 0,
+    ) {
         val writer = controlWriter ?: return
         val json = JSONObject().apply {
             put("decode_queue_depth", queueDepth)
@@ -277,6 +309,7 @@ class ConnectionManager(
             put("frames_dropped", dropped)
             put("last_frame_pts_us", lastPtsUs)
             put("rendered_at_us", renderedAtUs)
+            if (decodeTimeUs > 0) put("decode_time_us", decodeTimeUs)
         }
         writeOutput("stats") {
             try {

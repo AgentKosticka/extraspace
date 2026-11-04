@@ -154,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
                     frames_dropped: 0,
                     last_frame_pts_us: 0,
                     rendered_at_us: 0,
+                    decode_time_us: 0,
                 };
                 control_writer
                     .write_frame(

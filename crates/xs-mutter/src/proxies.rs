@@ -122,9 +122,11 @@ pub trait RemoteDesktopSession {
     // RecordMonitor converts video pixels to logical pixels inside Mutter.
 
     fn notify_touch_down(&self, stream: &str, slot: u32, x: f64, y: f64) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_touch_motion(&self, stream: &str, slot: u32, x: f64, y: f64) -> zbus::Result<()>;
     fn notify_touch_up(&self, slot: u32) -> zbus::Result<()>;
 
+    #[zbus(no_reply)]
     fn notify_pointer_motion_absolute(&self, stream: &str, x: f64, y: f64) -> zbus::Result<()>;
     fn notify_pointer_button(&self, button: i32, state: bool) -> zbus::Result<()>;
     fn notify_pointer_axis(&self, dx: f64, dy: f64, flags: u32) -> zbus::Result<()>;

@@ -464,9 +464,87 @@ async fn get_current_state(conn: &Connection) -> Result<CurrentState> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct StageGeometry {
+    pub monitor_x: f64,
+    pub monitor_y: f64,
+    pub monitor_scale: f64,
+    pub stage_width: f64,
+    pub stage_height: f64,
+}
+
 pub(crate) async fn virtual_input_scale(conn: &Connection) -> Result<f64> {
     let (_, _, logical, properties) = get_current_state(conn).await?;
     Ok(input_scale(&logical, &properties))
+}
+
+pub(crate) async fn stage_geometry(
+    conn: &Connection,
+    source: &crate::CaptureSource,
+) -> Result<Option<StageGeometry>> {
+    let (_, monitors, logical, properties) = get_current_state(conn).await?;
+    let layout_mode = prop_u32(&properties, "layout-mode").unwrap_or(LAYOUT_LOGICAL);
+    let mut max_x = 0i32;
+    let mut max_y = 0i32;
+    let mut target = None;
+
+    for (lx, ly, scale, transform, _, specs, _) in &logical {
+        let Some(mode) = specs
+            .iter()
+            .find_map(|spec| monitors.iter().find(|(m, ..)| m == spec))
+            .and_then(|(_, modes, _)| modes.iter().find(|m| mode_flag(m, "is-current")))
+        else {
+            continue;
+        };
+        let (lw, lh) = logical_size(mode.1, mode.2, *scale, *transform, layout_mode);
+        max_x = max_x.max(lx + lw);
+        max_y = max_y.max(ly + lh);
+
+        let is_target = match source {
+            crate::CaptureSource::Virtual => specs.iter().any(is_virtual),
+            crate::CaptureSource::Monitor(connector) => specs.iter().any(|s| s.0 == *connector),
+        };
+        if is_target {
+            let eff_scale = if layout_mode == LAYOUT_LOGICAL && scale.is_finite() && *scale >= 1.0 {
+                *scale
+            } else {
+                1.0
+            };
+            target = Some((*lx as f64, *ly as f64, eff_scale));
+        }
+    }
+
+    let Some((monitor_x, monitor_y, monitor_scale)) = target else {
+        return Ok(None);
+    };
+    if max_x <= 0 || max_y <= 0 {
+        return Ok(None);
+    }
+    Ok(Some(StageGeometry {
+        monitor_x,
+        monitor_y,
+        monitor_scale,
+        stage_width: max_x as f64,
+        stage_height: max_y as f64,
+    }))
+}
+
+/// `(vendor, product, serial)` of the captured output, the triple GNOME's
+/// tablet `output` setting uses to pin an absolute tablet to one monitor.
+pub(crate) async fn tablet_output_spec(
+    conn: &Connection,
+    source: &crate::CaptureSource,
+) -> Result<Option<[String; 3]>> {
+    let (_, monitors, logical, _) = get_current_state(conn).await?;
+    Ok(monitors
+        .iter()
+        .map(|(spec, ..)| spec)
+        .filter(|spec| match source {
+            crate::CaptureSource::Virtual => is_virtual(spec),
+            crate::CaptureSource::Monitor(connector) => spec.0 == *connector,
+        })
+        .find(|spec| logical.iter().any(|l| l.5.contains(spec)))
+        .map(|spec| [spec.1.clone(), spec.2.clone(), spec.3.clone()]))
 }
 
 fn input_scale(logical: &[LogicalMonitor], properties: &HashMap<String, OwnedValue>) -> f64 {

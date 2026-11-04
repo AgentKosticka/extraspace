@@ -56,12 +56,21 @@ async fn main() -> anyhow::Result<()> {
             let mut frames = 0;
             let mut decoded = 0;
             let mut induced_loss = false;
+            let mut opened_settings = false;
             let mut saw_reconnect = false;
             while let Ok(event) = tokio::time::timeout_at(deadline, events.recv()).await {
                 match event? {
                     Event::Stats(stats) => {
                         frames = stats.frames_encoded;
                         decoded = stats.frames_decoded;
+                        if !opened_settings
+                            && decoded > 0
+                            && std::env::var_os("XS_TEST_OPEN_SETTINGS").is_some()
+                        {
+                            opened_settings = true;
+                            engine.send(Command::OpenRemoteSettings);
+                            println!("cycle {cycle}: sent OpenRemoteSettings");
+                        }
                         if !induced_loss
                             && decoded > 0
                             && std::env::var_os("XS_TEST_LOSS").is_some()

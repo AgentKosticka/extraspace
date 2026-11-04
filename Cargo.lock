@@ -1846,6 +1846,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xs-proto",
  "zbus",
  "zvariant",
 ]

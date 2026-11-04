@@ -36,6 +36,8 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
     /** Device-clock microseconds reported by the codec for its last surface render. */
     val renderedAtUs = AtomicLong(0)
     val lastFramePtsUs = AtomicLong(0)
+    /** Rolling-average hardware decode latency in microseconds. */
+    val decodeTimeUs = AtomicInteger(0)
 
     /** Frames submitted but not yet released for display. Touched by two threads. */
     private val pendingInputs = AtomicInteger(0)
@@ -46,9 +48,13 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
     private val submittedPts = ConcurrentHashMap<Long, Long>()
 
     @Synchronized
-    fun start(width: Int, height: Int, csd: ByteArray?) {
+    fun start(width: Int, height: Int, csd: ByteArray?, codecName: String = "h264") {
         stop()
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        val mime = when (codecName.lowercase()) {
+            "h265", "hevc" -> MediaFormat.MIMETYPE_VIDEO_HEVC
+            else -> MediaFormat.MIMETYPE_VIDEO_AVC
+        }
+        val format = MediaFormat.createVideoFormat(mime, width, height).apply {
             // Tells the decoder to minimise internal buffering. Without this most
             // MediaCodec implementations hold 2-4 frames, which alone can exceed
             // our entire latency budget.
@@ -76,7 +82,7 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
             csd?.let { setByteBuffer("csd-0", ByteBuffer.wrap(it)) }
         }
 
-        val created = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val created = MediaCodec.createDecoderByType(mime)
         codec = created
         try {
             created.apply {
@@ -91,7 +97,7 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
                         Log.i(TAG, "latency stage=rendered local_pts_us=$localPtsUs render_us=${renderedNs / 1000 - localPtsUs} host_pts_us=$hostPts")
                     }
                 }, Handler(Looper.getMainLooper()))
-                Log.i(TAG, "decoder selected name=$name low_latency_supported=${codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).isFeatureSupported("low-latency")}")
+                Log.i(TAG, "decoder selected name=$name mime=$mime low_latency_supported=${codecInfo.getCapabilitiesForType(mime).isFeatureSupported("low-latency")}")
                 start()
             }
         } catch (e: Exception) {
@@ -102,6 +108,7 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
         presentation = PresentationWatch(System.nanoTime())
         framesDecoded.set(0)
         framesDropped.set(0)
+        decodeTimeUs.set(0)
         running = true
         // Output is drained on its own thread rather than piggybacking on input.
         // Draining only when a new frame arrives means that when the desktop goes
@@ -142,7 +149,14 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
             // Increment before submission: the independent drain thread can
             // release an output before queueInputBuffer returns. Config buffers
             // do not produce a corresponding picture and must not inflate depth.
-            if (!isConfig) pendingInputs.incrementAndGet()
+            if (!isConfig) {
+                // After an idle desktop the last output is arbitrarily old; the
+                // stall clock starts when work becomes pending, not at that output.
+                // Stamp before publishing the count so the watch never pairs the
+                // new pending frame with the stale timestamp.
+                if (pendingInputs.get() == 0) presentation?.lastOutputNs = System.nanoTime()
+                pendingInputs.incrementAndGet()
+            }
             try {
                 mc.queueInputBuffer(index, 0, length, localPtsUs, flags)
             } catch (e: RuntimeException) {
@@ -210,15 +224,23 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
     }
 
     private fun releaseDecoded(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo, render: Boolean) {
+        val nowNs = System.nanoTime()
+        val elapsedUs = (nowNs / 1000 - info.presentationTimeUs).coerceIn(0L, 1_000_000L).toInt()
         if (traceLatency) {
-            Log.i(TAG, "latency stage=decoded local_pts_us=${info.presentationTimeUs} decode_us=${System.nanoTime() / 1000 - info.presentationTimeUs} render=$render")
+            Log.i(TAG, "latency stage=decoded local_pts_us=${info.presentationTimeUs} decode_us=$elapsedUs render=$render")
         }
-        presentation?.lastOutputNs = System.nanoTime()
-        if (render) mc.releaseOutputBuffer(index, System.nanoTime())
+        presentation?.lastOutputNs = nowNs
+        if (render) mc.releaseOutputBuffer(index, nowNs)
         else { mc.releaseOutputBuffer(index, false); submittedPts.remove(info.presentationTimeUs) }
         if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
             pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
-            if (render) framesDecoded.incrementAndGet() else framesDropped.incrementAndGet()
+            if (render) {
+                framesDecoded.incrementAndGet()
+                val prev = decodeTimeUs.get()
+                decodeTimeUs.set(if (prev == 0) elapsedUs else ((prev * 3 + elapsedUs) / 4))
+            } else {
+                framesDropped.incrementAndGet()
+            }
         }
         if (traceLatency) outputPace.observe { "pts_us=${info.presentationTimeUs} size=${info.size}" }
     }
@@ -237,6 +259,7 @@ class VideoDecoder(private val surface: Surface, private val traceLatency: Boole
         codec = null
         presentation = null
         pendingInputs.set(0)
+        decodeTimeUs.set(0)
         submittedPts.clear()
     }
 

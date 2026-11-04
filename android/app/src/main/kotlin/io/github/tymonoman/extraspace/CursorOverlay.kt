@@ -18,7 +18,7 @@ class CursorOverlay(
     private val videoView: View,
     private val cursorView: ImageView,
 ) {
-    private val main = Handler(Looper.getMainLooper())
+    private val main = Handler.createAsync(Looper.getMainLooper())
     private val latest = AtomicReference<CursorUpdate?>()
     private val posted = AtomicBoolean(false)
 

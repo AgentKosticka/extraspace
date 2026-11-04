@@ -20,19 +20,25 @@ use gst::prelude::*;
 use gstreamer as gst;
 use tracing::{debug, info, warn};
 
-/// An H.264 encoder we know how to drive.
+/// An H.264 or H.265 (HEVC) encoder we know how to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoder {
     /// Preferred software encoder: fastest, most accurate rate control.
     X264,
     /// Fallback that ships with Fedora, so the app works with no extra installs.
     OpenH264,
-    /// VA-API on the GPU's low-power (VDENC) engine.
+    /// VA-API H.264 on the GPU's low-power (VDENC) engine.
     VaH264Lp,
-    /// VA-API on the general encode engine, where VDENC is absent.
+    /// VA-API H.264 on the general encode engine, where VDENC is absent.
     VaH264,
-    /// NVIDIA NVENC using the installed nvcodec driver.
+    /// NVIDIA NVENC H.264 using the installed nvcodec driver.
     NvH264,
+    /// VA-API HEVC (H.265) on the GPU's low-power engine.
+    VaH265Lp,
+    /// VA-API HEVC (H.265) on the general encode engine.
+    VaH265,
+    /// NVIDIA NVENC HEVC (H.265) using the installed nvcodec driver.
+    NvH265,
 }
 
 impl Encoder {
@@ -43,6 +49,9 @@ impl Encoder {
             Self::VaH264Lp => "vah264lpenc",
             Self::VaH264 => "vah264enc",
             Self::NvH264 => "nvh264enc",
+            Self::VaH265Lp => "vah265lpenc",
+            Self::VaH265 => "vah265enc",
+            Self::NvH265 => "nvh265enc",
         }
     }
 
@@ -53,6 +62,41 @@ impl Encoder {
             Self::VaH264Lp => "VA-API (GPU, low-power engine)",
             Self::VaH264 => "VA-API (GPU)",
             Self::NvH264 => "NVIDIA NVENC (GPU)",
+            Self::VaH265Lp => "VA-API HEVC (GPU, low-power engine)",
+            Self::VaH265 => "VA-API HEVC (GPU)",
+            Self::NvH265 => "NVIDIA NVENC HEVC (GPU)",
+        }
+    }
+
+    /// Whether this encoder produces HEVC (`h265`) rather than AVC (`h264`).
+    pub fn is_hevc(self) -> bool {
+        matches!(self, Self::VaH265Lp | Self::VaH265 | Self::NvH265)
+    }
+
+    /// Wire codec name sent in `VideoConfig`.
+    pub fn codec_name(self) -> &'static str {
+        if self.is_hevc() {
+            "h265"
+        } else {
+            "h264"
+        }
+    }
+
+    /// GStreamer bitstream parser element name matching this encoder.
+    pub fn parser_name(self) -> &'static str {
+        if self.is_hevc() {
+            "h265parse"
+        } else {
+            "h264parse"
+        }
+    }
+
+    /// GStreamer caps media type for the parsed byte-stream.
+    pub fn caps_media_type(self) -> &'static str {
+        if self.is_hevc() {
+            "video/x-h265"
+        } else {
+            "video/x-h264"
         }
     }
 
@@ -63,7 +107,15 @@ impl Encoder {
     /// encode itself, so a GPU encoder is only worth having if the frames reach
     /// it without a trip through the CPU.
     pub fn is_gpu(self) -> bool {
-        matches!(self, Self::VaH264Lp | Self::VaH264 | Self::NvH264)
+        matches!(
+            self,
+            Self::VaH264Lp
+                | Self::VaH264
+                | Self::NvH264
+                | Self::VaH265Lp
+                | Self::VaH265
+                | Self::NvH265
+        )
     }
 
     /// Encoders in descending order of preference.
@@ -77,6 +129,7 @@ impl Encoder {
     /// Whether this encoder's element is registered in the local GStreamer install.
     pub fn is_available(self) -> bool {
         gst::ElementFactory::find(self.element_name()).is_some()
+            && gst::ElementFactory::find(self.parser_name()).is_some()
     }
 
     /// Best encoder present on this machine.
@@ -104,12 +157,18 @@ impl Encoder {
         found
     }
 
-    /// `bitrate` is kbit/s for x264enc and the VA encoders but bit/s for
+    /// `bitrate` is kbit/s for x264enc and the GPU encoders but bit/s for
     /// openh264enc. Getting this wrong is a 1000x error, so the conversion lives
     /// in exactly one place.
     fn bitrate_property_value(self, kbps: u32) -> u32 {
         match self {
-            Self::X264 | Self::VaH264Lp | Self::VaH264 | Self::NvH264 => kbps,
+            Self::X264
+            | Self::VaH264Lp
+            | Self::VaH264
+            | Self::NvH264
+            | Self::VaH265Lp
+            | Self::VaH265
+            | Self::NvH265 => kbps,
             Self::OpenH264 => kbps.saturating_mul(1000),
         }
     }
@@ -146,13 +205,13 @@ impl Encoder {
                 ("complexity", "low"),
                 ("gop-size", &gop),
             ],
-            Self::VaH264Lp | Self::VaH264 => &[
+            Self::VaH264Lp | Self::VaH264 | Self::VaH265Lp | Self::VaH265 => &[
                 ("rate-control", "cbr"),
                 ("key-int-max", &gop),
                 ("b-frames", "0"),
                 ("ref-frames", "1"),
             ],
-            Self::NvH264 => &[
+            Self::NvH264 | Self::NvH265 => &[
                 ("rc-mode", "cbr"),
                 ("gop-size", &gop),
                 ("bframes", "0"),
@@ -163,6 +222,11 @@ impl Encoder {
         };
         for (name, value) in properties {
             set_checked(&element, name, value)?;
+        }
+        // Enable multi-slice encoding when the hardware driver supports it so
+        // encode and packetization can overlap across slices within a frame.
+        if self.is_gpu() {
+            let _ = set_checked(&element, "num-slices", "4");
         }
         debug!(encoder = factory, kbps, framerate, "encoder built");
         Ok(element)
@@ -224,21 +288,14 @@ fn set_checked(element: &gst::Element, name: &str, text: &str) -> Result<(), gst
     Ok(())
 }
 
-/// Keyframe interval, in frames, targeting roughly two seconds of *wall clock*.
+/// Periodic safety keyframe interval in frames (~10 seconds at nominal fps).
 ///
-/// Both encoders count this in frames, but the real frame rate depends entirely
-/// on how much of the screen is changing: measured at ~11 fps on a still desktop
-/// versus the nominal 60. Sizing against the nominal rate would mean a keyframe
-/// only every ten seconds while idle, which is exactly when a tablet is most
-/// likely to attach and need one.
+/// Initial tablet attachment and any dropped reference frame explicitly trigger
+/// an immediate IDR via `request_keyframe()`. Forcing an IDR every 24 frames
+/// (400 ms at 60 fps) starved P-frames and caused periodic USB transfer spikes.
 fn keyframe_interval_frames(nominal_framerate: u32) -> u32 {
-    /// Rate to assume when the screen is mostly static, measured on real hardware.
-    const IDLE_FPS: u32 = 12;
-    const TARGET_SECONDS: u32 = 2;
-    nominal_framerate
-        .min(IDLE_FPS)
-        .saturating_mul(TARGET_SECONDS)
-        .max(2)
+    const TARGET_SECONDS: u32 = 10;
+    nominal_framerate.saturating_mul(TARGET_SECONDS).max(24)
 }
 
 #[cfg(test)]
@@ -254,15 +311,19 @@ mod tests {
         // adaptive controller needs no special case for them.
         assert_eq!(Encoder::VaH264Lp.bitrate_property_value(15_000), 15_000);
         assert_eq!(Encoder::VaH264.bitrate_property_value(15_000), 15_000);
+        assert_eq!(Encoder::VaH265Lp.bitrate_property_value(15_000), 15_000);
     }
 
     #[test]
     fn hardware_backends_are_gpu() {
         assert!(Encoder::VaH264Lp.is_gpu());
         assert!(Encoder::VaH264.is_gpu());
+        assert!(Encoder::VaH265Lp.is_gpu());
+        assert!(Encoder::VaH265.is_gpu());
         assert!(!Encoder::X264.is_gpu());
         assert!(!Encoder::OpenH264.is_gpu());
         assert!(Encoder::NvH264.is_gpu());
+        assert!(Encoder::NvH265.is_gpu());
     }
 
     #[test]
@@ -276,19 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn keyframe_interval_assumes_the_idle_rate_not_the_nominal_one() {
-        // A still desktop measured ~11 fps against a nominal 60. Using 60 would
-        // put keyframes 10s apart, so this must not scale with the nominal rate.
-        assert_eq!(keyframe_interval_frames(60), 24);
-        assert_eq!(keyframe_interval_frames(30), 24);
-        // Below the idle assumption, the real rate is the limit.
-        assert_eq!(keyframe_interval_frames(10), 20);
+    fn keyframe_interval_uses_long_gop_since_attach_and_drops_force_idr() {
+        assert_eq!(keyframe_interval_frames(60), 600);
+        assert_eq!(keyframe_interval_frames(30), 300);
+        assert_eq!(keyframe_interval_frames(2), 24);
     }
 
     #[test]
     fn keyframe_interval_is_never_degenerate() {
         for fps in [0, 1, 2, 5, 60, 240] {
-            assert!(keyframe_interval_frames(fps) >= 2, "fps {fps}");
+            assert!(keyframe_interval_frames(fps) >= 24, "fps {fps}");
         }
     }
 

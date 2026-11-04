@@ -358,8 +358,32 @@ impl Transport {
             adb.forward(&device.serial, ports::CAMERA, sockets::CAMERA)
                 .await?;
 
-            // Restart the activity so we always talk to a fresh instance rather than
-            // one left over from a previous run with stale sockets.
+            // Fast path: if the companion is already in the foreground and listening,
+            // attach directly without tearing down its Activity and SurfaceView.
+            if let Ok(mut control) =
+                connect_once_listening_within(ports::CONTROL, Duration::from_millis(250)).await
+            {
+                if let Ok(hello) = negotiate_adb(&mut control, mode).await {
+                    if let (Ok(video), Ok(camera)) = (
+                        connect_with_retry(ports::VIDEO).await,
+                        connect_with_retry(ports::CAMERA).await,
+                    ) {
+                        info!("attached to already-listening companion without force-stop");
+                        return Ok(Self {
+                            device,
+                            hello: Some(hello),
+                            control: Box::new(control),
+                            video: Box::new(video),
+                            camera: Box::new(camera),
+                            adb,
+                            simulated: false,
+                            accessory: None,
+                        });
+                    }
+                }
+            }
+
+            // Cold start or stale sockets: restart the activity so we talk to a fresh instance.
             adb.force_stop(&device.serial, PACKAGE).await;
             adb.start_activity(&device.serial, ACTIVITY).await?;
 
@@ -526,17 +550,22 @@ async fn verify_installed_version(adb: &Adb, serial: &str, expected: u32) -> Res
 /// is bytes: the app writes `Hello` immediately on accept, so we peek for one byte
 /// and treat silence or EOF as "not up yet".
 async fn connect_once_listening(port: u16) -> Result<TcpStream> {
+    connect_once_listening_within(port, CONNECT_TIMEOUT).await
+}
+
+async fn connect_once_listening_within(port: u16, timeout: Duration) -> Result<TcpStream> {
     /// How long to give the peer to say something before assuming it is a phantom.
     const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 
-    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let probe_wait = PROBE_TIMEOUT.min(timeout);
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut attempts = 0u32;
     loop {
         if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
             let _ = stream.set_nodelay(true);
             let mut probe = [0u8; 1];
             // peek leaves the byte in the socket buffer for the real reader.
-            match tokio::time::timeout(PROBE_TIMEOUT, stream.peek(&mut probe)).await {
+            match tokio::time::timeout(probe_wait, stream.peek(&mut probe)).await {
                 Ok(Ok(n)) if n > 0 => {
                     debug!(port, attempts, "control channel connected and talking");
                     return Ok(stream);

@@ -28,6 +28,32 @@ class RuntimeSafetyTest {
         assertEquals(listOf(7), tracker.cancel().map { it.slot })
     }
 
+    @Test fun stationaryFingerMotionsAreSkippedWhileMovingFingerEmits() {
+        val tracker = TouchTracker()
+        assertNotNull(tracker.record(TouchEvent(Protocol.TouchAction.DOWN, 0, 10.0, 20.0)))
+        assertNotNull(tracker.record(TouchEvent(Protocol.TouchAction.DOWN, 1, 50.0, 60.0)))
+        assertNull(tracker.record(TouchEvent(Protocol.TouchAction.MOTION, 0, 10.0, 20.0)))
+        assertNotNull(tracker.record(TouchEvent(Protocol.TouchAction.MOTION, 1, 51.0, 60.0)))
+    }
+
+    @Test fun stylusTrackerTracksHoverPressureTiltAndCancelsCleanly() {
+        val stylus = StylusTracker()
+        assertFalse(stylus.isActive)
+        val hover = StylusEvent(Protocol.StylusAction.HOVER, Protocol.StylusTool.PEN, 0, 100.0, 200.0, 0.5f, 0.1f, -0.2f)
+        val recordedHover = stylus.record(hover)!!
+        assertEquals(0f, recordedHover.pressure, 0f)
+        assertTrue(stylus.isActive)
+        assertNull(stylus.record(hover))
+        val down = StylusEvent(Protocol.StylusAction.DOWN, Protocol.StylusTool.PEN, Protocol.StylusButtons.PRIMARY, 100.0, 200.0, 0.4f, 0.1f, -0.2f)
+        assertEquals(down, stylus.record(down))
+        val pressureChange = down.copy(action = Protocol.StylusAction.MOTION, pressure = 0.85f)
+        assertEquals(pressureChange, stylus.record(pressureChange))
+        assertNull(stylus.record(pressureChange))
+        val cancelled = stylus.cancel()
+        assertEquals(listOf(Protocol.StylusAction.UP, Protocol.StylusAction.HOVER_EXIT), cancelled.map { it.action })
+        assertFalse(stylus.isActive)
+    }
+
     @Test fun concurrentFailuresHaveExactlyOneOwnerAndCannotRestart() {
         val state = ConnectionState()
         assertTrue(state.start())

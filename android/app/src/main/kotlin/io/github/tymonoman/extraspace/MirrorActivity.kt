@@ -53,6 +53,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     @Volatile private var videoSession: VideoSession? = null
     @Volatile private var connectionEpoch = 0
     private val touches = TouchTracker()
+    private val stylus = StylusTracker()
     private var decoderSurface: Surface? = null
     @Volatile private var connection: ConnectionManager? = null
     private var camera: CameraSource? = null
@@ -89,6 +90,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
                     d.framesDropped.get(),
                     d.lastFramePtsUs.get(),
                     d.renderedAtUs.get(),
+                    d.decodeTimeUs.get(),
                 )
             }
             main.postDelayed(this, STATS_INTERVAL_MS)
@@ -175,7 +177,6 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         }
         val root = videoView.parent as FrameLayout
         root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> layoutVideo() }
-        findViewById<Button>(R.id.streaming_settings).setOnClickListener { showLobby() }
         cursorOverlay = CursorOverlay(videoView, findViewById<ImageView>(R.id.cursor))
         Log.i(TAG, "video output=${if (surfaceView != null) "surface" else "texture"}")
     }
@@ -258,7 +259,6 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         findViewById<Button>(R.id.retry).setOnClickListener { retryConnection() }
         findViewById<Button>(R.id.resume).setOnClickListener {
             lobby.visibility = View.GONE
-            findViewById<Button>(R.id.streaming_settings).visibility = View.VISIBLE
         }
         findViewById<Button>(R.id.display_test).setOnClickListener {
             AlertDialog.Builder(this).setTitle(R.string.display_test)
@@ -272,17 +272,18 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     }
     private fun releaseTouches() {
         touches.cancel().forEach { connection?.sendTouch(it) }
+        stylus.cancel().forEach { connection?.sendStylus(it) }
     }
     private fun showLobby() {
         releaseTouches()
         lobby.visibility = View.VISIBLE
-        findViewById<Button>(R.id.streaming_settings).visibility = View.GONE
         findViewById<Button>(R.id.resume).visibility = if (streamWidth > 0) View.VISIBLE else View.GONE
     }
     private fun resetConnection() {
         connectionEpoch++
         videoSession = null
         touches.cancel()
+        stylus.cancel()
         main.removeCallbacks(reconnect)
         main.removeCallbacks(statsTicker)
         connection?.close(); connection = null
@@ -292,7 +293,9 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         streamWidth = 0; streamHeight = 0
         accessoryConnected = false
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        if (::cursorOverlay.isInitialized) cursorOverlay.hide()
+        if (::cursorOverlay.isInitialized) {
+            cursorOverlay.hide()
+        }
         showLobby()
     }
     private val reconnect = Runnable {
@@ -313,10 +316,13 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         val owner = this
         val callbacks = object : ConnectionManager.Callbacks {
             override fun onVideoConfig(width: Int, height: Int, framerate: Int) {
+                onVideoConfig(width, height, framerate, "h264")
+            }
+            override fun onVideoConfig(width: Int, height: Int, framerate: Int, codec: String) {
                 // Retain the first IDR on the reader while the main thread sets
                 // up and publishes the decoder for this connection.
                 val task = FutureTask<Unit> {
-                    if (connectionEpoch == epoch && !destroyed) owner.onVideoConfig(width, height, framerate)
+                    if (connectionEpoch == epoch && !destroyed) owner.onVideoConfig(width, height, framerate, codec)
                 }
                 main.post(task)
                 try { task.get(5, TimeUnit.SECONDS) }
@@ -332,6 +338,9 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
             }
             override fun onCursor(update: CursorUpdate) {
                 main.post { if (connectionEpoch == epoch && !destroyed) owner.onCursor(update) }
+            }
+            override fun onOpenSettings() {
+                main.post { if (connectionEpoch == epoch && !destroyed) owner.onOpenSettings() }
             }
             override fun onConnected() {
                 main.post { if (connectionEpoch == epoch && !destroyed) owner.onConnected() }
@@ -382,6 +391,10 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     // The per-connection adapter serializes UI callbacks on the main thread and
     // rejects callbacks from obsolete sessions. Video inputs stay on the reader.
     override fun onVideoConfig(width: Int, height: Int, framerate: Int) {
+        onVideoConfig(width, height, framerate, "h264")
+    }
+
+    override fun onVideoConfig(width: Int, height: Int, framerate: Int, codec: String) {
         require(width > 0 && height > 0 && framerate > 0) { "Invalid video configuration" }
         videoSession = null
         streamWidth = width
@@ -396,7 +409,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         val surface = decoderSurface ?: throw ProtocolException("Video surface is unavailable")
         val target = createDecoder(surface)
         decoder = target
-        target.start(width, height, null)
+        target.start(width, height, null, codec)
         videoSession = VideoSession(connectionEpoch, target)
         main.removeCallbacks(statsTicker)
         main.postDelayed(statsTicker, STATS_INTERVAL_MS)
@@ -404,9 +417,8 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
             getString(if (accessoryConnected) R.string.transport_accessory else R.string.transport_adb))
         statusView.visibility = View.VISIBLE
         lobby.visibility = View.GONE
-        findViewById<Button>(R.id.streaming_settings).visibility = View.VISIBLE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        Log.i(TAG, "stream configured ${width}x$height @$framerate")
+        Log.i(TAG, "stream configured ${width}x$height @$framerate codec=$codec")
     }
 
     override fun onVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean) {
@@ -448,6 +460,10 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         cursorOverlay.submit(update)
     }
 
+    override fun onOpenSettings() {
+        showLobby()
+    }
+
     override fun onConnected() {
         showStatus(getString(R.string.connected_waiting))
     }
@@ -463,7 +479,64 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         if (!reason.startsWith("Incompatible connection methods:")) main.postDelayed(reconnect, 1500)
     }
 
-    // --------------------------------------------------------------- touch
+    // --------------------------------------------------- stylus & multitouch
+    private fun isStylusTool(toolType: Int): Boolean =
+        toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
+
+    private fun extractStylusButtons(buttonState: Int): Int {
+        var mask = 0
+        if (buttonState and (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY) != 0) {
+            mask = mask or Protocol.StylusButtons.PRIMARY
+        }
+        if (buttonState and (MotionEvent.BUTTON_STYLUS_SECONDARY or MotionEvent.BUTTON_TERTIARY) != 0) {
+            mask = mask or Protocol.StylusButtons.SECONDARY
+        }
+        return mask
+    }
+
+    private fun extractStylusTilt(tiltRad: Float, orientationRad: Float): Pair<Float, Float> {
+        val normalizedTilt = (tiltRad / (Math.PI.toFloat() / 2f)).coerceIn(0f, 1f)
+        val tx = (kotlin.math.sin(orientationRad.toDouble()) * normalizedTilt).toFloat().coerceIn(-1f, 1f)
+        val ty = (-kotlin.math.cos(orientationRad.toDouble()) * normalizedTilt).toFloat().coerceIn(-1f, 1f)
+        return tx to ty
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (lobby.visibility == View.VISIBLE) return super.onGenericMotionEvent(event)
+        val conn = connection ?: return super.onGenericMotionEvent(event)
+        if (streamWidth == 0 || streamHeight == 0) return super.onGenericMotionEvent(event)
+        if (event.pointerCount == 0 || !isStylusTool(event.getToolType(0))) {
+            return super.onGenericMotionEvent(event)
+        }
+
+        val tool = if (event.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER) {
+            Protocol.StylusTool.ERASER
+        } else {
+            Protocol.StylusTool.PEN
+        }
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> {
+                // Track proximity for palm rejection. The host consumes hover
+                // only to release contact; it never moves the desktop pointer.
+                touches.cancel().forEach { conn.sendTouch(it) }
+                sendTrackedStylus(
+                    conn,
+                    StylusEvent(Protocol.StylusAction.HOVER, tool, 0, 0.0, 0.0, 0f, 0f, 0f),
+                )
+                return true
+            }
+            MotionEvent.ACTION_HOVER_EXIT -> {
+                sendTrackedStylus(
+                    conn,
+                    StylusEvent(Protocol.StylusAction.HOVER_EXIT, tool, 0, 0.0, 0.0, 0f, 0f, 0f),
+                )
+                return true
+            }
+        }
+        return super.onGenericMotionEvent(event)
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
@@ -487,6 +560,52 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         fun mapX(raw: Float) = ((raw - videoView.left - offsetX) / scale).toDouble().coerceIn(0.0, streamWidth - 1.0)
         fun mapY(raw: Float) = ((raw - videoView.top - offsetY) / scale).toDouble().coerceIn(0.0, streamHeight - 1.0)
 
+        val actionIdx = if (event.actionMasked == MotionEvent.ACTION_MOVE) {
+            // MOVE has no changed pointer: actionIndex is always zero, which
+            // may be a palm that entered before the pen.
+            (0 until event.pointerCount).firstOrNull { isStylusTool(event.getToolType(it)) } ?: event.actionIndex
+        } else {
+            event.actionIndex
+        }
+        if (isStylusTool(event.getToolType(actionIdx))) {
+            // Active stylus rejects simultaneous finger/palm touches.
+            touches.cancel().forEach { conn.sendTouch(it) }
+            val tool = if (event.getToolType(actionIdx) == MotionEvent.TOOL_TYPE_ERASER) {
+                Protocol.StylusTool.ERASER
+            } else {
+                Protocol.StylusTool.PEN
+            }
+            val buttons = extractStylusButtons(event.buttonState)
+            fun sample(action: Byte, history: Int? = null) {
+                val x = history?.let { event.getHistoricalX(actionIdx, it) } ?: event.getX(actionIdx)
+                val y = history?.let { event.getHistoricalY(actionIdx, it) } ?: event.getY(actionIdx)
+                val pressure = if (action == Protocol.StylusAction.UP) 0f else {
+                    (history?.let { event.getHistoricalPressure(actionIdx, it) }
+                        ?: event.getPressure(actionIdx)).coerceIn(0.01f, 1f)
+                }
+                fun axis(axis: Int) = history?.let { event.getHistoricalAxisValue(axis, actionIdx, it) }
+                    ?: event.getAxisValue(axis, actionIdx)
+                val (tx, ty) = extractStylusTilt(axis(MotionEvent.AXIS_TILT), axis(MotionEvent.AXIS_ORIENTATION))
+                sendTrackedStylus(conn, StylusEvent(action, tool, buttons, mapX(x), mapY(y), pressure, tx, ty))
+            }
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                    if (event.getX(actionIdx) < videoView.left || event.getX(actionIdx) >= videoView.right ||
+                        event.getY(actionIdx) < videoView.top || event.getY(actionIdx) >= videoView.bottom) return true
+                    sample(Protocol.StylusAction.DOWN)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    for (h in 0 until event.historySize) sample(Protocol.StylusAction.MOTION, h)
+                    sample(Protocol.StylusAction.MOTION)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> sample(Protocol.StylusAction.UP)
+            }
+            return true
+        }
+
+        // Palm rejection: ignore finger touches while the stylus is hovering or drawing.
+        if (stylus.isActive) return true
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val i = event.actionIndex
@@ -501,8 +620,20 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
                 )
             }
             MotionEvent.ACTION_MOVE -> {
-                // A MOVE batches every pointer that changed, so emit one per finger.
+                // Emit batched historical samples and the current sample for each finger that moved.
+                for (h in 0 until event.historySize) {
+                    for (i in 0 until event.pointerCount) {
+                        if (isStylusTool(event.getToolType(i))) continue
+                        sendTrackedTouch(conn,
+                            TouchEvent(
+                                Protocol.TouchAction.MOTION, event.getPointerId(i),
+                                mapX(event.getHistoricalX(i, h)), mapY(event.getHistoricalY(i, h)),
+                            )
+                        )
+                    }
+                }
                 for (i in 0 until event.pointerCount) {
+                    if (isStylusTool(event.getToolType(i))) continue
                     sendTrackedTouch(conn,
                         TouchEvent(
                             Protocol.TouchAction.MOTION, event.getPointerId(i),
@@ -526,6 +657,10 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
 
     private fun sendTrackedTouch(conn: ConnectionManager, event: TouchEvent) {
         touches.record(event)?.let { conn.sendTouch(it) }
+    }
+
+    private fun sendTrackedStylus(conn: ConnectionManager, event: StylusEvent) {
+        stylus.record(event)?.let { conn.sendStylus(it) }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

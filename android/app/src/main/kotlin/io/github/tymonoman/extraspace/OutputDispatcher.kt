@@ -9,7 +9,7 @@ class OutputDispatcher(private val name: String, private val onFailure: (String)
     private val capacity: Int = 64, private val timeoutMs: Long = 2000) : Closeable {
     private data class Job(val key: String?, val write: () -> Unit)
     private val lock = Object()
-    private val jobs = java.util.ArrayDeque<Job>()
+    private val jobs = ArrayList<Job>(capacity)
     private var closed = false
     @Volatile private var startedNs = 0L
     private val watchdog = Executors.newSingleThreadScheduledExecutor { job ->
@@ -20,7 +20,7 @@ class OutputDispatcher(private val name: String, private val onFailure: (String)
             val job = synchronized(lock) {
                 while (!closed && jobs.isEmpty()) lock.wait()
                 if (closed) return@Thread
-                jobs.removeFirst()
+                jobs.removeAt(0)
             }
             startedNs = System.nanoTime()
             try { job.write() }
@@ -38,10 +38,21 @@ class OutputDispatcher(private val name: String, private val onFailure: (String)
     fun submit(key: String? = null, write: () -> Unit) {
         val full = synchronized(lock) {
             if (closed) return
-            // Only adjacent replaceable jobs are merged; gesture boundaries stay ordered.
-            if (key != null && jobs.peekLast()?.key == key) jobs.removeLast()
+            // Coalesce matching keys across interleaved multi-finger motion jobs,
+            // stopping at any non-coalesced barrier (key == null, such as DOWN/UP)
+            // so gesture boundaries stay strictly ordered.
+            if (key != null) {
+                for (i in jobs.indices.reversed()) {
+                    val existing = jobs[i]
+                    if (existing.key == null) break
+                    if (existing.key == key) {
+                        jobs.removeAt(i)
+                        break
+                    }
+                }
+            }
             if (jobs.size >= capacity) true
-            else { jobs.addLast(Job(key, write)); lock.notifyAll(); false }
+            else { jobs.add(Job(key, write)); lock.notifyAll(); false }
         }
         if (full) {
             try { watchdog.execute { fail("Connection output is overloaded. Reconnect your computer.") } }

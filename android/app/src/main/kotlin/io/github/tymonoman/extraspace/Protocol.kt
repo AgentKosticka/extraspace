@@ -45,6 +45,7 @@ object Protocol {
         const val HELLO_REQUEST: Byte = 8
         const val SESSION_END: Byte = 9
         const val CAMERA_STATUS: Byte = 10
+        const val OPEN_SETTINGS: Byte = 11
     }
 
     object CursorFlags {
@@ -54,10 +55,34 @@ object Protocol {
         const val BITMAP: Int = 8
     }
 
+    object TouchKind {
+        const val FINGER: Byte = 0
+        const val STYLUS: Byte = 1
+    }
+
     object TouchAction {
         const val DOWN: Byte = 0
         const val MOTION: Byte = 1
         const val UP: Byte = 2
+    }
+
+    object StylusAction {
+        const val HOVER: Byte = 0
+        const val DOWN: Byte = 1
+        const val MOTION: Byte = 2
+        const val UP: Byte = 3
+        const val HOVER_EXIT: Byte = 4
+    }
+
+    object StylusTool {
+        const val PEN: Byte = 0
+        const val ERASER: Byte = 1
+    }
+
+    object StylusButtons {
+        const val PRIMARY: Int = 1
+        const val SECONDARY: Int = 2
+        const val TERTIARY: Int = 4
     }
 
     /** Abstract socket names; must match `sockets` in `xs-transport`. */
@@ -235,5 +260,33 @@ data class TouchEvent(val action: Byte, val slot: Int, val x: Double, val y: Dou
 
     companion object {
         const val TOUCH_PAYLOAD_LEN = 21
+    }
+}
+
+data class StylusEvent(
+    val action: Byte,
+    val tool: Byte,
+    val buttons: Int,
+    val x: Double,
+    val y: Double,
+    val pressure: Float,
+    val tiltX: Float,
+    val tiltY: Float,
+) {
+    fun encode(): ByteArray =
+        ByteBuffer.allocate(STYLUS_PAYLOAD_LEN).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put(action)
+            put(tool)
+            put((buttons and 0xff).toByte())
+            put(0)
+            putDouble(x)
+            putDouble(y)
+            putFloat(pressure.coerceIn(0f, 1f))
+            putFloat(tiltX.coerceIn(-1f, 1f))
+            putFloat(tiltY.coerceIn(-1f, 1f))
+        }.array()
+
+    companion object {
+        const val STYLUS_PAYLOAD_LEN = 32
     }
 }

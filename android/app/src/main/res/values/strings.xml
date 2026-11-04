@@ -9,7 +9,7 @@
     <string name="resume_display">Return to desktop</string>
     <string name="device_processing">Experimental device frame selection</string>
     <string name="processing_help">Choose the newest decoded frame on this device when several are ready. May reduce lag under load. Desktop capture and encoding still run on the computer.</string>
-    <string name="setup_help">ADB: Enable USB debugging, accept the computer authorization prompt, and turn on Extra Display on the PC. The PC opens and refreshes this app automatically.\n\nUSB accessory: Select USB accessory (AOA) in USB Connection on your computer. Connect a data cable and open Extraspace from Android’s USB prompt. USB debugging is optional.\n\nYour device ID lets the PC remember display position, GNOME scale and Extraspace settings. Reinstalling or clearing app data creates a new ID. Use Android Back to open this screen during streaming.</string>
+    <string name="setup_help">ADB: Enable USB debugging, accept the computer authorization prompt, and turn on Extra Display on the PC. The PC opens and refreshes this app automatically.\n\nUSB accessory: Select USB accessory (AOA) in USB Connection on your computer. Connect a data cable and open Extraspace from Android’s USB prompt. USB debugging is optional.\n\nYour device ID lets the PC remember display position, GNOME scale and Extraspace settings. Reinstalling or clearing app data creates a new ID. Use “Open remote display settings” on the PC or Android Back to open this screen during streaming.</string>
     <string name="accessory_denied">USB accessory access denied. Tap Check Again to allow it.</string>
     <string name="accessory_waiting">Waiting for USB accessory. Select USB accessory on the PC, then connect the cable.</string>
     <string name="usb_permission_waiting">Accept the Android USB access prompt to start displaying.</string>
@@ -21,7 +21,6 @@
     <string-array name="connection_methods">
         <item>Automatic</item><item>ADB (USB debugging)</item><item>USB accessory (AOA)</item>
     </string-array>
-    <string name="settings">Settings</string>
     <string name="camera_denied">Camera access denied. Enable it in Android app permissions, then retry Tablet Camera on your computer.</string>
     <string name="camera_off">Camera off</string>
     <string name="camera_starting">Starting tablet camera…</string>
