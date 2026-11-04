@@ -3,6 +3,8 @@
     android:layout_width="match_parent" android:layout_height="match_parent"
     android:background="@android:color/black">
     <SurfaceView android:id="@+id/surface" android:layout_width="match_parent" android:layout_height="match_parent" />
+    <io.github.tymonoman.extraspace.InkOverlay android:id="@+id/ink" android:layout_width="match_parent"
+        android:layout_height="match_parent" />
     <ImageView android:id="@+id/cursor" android:layout_width="1dp" android:layout_height="1dp"
         android:layout_gravity="top|start" android:clickable="false" android:focusable="false"
         android:importantForAccessibility="no" android:scaleType="fitXY" android:visibility="gone" />
@@ -59,6 +61,11 @@
                     android:textSize="16sp" android:text="@string/device_processing" />
                 <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
                     android:text="@string/processing_help" android:textColor="@color/xs_muted" android:textSize="14sp" />
+                <androidx.appcompat.widget.SwitchCompat android:id="@+id/local_ink" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:minHeight="48dp" android:textColor="@color/xs_text"
+                    android:textSize="16sp" android:text="@string/local_ink" android:layout_marginTop="12dp" />
+                <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:text="@string/local_ink_help" android:textColor="@color/xs_muted" android:textSize="14sp" />
             </LinearLayout>
             <TextView style="@style/Extraspace.SectionTitle" android:text="@string/getting_started" />
             <TextView android:layout_width="match_parent" android:layout_height="wrap_content"

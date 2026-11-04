@@ -76,7 +76,15 @@ pub struct CursorHub {
     /// appsrc rejected the buffer (downstream full).
     push_fail: Arc<AtomicU64>,
     copy_max_us: AtomicU64,
+    /// `(delivered_pts_ns, captured_ns)` for recent frames. The pacer restamps
+    /// PTS at delivery; this keeps the original capture instant for latency.
+    capture_times: Arc<Mutex<std::collections::VecDeque<(u64, u64)>>>,
+    /// `(sum_us, count, max_us)` of capture-to-delivery waits in the pacer.
+    pacer_wait: Arc<[AtomicU64; 3]>,
 }
+
+/// Enough for every frame that can be inside the encoder at once.
+const CAPTURE_TIMES_KEPT: usize = 32;
 
 pub struct Capture {
     loop_ptr: usize,
@@ -111,6 +119,10 @@ impl CursorHub {
             pushed_frames: Arc::new(AtomicU64::new(0)),
             push_fail: Arc::new(AtomicU64::new(0)),
             copy_max_us: AtomicU64::new(0),
+            capture_times: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+                CAPTURE_TIMES_KEPT,
+            ))),
+            pacer_wait: Arc::new(Default::default()),
         })
     }
 
@@ -133,16 +145,45 @@ impl CursorHub {
         let failed = Arc::clone(&self.push_fail);
         let origin = self.origin;
         let duration_ns = 1_000_000_000 / u64::from(self.framerate);
+        let capture_times = Arc::clone(&self.capture_times);
+        let pacer_wait = Arc::clone(&self.pacer_wait);
+        let mut last_captured_ns = None;
+        let mut last_pts_ns: Option<u64> = None;
         *pacer = Some(
             crate::frame_pacer::FramePacer::new_with_settle(
                 self.framerate,
                 std::time::Duration::from_millis(120),
                 move |mut buffer: gst::Buffer| {
+                    let delivered_ns = origin.elapsed().as_nanos() as u64;
+                    let captured_ns = buffer.pts().map(|t| t.nseconds());
+                    // A settle refinement re-pushes the previous image: its age is
+                    // not latency, so it counts as captured on delivery.
+                    let captured_ns = match captured_ns {
+                        Some(c) if Some(c) != last_captured_ns => {
+                            last_captured_ns = Some(c);
+                            let wait_us = delivered_ns.saturating_sub(c) / 1000;
+                            pacer_wait[0].fetch_add(wait_us, Ordering::Relaxed);
+                            pacer_wait[1].fetch_add(1, Ordering::Relaxed);
+                            pacer_wait[2].fetch_max(wait_us, Ordering::Relaxed);
+                            c
+                        }
+                        _ => delivered_ns,
+                    };
+                    // The pacer may deliver up to a quarter period early; keep PTS
+                    // a full period apart so drop-only videorate never discards it.
+                    let pts_ns = last_pts_ns
+                        .map_or(delivered_ns, |last| delivered_ns.max(last + duration_ns));
+                    last_pts_ns = Some(pts_ns);
+                    {
+                        let mut times = capture_times.lock().expect("capture times lock");
+                        if times.len() == CAPTURE_TIMES_KEPT {
+                            times.pop_front();
+                        }
+                        times.push_back((pts_ns, captured_ns));
+                    }
                     {
                         let buf = buffer.make_mut();
-                        buf.set_pts(gst::ClockTime::from_nseconds(
-                            origin.elapsed().as_nanos() as u64
-                        ));
+                        buf.set_pts(gst::ClockTime::from_nseconds(pts_ns));
                         buf.set_duration(gst::ClockTime::from_nseconds(duration_ns));
                     }
                     if let Err(err) = appsrc.push_buffer(buffer) {
@@ -162,11 +203,32 @@ impl CursorHub {
         self.origin.elapsed().as_micros() as u64
     }
 
+    /// Capture instant, on the [`now_us`](Self::now_us) clock, of the frame the
+    /// pacer delivered with this PTS. Falls back to the PTS itself.
+    pub fn captured_us(&self, delivered_pts_ns: u64) -> u64 {
+        self.capture_times
+            .lock()
+            .expect("capture times lock")
+            .iter()
+            .rev()
+            .find(|(delivered, _)| *delivered == delivered_pts_ns)
+            .map_or(delivered_pts_ns, |(_, captured)| *captured)
+            / 1000
+    }
+
     pub fn stop_pacer(&self) {
         self.pacer.lock().expect("frame pacer lock").take();
     }
 
     /// `(mutter_frames, pushed, push_fail, copy_max_us)` since the previous take.
+    /// Mean and max microseconds a captured frame waited in the pacer.
+    pub fn take_pacer_wait(&self) -> (u64, u64) {
+        let sum = self.pacer_wait[0].swap(0, Ordering::Relaxed);
+        let count = self.pacer_wait[1].swap(0, Ordering::Relaxed);
+        let max = self.pacer_wait[2].swap(0, Ordering::Relaxed);
+        (sum.checked_div(count).unwrap_or(0), max)
+    }
+
     pub fn take_capture_counts(&self) -> (u64, u64, u64, u64) {
         (
             self.mutter_frames.swap(0, Ordering::Relaxed),

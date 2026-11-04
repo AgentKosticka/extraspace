@@ -25,8 +25,8 @@ pub use xs_video::{available_encoders, EncoderOption, EncoderSelection, Encoding
 
 pub use adaptive::{AdaptiveController, BitrateBounds, HealthSample};
 pub use session::{
-    clamp_ui_scale, fallback_sizes, logical_size_for, modes_enabled, scaled_size_for,
-    virtual_size_for, DisplayMode, SessionConfig,
+    clamp_ui_scale, effective_framerate, fallback_sizes, logical_size_for, modes_enabled,
+    scaled_size_for, virtual_size_for, DisplayMode, SessionConfig, MATCH_PANEL_RATE,
 };
 
 /// Events per second the tablet reports and the controller consumes.
@@ -97,6 +97,11 @@ pub struct Stats {
     pub encode_ms: f64,
     /// Rolling average tablet decode latency per frame in milliseconds.
     pub decode_ms: f64,
+    /// Capture on the host to decoded on the tablet, for the latest sampled
+    /// frame; excludes the tablet's own display scan-out. Zero until measured.
+    pub glass_ms: f64,
+    /// Mean tablet input sample to host injection; zero without input.
+    pub input_ms: f64,
     /// Frames released by the tablet decoder, distinct from encoded frames.
     pub frames_decoded: u64,
     pub frames_encoded: u64,

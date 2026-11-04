@@ -38,7 +38,7 @@ impl DeviceSettings {
         c.scale = crate::clamp_ui_scale(self.scale);
         c.mode = self.mode;
         c.mirror_source = self.mirror_source.clone();
-        c.framerate = self.framerate.clamp(1, 120);
+        c.framerate = self.framerate.min(120);
         c.encoder = self.encoder.clone();
         c.bounds = BitrateBounds {
             min_kbps: self.bounds.min_kbps.min(self.bounds.max_kbps).max(100),

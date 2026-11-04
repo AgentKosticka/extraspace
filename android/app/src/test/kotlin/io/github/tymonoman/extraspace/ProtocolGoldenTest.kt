@@ -15,7 +15,7 @@ class ProtocolGoldenTest {
             Protocol.ControlKind.HELLO_REQUEST, Protocol.ControlKind.SESSION_END, Protocol.ControlKind.CAMERA_STATUS,
             Protocol.ControlKind.OPEN_SETTINGS)
         assertEquals(listOf<Byte>(0, 1, 2, 3), listOf(Protocol.Channel.CONTROL, Protocol.Channel.TOUCH, Protocol.Channel.VIDEO_DOWN, Protocol.Channel.CAMERA_UP))
-        assertEquals(listOf<Short>(1, 2), listOf(Protocol.Flags.KEYFRAME, Protocol.Flags.CODEC_CONFIG))
+        assertEquals(listOf<Short>(1, 2, 4), listOf(Protocol.Flags.KEYFRAME, Protocol.Flags.CODEC_CONFIG, Protocol.Flags.FRAGMENT))
         assertEquals(listOf<Byte>(0, 1, 2), listOf(Protocol.TouchAction.DOWN, Protocol.TouchAction.MOTION, Protocol.TouchAction.UP))
         assertEquals(
             listOf<Byte>(0, 1, 2, 3, 4),
@@ -29,7 +29,7 @@ class ProtocolGoldenTest {
         )
         assertEquals(listOf<Byte>(0, 1), listOf(Protocol.StylusTool.PEN, Protocol.StylusTool.ERASER))
         assertEquals(listOf(1, 2, 4, 8), listOf(Protocol.CursorFlags.VISIBLE, Protocol.CursorFlags.POSITION, Protocol.CursorFlags.HOTSPOT, Protocol.CursorFlags.BITMAP))
-        assertEquals(1, Protocol.VERSION)
+        assertEquals(2, Protocol.VERSION)
         val vectors = javaClass.getResourceAsStream("/golden-vectors.tsv")!!.bufferedReader().readLines()
         for (line in vectors.filter { !it.startsWith("#") && it.isNotBlank() }) {
             val f = line.split('\t')

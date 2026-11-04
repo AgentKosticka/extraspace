@@ -268,6 +268,18 @@ impl Transport {
         if mode == TransportMode::Adb {
             return Self::connect_adb(apk, apk_version, mode).await;
         }
+        // A tablet still in accessory mode from an earlier session no longer
+        // listens over ADB; resume on USB instead of timing out there.
+        if mode == TransportMode::Accessory
+            && tokio::task::spawn_blocking(aoa::accessory_present)
+                .await
+                .unwrap_or(false)
+        {
+            match Self::connect_accessory(mode, &progress).await {
+                Ok(t) => return Ok(t),
+                Err(e) => warn!(error = %e, "resuming the USB accessory failed; trying ADB"),
+            }
+        }
         // ADB control is also a discovery channel when either selector only
         // permits accessory. This lets us detect incompatible selections before
         // switching the device's USB mode or waiting for video sockets.

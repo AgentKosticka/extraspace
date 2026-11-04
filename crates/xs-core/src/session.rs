@@ -52,6 +52,7 @@ pub struct SessionConfig {
     /// GNOME UI scale on the virtual monitor. Framebuffer size is the panel;
     /// see [`virtual_size_for`].
     pub scale: f64,
+    /// Stream rate in fps; [`MATCH_PANEL_RATE`] follows the tablet's refresh.
     pub framerate: u32,
     pub encoder: crate::EncoderSelection,
     pub bounds: BitrateBounds,
@@ -72,7 +73,7 @@ impl Default for SessionConfig {
         Self {
             mode: DisplayMode::Extend,
             scale: 1.5,
-            framerate: 60,
+            framerate: MATCH_PANEL_RATE,
             encoder: crate::EncoderSelection::default(),
             bounds: BitrateBounds::default(),
             mirror_source: None,
@@ -355,8 +356,7 @@ pub async fn run(
                 }
                 let display_or_encoder_changed = config.mode != settings.mode
                     || config.mirror_source != settings.mirror_source
-                    || (clamp_ui_scale(config.scale) - clamp_ui_scale(settings.scale)).abs()
-                        > 1e-6
+                    || (clamp_ui_scale(config.scale) - clamp_ui_scale(settings.scale)).abs() > 1e-6
                     || config.framerate != settings.framerate
                     || config.encoder != settings.encoder;
                 let camera_changed = config.camera_enabled != settings.camera_enabled
@@ -735,6 +735,13 @@ async fn connect_streams(
     )));
     let _ = events.send(Event::Cameras(hello.cameras.clone()));
     let scale = clamp_ui_scale(config.scale);
+    let framerate = effective_framerate(config.framerate, hello.refresh_rate);
+    info!(
+        framerate,
+        panel_hz = hello.refresh_rate,
+        setting = config.framerate,
+        "stream frame rate"
+    );
     let (asked_width, asked_height) = if modes_enabled() {
         scaled_size_for(hello.width, hello.height, scale)
     } else {
@@ -785,7 +792,7 @@ async fn connect_streams(
             DisplayConfig {
                 width: asked_width,
                 height: asked_height,
-                refresh_rate: config.framerate as f64,
+                refresh_rate: framerate as f64,
                 scale,
                 fallback_sizes: fallback_sizes(hello.width, hello.height),
                 layout_key: (config.mode == DisplayMode::Extend).then(|| device_id.clone()),
@@ -807,11 +814,11 @@ async fn connect_streams(
     let (width, height) = mutter.effective_size();
 
     step("Starting the video pipeline…");
-    let start_kbps = starting_bitrate(width, height, config.framerate, config.bounds);
+    let start_kbps = starting_bitrate(width, height, framerate, config.bounds);
     let pipeline_config = PipelineConfig {
         width,
         height,
-        framerate: config.framerate,
+        framerate,
         bitrate_kbps: start_kbps,
         scale,
     };
@@ -883,7 +890,7 @@ async fn connect_streams(
     let video_config = VideoConfig {
         width,
         height,
-        framerate: config.framerate,
+        framerate,
         bitrate_kbps: start_kbps,
         codec: pipeline.encoder().codec_name().into(),
     };
@@ -1026,6 +1033,13 @@ async fn connect_streams(
 
         tasks.push(tokio::spawn(async move {
             let mut fps = FpsCounter::new();
+            let mut clock = ClockSync::default();
+            // Frame PTS are on the pipeline clock; latency maths uses ours.
+            let pipeline_to_host = monotonic_us() as i64 - pipeline_pace.clock_now_us() as i64;
+            let mut input_received = LatencyWindow::default();
+            let mut input_injected = LatencyWindow::default();
+            let mut glass = LatencyWindow::default();
+            let mut last_glass_pts = 0u64;
             let mut last_dropped = 0u64;
             let mut last_bytes = 0u64;
             let mut first_sample = true;
@@ -1040,7 +1054,13 @@ async fn connect_streams(
                     }
                 };
 
-                last_contact_us.store(monotonic_us(), Ordering::Relaxed);
+                let received_us = monotonic_us();
+                last_contact_us.store(received_us, Ordering::Relaxed);
+                if frame.channel() == Channel::Touch {
+                    if let Some(event_us) = clock.to_host_us(frame.header.pts_us) {
+                        input_received.add(received_us as i64 - event_us);
+                    }
+                }
                 match frame.channel() {
                     Channel::Touch if frame.header.kind == xs_proto::TOUCH_KIND_STYLUS => {
                         let Some(stylus) = xs_proto::StylusEvent::decode(&frame.payload) else {
@@ -1063,6 +1083,9 @@ async fn connect_streams(
                         }
                         if let Err(e) = mutter.stylus_event(stylus).await {
                             warn!(error = %e, "stylus injection failed");
+                        }
+                        if let Some(event_us) = clock.to_host_us(frame.header.pts_us) {
+                            input_injected.add(monotonic_us() as i64 - event_us);
                         }
                     }
 
@@ -1095,6 +1118,9 @@ async fn connect_streams(
                         if let Err(e) = result {
                             warn!(error = %e, "touch injection failed");
                         }
+                        if let Some(event_us) = clock.to_host_us(frame.header.pts_us) {
+                            input_injected.add(monotonic_us() as i64 - event_us);
+                        }
                     }
 
                     Channel::Control if frame.header.kind == ControlKind::CameraStatus as u8 => {
@@ -1115,8 +1141,13 @@ async fn connect_streams(
                     Channel::Control if frame.header.kind == ControlKind::Pong as u8 => {
                         // The tablet echoes our timestamp verbatim, so this is a
                         // true round trip and needs no clock synchronisation.
-                        let elapsed = monotonic_us().saturating_sub(frame.header.pts_us);
+                        let elapsed = received_us.saturating_sub(frame.header.pts_us);
                         rtt_us.store(elapsed, Ordering::Relaxed);
+                        // Companion 23+ appends its own clock at echo time.
+                        if let Some(device) = frame.payload.get(..8) {
+                            let device_us = u64::from_le_bytes(device.try_into().unwrap());
+                            clock.observe(frame.header.pts_us, received_us, device_us);
+                        }
                     }
 
                     Channel::Control if frame.header.kind == ControlKind::Stats as u8 => {
@@ -1132,6 +1163,15 @@ async fn connect_streams(
                         let elapsed = now.duration_since(last_sample_at).as_secs_f64().max(0.001);
                         last_sample_at = now;
 
+                        // Capture on this host -> released for display on the tablet.
+                        if device.last_frame_pts_us != last_glass_pts && device.rendered_at_us > 0 {
+                            last_glass_pts = device.last_frame_pts_us;
+                            if let Some(rendered) = clock.to_host_us(device.rendered_at_us) {
+                                glass.add(
+                                    rendered - (device.last_frame_pts_us as i64 + pipeline_to_host),
+                                );
+                            }
+                        }
                         let total_dropped = dropped + device.frames_dropped;
                         let rtt = Duration::from_micros(rtt_us.load(Ordering::Relaxed));
                         let sample = HealthSample {
@@ -1148,6 +1188,7 @@ async fn connect_streams(
                         let (mutter_frames, pushed, push_fail, copy_max_us) =
                             pipeline_pace.take_capture_counts();
                         let write = write_pace.take();
+                        let (pacer_wait_us, pacer_wait_max_us) = pipeline_pace.take_pacer_wait();
                         debug!(
                             queue = sample.decode_queue_depth,
                             drops = sample.dropped_delta,
@@ -1169,8 +1210,19 @@ async fn connect_streams(
                             keyframe_bytes =
                                 stats_source.last_keyframe_bytes.load(Ordering::Relaxed),
                             device_pts_us = device.last_frame_pts_us,
+                            capture_to_decoded_ms = glass.last_ms(),
+                            pacer_wait_us,
+                            pacer_wait_max_us,
+                            input_received_ms = input_received.mean_ms(),
+                            input_received_max_ms = input_received.max_ms(),
+                            input_injected_ms = input_injected.mean_ms(),
+                            input_events = input_received.count(),
+                            clock_rtt_us = clock.best_rtt_us(),
                             "health sample"
                         );
+                        let input_ms = input_injected.mean_ms();
+                        input_received.clear();
+                        input_injected.clear();
 
                         if let Some(new_kbps) = controller.lock().await.observe(sample, now) {
                             info!(new_kbps, "adapting bitrate");
@@ -1196,6 +1248,8 @@ async fn connect_streams(
                             control_rtt_ms: rtt.as_secs_f64() * 1000.0,
                             encode_ms,
                             decode_ms,
+                            glass_ms: glass.last_ms(),
+                            input_ms,
                             frames_decoded: device.frames_decoded,
                             frames_encoded: encoded,
                             frames_dropped: total_dropped,
@@ -1363,6 +1417,124 @@ fn monotonic_us() -> u64 {
     ORIGIN.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
+/// Frame-rate setting meaning "the tablet panel's refresh rate".
+pub const MATCH_PANEL_RATE: u32 = 0;
+
+/// The rate to stream at. Matching the panel avoids Android dropping a 90 or
+/// 120 Hz display to 60 Hz for us, and every stage then waits on a shorter
+/// interval: capture, encode cadence and the tablet's vsync.
+pub fn effective_framerate(setting: u32, panel_hz: f64) -> u32 {
+    if setting != MATCH_PANEL_RATE {
+        return setting.clamp(1, 120);
+    }
+    let hz = panel_hz.round();
+    if hz.is_finite() && hz >= 30.0 {
+        (hz as u32).min(120)
+    } else {
+        60
+    }
+}
+
+/// Offset between the tablet's monotonic clock and ours, from ping/pong.
+///
+/// The tablet stamps its clock when echoing; assuming the echo happened mid-way
+/// through the round trip, the error is at most half the RTT. The fastest round
+/// trip in a window is the least queued, so it gives the tightest estimate.
+#[derive(Debug)]
+struct ClockSync {
+    /// `device_us - host_us`.
+    offset_us: Option<i64>,
+    best_rtt_us: u64,
+    samples: u32,
+}
+
+impl Default for ClockSync {
+    fn default() -> Self {
+        Self {
+            offset_us: None,
+            best_rtt_us: u64::MAX,
+            samples: 0,
+        }
+    }
+}
+
+impl ClockSync {
+    /// Ten seconds of 2 Hz pings; older estimates age out with drift.
+    const WINDOW: u32 = 20;
+
+    fn observe(&mut self, sent_us: u64, received_us: u64, device_us: u64) {
+        let rtt = received_us.saturating_sub(sent_us);
+        if self.samples >= Self::WINDOW {
+            self.samples = 0;
+            self.best_rtt_us = u64::MAX;
+        }
+        self.samples += 1;
+        if rtt <= self.best_rtt_us {
+            self.best_rtt_us = rtt;
+            self.offset_us = Some(device_us as i64 - (sent_us + rtt / 2) as i64);
+        }
+    }
+
+    fn to_host_us(&self, device_us: u64) -> Option<i64> {
+        self.offset_us.map(|offset| device_us as i64 - offset)
+    }
+
+    fn best_rtt_us(&self) -> u64 {
+        if self.offset_us.is_some() {
+            self.best_rtt_us
+        } else {
+            0
+        }
+    }
+}
+
+/// One-way latencies between health samples. Values outside 0..1 s are clock
+/// noise or stale stamps and are ignored rather than averaged in.
+#[derive(Debug, Default)]
+struct LatencyWindow {
+    count: u64,
+    sum_us: u64,
+    max_us: u64,
+    last_us: u64,
+}
+
+impl LatencyWindow {
+    fn add(&mut self, us: i64) {
+        let Ok(us) = u64::try_from(us) else { return };
+        if us >= 1_000_000 {
+            return;
+        }
+        self.count += 1;
+        self.sum_us += us;
+        self.max_us = self.max_us.max(us);
+        self.last_us = us;
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn mean_ms(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_us as f64 / self.count as f64 / 1000.0
+        }
+    }
+
+    fn max_ms(&self) -> f64 {
+        self.max_us as f64 / 1000.0
+    }
+
+    fn last_ms(&self) -> f64 {
+        self.last_us as f64 / 1000.0
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// A sensible opening bitrate, so the first second does not look terrible while
 /// the controller finds its level.
 ///
@@ -1381,6 +1553,47 @@ fn starting_bitrate(width: u32, height: u32, framerate: u32, bounds: BitrateBoun
 
 #[cfg(test)]
 mod tests {
+    use super::{ClockSync, LatencyWindow};
+
+    #[test]
+    fn match_panel_rate_follows_the_tablet_within_bounds() {
+        use super::{effective_framerate, MATCH_PANEL_RATE};
+        assert_eq!(effective_framerate(MATCH_PANEL_RATE, 90.0), 90);
+        assert_eq!(effective_framerate(MATCH_PANEL_RATE, 59.94), 60);
+        assert_eq!(effective_framerate(MATCH_PANEL_RATE, 144.0), 120);
+        // Unknown or implausible panel rates fall back to 60.
+        assert_eq!(effective_framerate(MATCH_PANEL_RATE, 0.0), 60);
+        assert_eq!(effective_framerate(MATCH_PANEL_RATE, f64::NAN), 60);
+        // An explicit choice wins.
+        assert_eq!(effective_framerate(30, 90.0), 30);
+    }
+
+    #[test]
+    fn clock_sync_keeps_the_least_queued_round_trip() {
+        let mut clock = ClockSync::default();
+        assert_eq!(clock.to_host_us(5_000), None);
+        // Device clock runs 1_000_000 us ahead; the echo is mid-way.
+        clock.observe(100, 110, 1_000_105);
+        assert_eq!(clock.to_host_us(1_000_200), Some(200));
+        // A slower, skewed round trip must not replace the tighter estimate.
+        clock.observe(200, 260, 1_000_250);
+        assert_eq!(clock.to_host_us(1_000_200), Some(200));
+        assert_eq!(clock.best_rtt_us(), 10);
+    }
+
+    #[test]
+    fn latency_window_ignores_clock_noise() {
+        let mut window = LatencyWindow::default();
+        window.add(-5);
+        window.add(2_000_000);
+        window.add(4_000);
+        window.add(6_000);
+        assert_eq!(window.count(), 2);
+        assert_eq!(window.mean_ms(), 5.0);
+        assert_eq!(window.max_ms(), 6.0);
+        assert_eq!(window.last_ms(), 6.0);
+    }
+
     use super::*;
 
     #[tokio::test]

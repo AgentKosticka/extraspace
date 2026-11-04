@@ -10,6 +10,8 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.CountDownLatch
 import kotlin.concurrent.thread
@@ -177,10 +179,14 @@ class ConnectionManager(
             Protocol.ControlKind.OPEN_SETTINGS -> callbacks.onOpenSettings()
             Protocol.ControlKind.PING -> {
                 // Echo the timestamp back untouched so the host can measure
-                // a true round trip without us needing a synced clock.
+                // a true round trip without us needing a synced clock. The
+                // payload adds our monotonic clock at echo time, which lets the
+                // host estimate the clock offset for one-way latency figures.
+                val deviceUs = System.nanoTime() / 1000
                 writeOutput { writer.write(
                     Protocol.Channel.CONTROL, Protocol.ControlKind.PONG,
-                    0, header.ptsUs, ByteArray(0),
+                    0, header.ptsUs,
+                    ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(deviceUs).array(),
                 ) }
             }
             else -> Log.w(TAG, "unhandled control kind ${header.kind}")
@@ -196,15 +202,14 @@ class ConnectionManager(
             cameraWriter = writer
             // AOA is host-requested, including reconnects with the cable attached.
             // ADB announces itself when its control socket connects.
-            var buffer = ByteArray(512 * 1024)
+            val video = VideoAssembler()
             while (running.get()) {
                 val header = reader.readHeader()
                 when (header.channel) {
                     Protocol.Channel.CONTROL -> handleControl(header, reader.readPayload(header), writer)
                     Protocol.Channel.VIDEO_DOWN -> {
-                        if (header.length > buffer.size) buffer = ByteArray(header.length)
-                        reader.readPayload(header, buffer)
-                        deliverVideoFrame(buffer, header.length, header.ptsUs,
+                        val length = video.read(reader, header)
+                        if (length >= 0) deliverVideoFrame(video.buffer, length, header.ptsUs,
                             header.flags.toInt() and Protocol.Flags.CODEC_CONFIG.toInt() != 0)
                     }
                     else -> throw ProtocolException("unexpected accessory channel ${header.channel}")
@@ -249,15 +254,19 @@ class ConnectionManager(
         Log.i(TAG, "sent hello: ${DeviceInfo.width}x${DeviceInfo.height} @${DeviceInfo.refreshRate}")
     }
 
-    /** Sends a touch event. Cheap enough to call straight from the input thread. */
-    fun sendTouch(event: TouchEvent) {
+    /**
+     * Sends a touch event. Cheap enough to call straight from the input thread.
+     * [eventUs] is when the panel sampled it, on the device monotonic clock; the
+     * host converts it with the pong clock offset to measure input latency.
+     */
+    fun sendTouch(event: TouchEvent, eventUs: Long = System.nanoTime() / 1000) {
         val writer = controlWriter ?: return
         val key = if (event.action == Protocol.TouchAction.MOTION) "motion:${event.slot}" else null
         writeOutput(key) {
             try {
                 writer.write(
                     Protocol.Channel.TOUCH, Protocol.TouchKind.FINGER, 0,
-                    System.nanoTime() / 1000, event.encode(),
+                    eventUs, event.encode(),
                 )
             } catch (e: Exception) {
                 fail(e.message ?: "could not send touch")
@@ -266,7 +275,7 @@ class ConnectionManager(
     }
 
     /** Sends a stylus hover/tip/pressure/tilt/button event. */
-    fun sendStylus(event: StylusEvent) {
+    fun sendStylus(event: StylusEvent, eventUs: Long = System.nanoTime() / 1000) {
         val writer = controlWriter ?: return
         val key = if (event.action == Protocol.StylusAction.HOVER || event.action == Protocol.StylusAction.MOTION) {
             "stylus:${event.action}:${event.tool}:${event.buttons}"
@@ -277,7 +286,7 @@ class ConnectionManager(
             try {
                 writer.write(
                     Protocol.Channel.TOUCH, Protocol.TouchKind.STYLUS, 0,
-                    System.nanoTime() / 1000, event.encode(),
+                    eventUs, event.encode(),
                 )
             } catch (e: Exception) {
                 fail(e.message ?: "could not send stylus")

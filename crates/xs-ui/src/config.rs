@@ -41,7 +41,7 @@ impl Default for Config {
             transport: xs_core::TransportMode::default(),
             mode: "extend".into(),
             mirror_source: None,
-            framerate: 60,
+            framerate: xs_core::MATCH_PANEL_RATE,
             encoder: EncoderSelection::default(),
             min_bitrate_kbps: BitrateBounds::default().min_kbps,
             max_bitrate_kbps: BitrateBounds::default().max_kbps,
@@ -207,7 +207,7 @@ mod tests {
         // serde(default) means an old config missing new fields still loads.
         let back: Config = serde_json::from_str(r#"{"scale": 2.0}"#).unwrap();
         assert_eq!(back.scale, 2.0);
-        assert_eq!(back.framerate, 60);
+        assert_eq!(back.framerate, xs_core::MATCH_PANEL_RATE);
         assert!(!back.keep_running_in_tray);
         assert_eq!(back.encoder, EncoderSelection::default());
     }

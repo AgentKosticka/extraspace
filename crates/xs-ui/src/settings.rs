@@ -107,10 +107,10 @@ pub fn present(
         .subtitle("On stock GNOME, larger values reduce stream resolution. Use Displays for desktop text size.")
         .model(&gtk::StringList::new(&refs)).build();
     scale.set_selected(scale_index(c.scale));
-    let fps = adw::SpinRow::with_range(1.0, 120.0, 1.0);
+    let fps = adw::SpinRow::with_range(0.0, 120.0, 1.0);
     fps.set_title("Frame rate (fps)");
-    fps.set_subtitle("Try 30 for lower power use; 60 for smoother motion");
-    fps.set_value(c.framerate.clamp(1, 120) as f64);
+    fps.set_subtitle("0 matches the tablet's refresh rate for the lowest latency; 30 saves power");
+    fps.set_value(c.framerate.min(120) as f64);
     let min = adw::SpinRow::with_range(0.1, 100.0, 0.5);
     min.set_title("Minimum quality bitrate (Mbps)");
     min.set_digits(1);

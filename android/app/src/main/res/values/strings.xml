@@ -8,6 +8,8 @@
     <string name="display_test">Display &amp; Touch Check</string>
     <string name="resume_display">Return to desktop</string>
     <string name="device_processing">Experimental device frame selection</string>
+    <string name="local_ink">Instant pen ink</string>
+    <string name="local_ink_help">Draw a brief trail under the pen on this tablet while the computer\'s picture catches up. It fades within a fraction of a second.</string>
     <string name="processing_help">Choose the newest decoded frame on this device when several are ready. May reduce lag under load. Desktop capture and encoding still run on the computer.</string>
     <string name="setup_help">ADB: Enable USB debugging, accept the computer authorization prompt, and turn on Extra Display on the PC. The PC opens and refreshes this app automatically.\n\nUSB accessory: Select USB accessory (AOA) in USB Connection on your computer. Connect a data cable and open Extraspace from Android’s USB prompt. USB debugging is optional.\n\nYour device ID lets the PC remember display position, GNOME scale and Extraspace settings. Reinstalling or clearing app data creates a new ID. Use “Open remote display settings” on the PC or Android Back to open this screen during streaming.</string>
     <string name="accessory_denied">USB accessory access denied. Tap Check Again to allow it.</string>

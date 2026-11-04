@@ -213,6 +213,7 @@ impl Default for VideoConfig {
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
     pub data: Bytes,
+    /// When the image was captured, on the [`VideoPipeline::clock_now_us`] clock.
     pub pts_us: u64,
     pub keyframe: bool,
 }
@@ -442,27 +443,32 @@ impl VideoPipeline {
                                 return Ok(gst::FlowSuccess::Ok);
                             }
                             let pts_us = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
+                            // Encoders shift their output segment (by 1000 h for
+                            // vah264lpenc); running time recovers the input PTS.
+                            let running = sample
+                                .segment()
+                                .and_then(|s| s.downcast_ref::<gst::ClockTime>())
+                                .zip(buffer.pts())
+                                .and_then(|(segment, pts)| segment.to_running_time(pts))
+                                .or(buffer.pts());
+                            let captured_us =
+                                running.map_or(0, |t| sink_hub.captured_us(t.nseconds()));
                             let started_us = encode_in_us.load(Ordering::Relaxed);
                             if started_us > 0 {
-                                let encode_us = sink_hub
-                                    .now_us()
-                                    .saturating_sub(started_us)
-                                    .min(1_000_000);
-                                let prev_encode =
-                                    sink_stats.encode_time_us.load(Ordering::Relaxed);
+                                let encode_us =
+                                    sink_hub.now_us().saturating_sub(started_us).min(1_000_000);
+                                let prev_encode = sink_stats.encode_time_us.load(Ordering::Relaxed);
                                 let smoothed = if prev_encode == 0 {
                                     encode_us
                                 } else {
                                     (prev_encode * 3 + encode_us) / 4
                                 };
-                                sink_stats
-                                    .encode_time_us
-                                    .store(smoothed, Ordering::Relaxed);
+                                sink_stats.encode_time_us.store(smoothed, Ordering::Relaxed);
                             }
                             let au_bytes = map.len();
                             let frame = EncodedFrame {
                                 data: Bytes::copy_from_slice(map.as_slice()),
-                                pts_us,
+                                pts_us: captured_us,
                                 keyframe,
                             };
                             sink_stats
@@ -613,6 +619,11 @@ impl VideoPipeline {
         self.hub.take_capture_counts()
     }
 
+    /// Mean and max microseconds frames waited in the pacer since the last call.
+    pub fn take_pacer_wait(&self) -> (u64, u64) {
+        self.hub.take_pacer_wait()
+    }
+
     pub fn start(&self) -> Result<()> {
         *self.failure.lock().expect("pipeline failure lock") = None;
         if let Some(bus) = self.pipeline.bus() {
@@ -669,7 +680,10 @@ impl VideoPipeline {
 
     /// Adjusts bitrate on the running pipeline; the adaptive controller's lever.
     pub fn set_bitrate(&self, kbps: u32) {
-        if let Err(e) = self.encoder.set_bitrate(&self.encoder_element, kbps) {
+        if let Err(e) = self
+            .encoder
+            .set_bitrate(&self.encoder_element, kbps, self.config.framerate)
+        {
             warn!(error = %e, kbps, "encoder rejected bitrate change");
             *self.failure.lock().expect("pipeline failure lock") = Some(e.to_string());
         }
@@ -685,6 +699,11 @@ impl VideoPipeline {
         if !self.encoder_element.send_event(event) {
             debug!("encoder did not accept the force-keyframe request");
         }
+    }
+
+    /// The clock behind [`EncodedFrame::pts_us`], for converting to other clocks.
+    pub fn clock_now_us(&self) -> u64 {
+        self.hub.now_us()
     }
 
     pub fn stats(&self) -> &Arc<VideoStats> {

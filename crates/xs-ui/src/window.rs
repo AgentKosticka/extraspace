@@ -824,7 +824,15 @@ fn apply_stats(widgets: &Rc<Widgets>, stats: &Stats) {
         .set_subtitle(&format!("{:.0} fps", stats.fps));
     // Bound to a local: a `format!` temporary inside the call would not outlive it.
     let latency = if stats.control_rtt_ms > 0.0 {
-        if stats.encode_ms > 0.0 || stats.decode_ms > 0.0 {
+        if stats.glass_ms > 0.0 {
+            // One-way figures need the companion's pong clock (version 23+).
+            let mut text = format!("screen {:.1} ms", stats.glass_ms);
+            if stats.input_ms > 0.0 {
+                text.push_str(&format!(" · touch {:.1} ms", stats.input_ms));
+            }
+            text.push_str(&format!(" · round trip {:.1} ms", stats.control_rtt_ms));
+            text
+        } else if stats.encode_ms > 0.0 || stats.decode_ms > 0.0 {
             format!(
                 "{:.1} ms (encode {:.1} ms · decode {:.1} ms)",
                 stats.control_rtt_ms, stats.encode_ms, stats.decode_ms

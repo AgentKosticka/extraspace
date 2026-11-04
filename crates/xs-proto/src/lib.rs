@@ -107,6 +107,9 @@ pub mod flags {
     pub const KEYFRAME: u16 = 1 << 0;
     /// Payload is codec configuration (SPS/PPS), not a displayable frame.
     pub const CODEC_CONFIG: u16 = 1 << 1;
+    /// More of this video frame follows in the next frame on the channel.
+    /// Only the USB accessory bridge splits frames, so control can interleave.
+    pub const FRAGMENT: u16 = 1 << 2;
 }
 
 /// Message kinds on [`Channel::Control`].
@@ -330,7 +333,7 @@ pub struct Hello {
     pub cameras: Vec<CameraInfo>,
 }
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraInfo {
@@ -868,7 +871,7 @@ mod golden_tests {
 
     #[test]
     fn shared_wire_vectors() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
         assert_eq!(
             [
                 Channel::Control as u8,
@@ -896,10 +899,7 @@ mod golden_tests {
             ],
             [0, 1, 2, 3, 4]
         );
-        assert_eq!(
-            [StylusTool::Pen as u8, StylusTool::Eraser as u8],
-            [0, 1]
-        );
+        assert_eq!([StylusTool::Pen as u8, StylusTool::Eraser as u8], [0, 1]);
         assert_eq!(
             [
                 ControlKind::Hello as u8,
@@ -917,7 +917,10 @@ mod golden_tests {
             ],
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
-        assert_eq!([flags::KEYFRAME, flags::CODEC_CONFIG], [1, 2]);
+        assert_eq!(
+            [flags::KEYFRAME, flags::CODEC_CONFIG, flags::FRAGMENT],
+            [1, 2, 4]
+        );
         assert_eq!(
             [
                 cursor_flags::VISIBLE,

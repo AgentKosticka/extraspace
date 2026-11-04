@@ -189,6 +189,9 @@ impl Encoder {
         let bitrate = self.bitrate_property_value(kbps);
         set_checked(&element, "bitrate", &bitrate.to_string())?;
         let gop = keyframe_interval_frames(framerate).to_string();
+        let x264_vbv_ms = (1000 * FRAME_CAP_FRAMES / framerate.max(1))
+            .max(1)
+            .to_string();
         let properties: &[(&str, &str)] = match self {
             Self::X264 => &[
                 ("tune", "zerolatency"),
@@ -197,8 +200,12 @@ impl Encoder {
                 ("threads", "2"),
                 ("byte-stream", "true"),
                 ("key-int-max", &gop),
-                // Bound burst size to a short live-display budget.
-                ("vbv-buf-capacity", "100"),
+                // Bound burst size to the frame cap; ms of the bitrate.
+                ("vbv-buf-capacity", &x264_vbv_ms),
+                // Refresh a moving column of intra blocks instead of sending a
+                // whole IDR each GOP: no periodic size spike to cross USB.
+                // The first frame and requested recoveries are still IDR.
+                ("intra-refresh", "true"),
             ],
             Self::OpenH264 => &[
                 ("rate-control", "bitrate"),
@@ -223,11 +230,10 @@ impl Encoder {
         for (name, value) in properties {
             set_checked(&element, name, value)?;
         }
-        // Enable multi-slice encoding when the hardware driver supports it so
-        // encode and packetization can overlap across slices within a frame.
-        if self.is_gpu() {
-            let _ = set_checked(&element, "num-slices", "4");
-        }
+        // No multi-slice encoding: frames are sent whole (h264parse alignment=au),
+        // so slices cannot overlap with transfer. Measured on Intel VA with an
+        // Exynos decoder, four slices gave no latency gain and cost quality.
+        self.apply_frame_cap(&element, kbps, framerate);
         debug!(encoder = factory, kbps, framerate, "encoder built");
         Ok(element)
     }
@@ -236,13 +242,48 @@ impl Encoder {
         self,
         element: &gst::Element,
         kbps: u32,
+        framerate: u32,
     ) -> Result<(), gst::glib::BoolError> {
         set_checked(
             element,
             "bitrate",
             &self.bitrate_property_value(kbps).to_string(),
-        )
+        )?;
+        self.apply_frame_cap(element, kbps, framerate);
+        Ok(())
     }
+
+    /// Caps the rate-control buffer to [`FRAME_CAP_FRAMES`] frames of bitrate.
+    ///
+    /// Left at its default, the buffer lets a keyframe or full-screen change
+    /// grow to many frames' worth, and every byte of it must cross USB before
+    /// the tablet can decode. A small buffer trades a briefly softer picture
+    /// for a bounded transmission time. Best effort: a driver without the
+    /// property keeps its default.
+    fn apply_frame_cap(self, element: &gst::Element, kbps: u32, framerate: u32) {
+        let kbits = frame_cap_kbits(kbps, framerate);
+        let property = match self {
+            // In kbit; the VA range tops out at 1023.
+            Self::VaH264Lp | Self::VaH264 | Self::VaH265Lp | Self::VaH265 => {
+                Some(("cpb-size", kbits.min(1023)))
+            }
+            Self::NvH264 | Self::NvH265 => Some(("vbv-buffer-size", kbits)),
+            // x264 takes milliseconds at build time; OpenH264 has no control.
+            Self::X264 | Self::OpenH264 => None,
+        };
+        if let Some((name, value)) = property {
+            if let Err(e) = set_checked(element, name, &value.to_string()) {
+                debug!(error = %e, property = name, "encoder has no frame-size cap");
+            }
+        }
+    }
+}
+
+/// Rate-control buffer, in frames of the target bitrate.
+const FRAME_CAP_FRAMES: u32 = 2;
+
+fn frame_cap_kbits(kbps: u32, framerate: u32) -> u32 {
+    (kbps.saturating_mul(FRAME_CAP_FRAMES) / framerate.max(1)).max(1)
 }
 
 /// Driver versions can expose different properties/ranges. Turn incompatibility
@@ -315,6 +356,14 @@ mod tests {
     }
 
     #[test]
+    fn frame_cap_is_two_frames_of_bitrate() {
+        assert_eq!(frame_cap_kbits(30_000, 90), 666);
+        assert_eq!(frame_cap_kbits(30_000, 60), 1000);
+        assert_eq!(frame_cap_kbits(1, 120), 1);
+        assert_eq!(frame_cap_kbits(30_000, 0), 60_000);
+    }
+
+    #[test]
     fn hardware_backends_are_gpu() {
         assert!(Encoder::VaH264Lp.is_gpu());
         assert!(Encoder::VaH264.is_gpu());
@@ -369,13 +418,13 @@ mod tests {
                 continue;
             }
             let element = encoder.build(15_000, 60).unwrap();
-            encoder.set_bitrate(&element, 10_000).unwrap();
+            encoder.set_bitrate(&element, 10_000, 60).unwrap();
             assert_eq!(
                 element.property::<u32>("bitrate"),
                 encoder.bitrate_property_value(10_000)
             );
             if encoder == Encoder::X264 {
-                assert!(encoder.set_bitrate(&element, u32::MAX).is_err());
+                assert!(encoder.set_bitrate(&element, u32::MAX, 60).is_err());
             }
         }
     }

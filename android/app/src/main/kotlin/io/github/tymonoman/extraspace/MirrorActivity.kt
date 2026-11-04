@@ -2,6 +2,7 @@ package io.github.tymonoman.extraspace
 
 import android.annotation.SuppressLint
 import android.graphics.SurfaceTexture
+import android.os.Build
 import android.os.Bundle
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
@@ -21,6 +22,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.addCallback
 import androidx.core.content.ContextCompat
 import android.util.Log
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -48,6 +50,8 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     private var ownsDecoderSurface = false
     private lateinit var statusView: TextView
     private lateinit var cursorOverlay: CursorOverlay
+    private val ink by lazy { findViewById<InkOverlay>(R.id.ink) }
+    private var localInk = true
     @Volatile private var decoder: VideoDecoder? = null
     private data class VideoSession(val epoch: Int, val decoder: VideoDecoder)
     @Volatile private var videoSession: VideoSession? = null
@@ -106,6 +110,10 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         goFullscreen()
 
         setContentView(R.layout.activity_mirror)
+        // Android batches touch and stylus motion to one event per vsync by
+        // default, holding samples for up to a frame. Remote input wants each
+        // panel sample as it arrives; the output queue coalesces bursts.
+        window.decorView.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_POINTER)
         statusView = findViewById(R.id.status)
         lobby = findViewById(R.id.lobby)
         // Match the desktop's readable preferences column on wide tablets.
@@ -256,6 +264,15 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
                 decoder?.selectNewestFrame = enabled
             }
         }
+        findViewById<SwitchCompat>(R.id.local_ink).apply {
+            localInk = preferences.getBoolean("local_ink", true)
+            isChecked = localInk
+            setOnCheckedChangeListener { _, enabled ->
+                preferences.edit().putBoolean("local_ink", enabled).apply()
+                localInk = enabled
+                if (!enabled) ink.clear()
+            }
+        }
         findViewById<Button>(R.id.retry).setOnClickListener { retryConnection() }
         findViewById<Button>(R.id.resume).setOnClickListener {
             lobby.visibility = View.GONE
@@ -275,6 +292,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         stylus.cancel().forEach { connection?.sendStylus(it) }
     }
     private fun showLobby() {
+        ink.clear()
         releaseTouches()
         lobby.visibility = View.VISIBLE
         findViewById<Button>(R.id.resume).visibility = if (streamWidth > 0) View.VISIBLE else View.GONE
@@ -480,6 +498,15 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     }
 
     // --------------------------------------------------- stylus & multitouch
+    /** Device-clock time of the sample being sent; travels in the frame header. */
+    private var inputEventUs = 0L
+
+    private fun eventUs(e: MotionEvent): Long =
+        if (Build.VERSION.SDK_INT >= 34) e.eventTimeNanos / 1000 else e.eventTime * 1000
+
+    private fun historicalEventUs(e: MotionEvent, h: Int): Long =
+        if (Build.VERSION.SDK_INT >= 34) e.getHistoricalEventTimeNanos(h) / 1000 else e.getHistoricalEventTime(h) * 1000
+
     private fun isStylusTool(toolType: Int): Boolean =
         toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
 
@@ -508,6 +535,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         if (event.pointerCount == 0 || !isStylusTool(event.getToolType(0))) {
             return super.onGenericMotionEvent(event)
         }
+        inputEventUs = eventUs(event)
 
         val tool = if (event.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER) {
             Protocol.StylusTool.ERASER
@@ -546,6 +574,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
         if (lobby.visibility == View.VISIBLE) return super.onTouchEvent(event)
         val conn = connection ?: return false
         if (streamWidth == 0 || streamHeight == 0) return false
+        inputEventUs = eventUs(event)
 
         // The surface may be letterboxed if the host's monitor aspect ratio does
         // not exactly match the panel, so map through the displayed rectangle
@@ -577,6 +606,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
             }
             val buttons = extractStylusButtons(event.buttonState)
             fun sample(action: Byte, history: Int? = null) {
+                inputEventUs = history?.let { historicalEventUs(event, it) } ?: eventUs(event)
                 val x = history?.let { event.getHistoricalX(actionIdx, it) } ?: event.getX(actionIdx)
                 val y = history?.let { event.getHistoricalY(actionIdx, it) } ?: event.getY(actionIdx)
                 val pressure = if (action == Protocol.StylusAction.UP) 0f else {
@@ -586,6 +616,10 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
                 fun axis(axis: Int) = history?.let { event.getHistoricalAxisValue(axis, actionIdx, it) }
                     ?: event.getAxisValue(axis, actionIdx)
                 val (tx, ty) = extractStylusTilt(axis(MotionEvent.AXIS_TILT), axis(MotionEvent.AXIS_ORIENTATION))
+                if (localInk && tool == Protocol.StylusTool.PEN) {
+                    if (action == Protocol.StylusAction.UP) ink.lift()
+                    else ink.add(x, y, pressure, start = action == Protocol.StylusAction.DOWN, atNs = inputEventUs * 1000)
+                }
                 sendTrackedStylus(conn, StylusEvent(action, tool, buttons, mapX(x), mapY(y), pressure, tx, ty))
             }
             when (event.actionMasked) {
@@ -622,6 +656,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
             MotionEvent.ACTION_MOVE -> {
                 // Emit batched historical samples and the current sample for each finger that moved.
                 for (h in 0 until event.historySize) {
+                    inputEventUs = historicalEventUs(event, h)
                     for (i in 0 until event.pointerCount) {
                         if (isStylusTool(event.getToolType(i))) continue
                         sendTrackedTouch(conn,
@@ -632,6 +667,7 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
                         )
                     }
                 }
+                inputEventUs = eventUs(event)
                 for (i in 0 until event.pointerCount) {
                     if (isStylusTool(event.getToolType(i))) continue
                     sendTrackedTouch(conn,
@@ -656,11 +692,11 @@ class MirrorActivity : AppCompatActivity(), ConnectionManager.Callbacks {
     }
 
     private fun sendTrackedTouch(conn: ConnectionManager, event: TouchEvent) {
-        touches.record(event)?.let { conn.sendTouch(it) }
+        touches.record(event)?.let { conn.sendTouch(it, inputEventUs) }
     }
 
     private fun sendTrackedStylus(conn: ConnectionManager, event: StylusEvent) {
-        stylus.record(event)?.let { conn.sendStylus(it) }
+        stylus.record(event)?.let { conn.sendStylus(it, inputEventUs) }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

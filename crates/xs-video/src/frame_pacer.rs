@@ -79,6 +79,12 @@ impl<T: Clone + Send + 'static> FramePacer<T> {
     /// Like [`Self::new`], plus a single static-settle refinement re-push after
     /// `settle_delay` of silence so the encoder can spend a full frame budget
     /// sharpening static text once motion stops.
+    ///
+    /// Frames may also leave up to a quarter period early. Capture runs at the
+    /// same nominal rate but its own phase; with a hard deadline, a frame that
+    /// lands just before it waits a whole period, and measured waits averaged
+    /// half a frame. The schedule advances by whole periods, so the long-run
+    /// rate is still bounded, and idle time earns at most the slack.
     pub fn new_with_settle(
         fps: u32,
         settle_delay: Duration,
@@ -93,6 +99,7 @@ impl<T: Clone + Send + 'static> FramePacer<T> {
         ));
         let receiver = Arc::clone(&shared);
         let period = Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(fps.max(1))));
+        let slack = period / 4;
         let worker = thread::Builder::new()
             .name("xs-frame-pacer".into())
             .spawn(move || {
@@ -122,9 +129,13 @@ impl<T: Clone + Send + 'static> FramePacer<T> {
                     if state.stopped {
                         break;
                     }
-                    if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                    let now = Instant::now();
+                    if let Some(wait) = next
+                        .checked_duration_since(now)
+                        .filter(|wait| *wait > slack)
+                    {
                         let (waiting, _) = changed
-                            .wait_timeout(state, wait)
+                            .wait_timeout(state, wait - slack)
                             .expect("frame pacer deadline");
                         drop(waiting);
                         continue;
@@ -132,7 +143,7 @@ impl<T: Clone + Send + 'static> FramePacer<T> {
                     let frame = state.pending.take().expect("pending frame");
                     settle_candidate = Some(frame.clone());
                     drop(state);
-                    next = Instant::now() + period;
+                    next = (next + period).max(now + period - slack);
                     deliver(frame);
                 }
             })?;
@@ -189,6 +200,30 @@ mod tests {
             third.duration_since(second) >= Duration::from_nanos(1_000_000_000u64.div_ceil(60))
         );
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(pacer);
+    }
+
+    #[test]
+    fn a_frame_slightly_ahead_of_schedule_is_not_held_for_a_period() {
+        let (tx, rx) = mpsc::channel();
+        let pacer = FramePacer::new_with_settle(50, Duration::from_secs(10), move |frame| {
+            tx.send((frame, Instant::now())).unwrap();
+        })
+        .unwrap();
+        pacer.submit(1u32);
+        let (_, first) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // 20 ms period: arrive 3 ms early, inside the 5 ms slack.
+        thread::sleep(Duration::from_millis(17).saturating_sub(first.elapsed()));
+        let submitted = Instant::now();
+        pacer.submit(2u32);
+        let (frame, delivered) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(frame, 2);
+        assert!(delivered.duration_since(submitted) < Duration::from_millis(2));
+        // Far ahead of schedule is still held back.
+        let submitted = Instant::now();
+        pacer.submit(3u32);
+        let (_, delivered) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(delivered.duration_since(submitted) >= Duration::from_millis(10));
         drop(pacer);
     }
 

@@ -8,6 +8,25 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 class RuntimeSafetyTest {
+    @Test fun accessoryVideoFragmentsReassembleIntoOneFrame() {
+        val out = java.io.ByteArrayOutputStream()
+        val writer = FrameWriter(out)
+        val whole = ByteArray(40_000) { (it % 251).toByte() }
+        val fragment = (Protocol.Flags.KEYFRAME.toInt() or Protocol.Flags.FRAGMENT.toInt()).toShort()
+        writer.write(Protocol.Channel.VIDEO_DOWN, 0, fragment, 7, whole.copyOfRange(0, 16_384))
+        writer.write(Protocol.Channel.VIDEO_DOWN, 0, fragment, 7, whole.copyOfRange(16_384, 32_768))
+        writer.write(Protocol.Channel.VIDEO_DOWN, 0, Protocol.Flags.KEYFRAME, 7, whole.copyOfRange(32_768, 40_000))
+        writer.write(Protocol.Channel.VIDEO_DOWN, 0, 0, 8, byteArrayOf(1, 2, 3))
+        val reader = FrameReader(java.io.ByteArrayInputStream(out.toByteArray()))
+        val assembler = VideoAssembler(initialCapacity = 1024)
+        assertEquals(-1, assembler.read(reader, reader.readHeader()))
+        assertEquals(-1, assembler.read(reader, reader.readHeader()))
+        assertEquals(40_000, assembler.read(reader, reader.readHeader()))
+        assertArrayEquals(whole, assembler.buffer.copyOf(40_000))
+        // The next unsplit frame starts from the beginning again.
+        assertEquals(3, assembler.read(reader, reader.readHeader()))
+        assertArrayEquals(byteArrayOf(1, 2, 3), assembler.buffer.copyOf(3))
+    }
     @Test fun cancelReleasesEveryFingerOnceIncludingMovedPositions() {
         val tracker = TouchTracker()
         for (slot in listOf(2, 7, 13)) tracker.record(TouchEvent(Protocol.TouchAction.DOWN, slot, 1.0, 2.0))

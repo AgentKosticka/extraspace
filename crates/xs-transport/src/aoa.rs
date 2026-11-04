@@ -8,13 +8,16 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
-use xs_proto::{Channel, ControlKind, Header, HEADER_LEN};
+use xs_proto::{flags, Channel, ControlKind, Header, HEADER_LEN};
 
 const USB_PACKET: usize = 16 * 1024;
+/// Video payloads are split into fragments of this size so that control frames
+/// (cursor moves, pings) wait at most one fragment, not a whole keyframe.
+const VIDEO_FRAGMENT: usize = USB_PACKET;
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(1);
 const MANUFACTURER: &str = "Extraspace";
@@ -25,14 +28,103 @@ pub(crate) struct AccessoryHandle {
     sockets: Vec<UnixStream>,
     usb: Arc<DeviceHandle<GlobalContext>>,
     output: u8,
-    writer_lock: Arc<Mutex<()>>,
+    writer_lock: Arc<WriterGate>,
+}
+
+/// Exclusive access to the single bulk OUT endpoint, with control frames
+/// served before video. Waiting is a condition variable, never a spin.
+#[derive(Default)]
+struct WriterGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    busy: bool,
+    control_waiting: usize,
+}
+
+struct GateGuard<'a>(&'a WriterGate);
+
+impl WriterGate {
+    /// Waits for the endpoint. Video also yields to any waiting control frame.
+    /// Wakes periodically so a stopped bridge does not wait forever.
+    fn acquire(&self, control: bool, stopped: &AtomicBool) -> std::io::Result<GateGuard<'_>> {
+        fn poisoned<T>(_: T) -> std::io::Error {
+            std::io::Error::other("USB writer lock poisoned")
+        }
+        let mut state = self.state.lock().map_err(poisoned)?;
+        if control {
+            state.control_waiting += 1;
+        }
+        while state.busy || (!control && state.control_waiting > 0) {
+            if stopped.load(Ordering::Relaxed) {
+                if control {
+                    state.control_waiting -= 1;
+                }
+                return Err(std::io::ErrorKind::ConnectionAborted.into());
+            }
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(100))
+                .map_err(poisoned)?
+                .0;
+        }
+        if control {
+            state.control_waiting -= 1;
+        }
+        state.busy = true;
+        Ok(GateGuard(self))
+    }
+}
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.busy = false;
+        }
+        self.0.changed.notify_all();
+    }
+}
+
+/// Splits one video frame into wire frames of at most [`VIDEO_FRAGMENT`]
+/// payload bytes. All but the last carry [`flags::FRAGMENT`]; the last keeps
+/// the original flags, so the receiver delivers on it.
+fn video_fragments(
+    header: &Header,
+    payload: &[u8],
+) -> Vec<([u8; HEADER_LEN], std::ops::Range<usize>)> {
+    if payload.len() <= VIDEO_FRAGMENT {
+        return vec![(header.encode(), 0..payload.len())];
+    }
+    let mut out = Vec::with_capacity(payload.len().div_ceil(VIDEO_FRAGMENT));
+    let mut start = 0;
+    while start < payload.len() {
+        let end = (start + VIDEO_FRAGMENT).min(payload.len());
+        let last = end == payload.len();
+        let piece = Header {
+            flags: if last {
+                header.flags
+            } else {
+                header.flags | flags::FRAGMENT
+            },
+            len: (end - start) as u32,
+            ..*header
+        };
+        out.push((piece.encode(), start..end));
+        start = end;
+    }
+    out
 }
 impl AccessoryHandle {
     pub(crate) async fn disconnect(self: &Arc<Self>) {
         self.close(); // unblock pending handshake writers before taking the USB lock
         let this = self.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let _guard = this.writer_lock.lock();
+            // The bridge is already stopped; take the endpoint unconditionally.
+            let never = AtomicBool::new(false);
+            let _guard = this.writer_lock.acquire(true, &never);
             let head = Header {
                 channel: Channel::Control,
                 kind: ControlKind::SessionEnd as u8,
@@ -81,6 +173,18 @@ impl Drop for DiscoveryGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
     }
+}
+
+/// Whether a device is already in accessory mode, e.g. left there by a host
+/// process that exited. Its companion then listens on USB, not on ADB.
+pub(crate) fn accessory_present() -> bool {
+    rusb::devices().is_ok_and(|devices| {
+        devices.iter().any(|device| {
+            device
+                .device_descriptor()
+                .is_ok_and(|d| accessory(d.vendor_id(), d.product_id()))
+        })
+    })
 }
 
 fn open_usb(cancelled: &AtomicBool) -> Result<(DeviceHandle<GlobalContext>, u8, u8, String)> {
@@ -275,7 +379,7 @@ fn bridge(
     let read_control = control_bridge.try_clone()?;
     let stopped = Arc::new(AtomicBool::new(false));
     let usb = Arc::new(usb);
-    let lock = Arc::new(Mutex::new(()));
+    let lock = Arc::new(WriterGate::default());
     let session = Arc::new(AccessoryHandle {
         stopped: stopped.clone(),
         sockets: cleanup,
@@ -283,12 +387,10 @@ fn bridge(
         output,
         writer_lock: lock.clone(),
     });
-    let control_waiting = Arc::new( std::sync::atomic::AtomicUsize::new(0));
     for (is_control, mut stream) in [(true, control_bridge), (false, video_bridge)] {
         let usb = usb.clone();
         let stopped = stopped.clone();
         let lock = lock.clone();
-        let control_waiting = control_waiting.clone();
         let fail_sockets = session
             .sockets
             .iter()
@@ -298,50 +400,49 @@ fn bridge(
             let result = (|| -> std::io::Result<()> {
                 while !stopped.load(Ordering::Relaxed) {
                     let (head, payload) = read_frame(&mut stream)?;
-                    let awaiting_permission = Header::decode(&head).is_ok_and(|h| {
-                        h.channel == Channel::Control && h.kind == ControlKind::HelloRequest as u8
-                    });
+                    let header = Header::decode(&head).map_err(std::io::Error::other)?;
+                    let awaiting_permission = header.channel == Channel::Control
+                        && header.kind == ControlKind::HelloRequest as u8;
                     let consent_deadline = Instant::now() + Duration::from_secs(60);
-                    if is_control {
-                        control_waiting.fetch_add(1, Ordering::AcqRel);
+                    let pieces = if is_control {
+                        vec![(head, 0..payload.len())]
                     } else {
-                        while control_waiting.load(Ordering::Acquire) > 0
-                            && !stopped.load(Ordering::Relaxed)
+                        video_fragments(&header, &payload)
+                    };
+                    for (piece_head, range) in pieces {
+                        // Released between fragments, so a control frame waits
+                        // at most one fragment behind video.
+                        let _guard = lock.acquire(is_control, &stopped)?;
+                        // One buffer per piece: a separate 20-byte header write
+                        // would cost its own USB transfer on every frame.
+                        let mut wire = Vec::with_capacity(HEADER_LEN + range.len());
+                        wire.extend_from_slice(&piece_head);
+                        wire.extend_from_slice(&payload[range]);
                         {
-                            std::thread::yield_now();
-                        }
-                    }
-                    let guard = lock.lock();
-                    if is_control {
-                        control_waiting.fetch_sub(1, Ordering::AcqRel);
-                    }
-                    let _guard =
-                        guard.map_err(|_| std::io::Error::other("USB writer lock poisoned"))?;
-                    // Header and payload are one frame; competing channels cannot interleave.
-                    for bytes in [head.as_slice(), payload.as_slice()] {
-                        for chunk in bytes.chunks(USB_PACKET) {
-                            let mut rest = chunk;
-                            while !rest.is_empty() {
-                                if stopped.load(Ordering::Relaxed) {
-                                    return Err(std::io::ErrorKind::ConnectionAborted.into());
-                                }
-                                let n = match usb.write_bulk(output, rest, IO_TIMEOUT) {
-                                    Ok(n) => n,
-                                    // Android does not consume the endpoint until Allow.
-                                    // rusb returns Ok(n) for partial timeout transfers, so
-                                    // this retry never resends bytes already transferred.
-                                    Err(rusb::Error::Timeout)
-                                        if awaiting_permission
-                                            && Instant::now() < consent_deadline =>
-                                    {
-                                        continue
+                            for chunk in wire.chunks(USB_PACKET + HEADER_LEN) {
+                                let mut rest = chunk;
+                                while !rest.is_empty() {
+                                    if stopped.load(Ordering::Relaxed) {
+                                        return Err(std::io::ErrorKind::ConnectionAborted.into());
                                     }
-                                    Err(e) => return Err(std::io::Error::other(e)),
-                                };
-                                if n == 0 {
-                                    return Err(std::io::ErrorKind::WriteZero.into());
+                                    let n = match usb.write_bulk(output, rest, IO_TIMEOUT) {
+                                        Ok(n) => n,
+                                        // Android does not consume the endpoint until Allow.
+                                        // rusb returns Ok(n) for partial timeout transfers, so
+                                        // this retry never resends bytes already transferred.
+                                        Err(rusb::Error::Timeout)
+                                            if awaiting_permission
+                                                && Instant::now() < consent_deadline =>
+                                        {
+                                            continue
+                                        }
+                                        Err(e) => return Err(std::io::Error::other(e)),
+                                    };
+                                    if n == 0 {
+                                        return Err(std::io::ErrorKind::WriteZero.into());
+                                    }
+                                    rest = &rest[n..];
                                 }
-                                rest = &rest[n..];
                             }
                         }
                     }
@@ -457,6 +558,73 @@ impl Read for BulkReader {
 }
 #[cfg(test)]
 mod tests {
+    use super::{video_fragments, WriterGate, VIDEO_FRAGMENT};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use xs_proto::{flags, Channel, Header};
+
+    #[test]
+    fn large_video_frames_split_and_keep_flags_on_the_last_piece() {
+        let header = Header {
+            channel: Channel::VideoDown,
+            kind: 0,
+            flags: flags::KEYFRAME,
+            len: (VIDEO_FRAGMENT * 2 + 5) as u32,
+            pts_us: 42,
+        };
+        let pieces = video_fragments(&header, &vec![0; VIDEO_FRAGMENT * 2 + 5]);
+        let decoded: Vec<_> = pieces
+            .iter()
+            .map(|(h, r)| (Header::decode(h).unwrap(), r.clone()))
+            .collect();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].0.flags, flags::KEYFRAME | flags::FRAGMENT);
+        assert_eq!(decoded[1].0.flags, flags::KEYFRAME | flags::FRAGMENT);
+        assert_eq!(decoded[2].0.flags, flags::KEYFRAME);
+        assert_eq!(decoded[2].1, VIDEO_FRAGMENT * 2..VIDEO_FRAGMENT * 2 + 5);
+        assert!(decoded
+            .iter()
+            .all(|(h, r)| h.len as usize == r.len() && h.pts_us == 42));
+        // A frame that fits is sent unchanged.
+        let small = video_fragments(&Header { len: 5, ..header }, &[0; 5]);
+        assert_eq!(Header::decode(&small[0].0).unwrap().flags, flags::KEYFRAME);
+    }
+
+    #[test]
+    fn waiting_control_goes_before_waiting_video() {
+        let gate = Arc::new(WriterGate::default());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let held = gate.acquire(false, &stopped).unwrap();
+        let (order_tx, order) = mpsc::channel();
+        let spawn = |control: bool, delay: u64| {
+            let (gate, stopped, order_tx) = (gate.clone(), stopped.clone(), order_tx.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(delay));
+                let _guard = gate.acquire(control, &stopped).unwrap();
+                order_tx.send(control).unwrap();
+            })
+        };
+        // Video queues first, then control; control must still win.
+        let video = spawn(false, 0);
+        let control = spawn(true, 50);
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+        assert!(order.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(!order.recv_timeout(Duration::from_secs(1)).unwrap());
+        video.join().unwrap();
+        control.join().unwrap();
+    }
+
+    #[test]
+    fn stopping_releases_a_waiting_writer() {
+        let gate = WriterGate::default();
+        let stopped = AtomicBool::new(false);
+        let _held = gate.acquire(true, &stopped).unwrap();
+        stopped.store(true, Ordering::Relaxed);
+        assert!(gate.acquire(false, &stopped).is_err());
+    }
+
     #[test]
     fn cancelled_discovery_stops_before_probing_or_switching_usb() {
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

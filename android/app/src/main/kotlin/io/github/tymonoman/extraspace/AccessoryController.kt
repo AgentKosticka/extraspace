@@ -12,6 +12,19 @@ import androidx.activity.ComponentActivity
 import androidx.core.content.ContextCompat
 import java.io.Closeable
 
+/**
+ * [UsbAccessory.equals] reads the serial number, which throws once permission
+ * is gone; a detach broadcast arrives exactly then and crashed the app. Fall
+ * back to the identifying strings, which need no permission.
+ */
+internal fun sameAccessory(a: UsbAccessory?, b: UsbAccessory?): Boolean {
+    if (a == null || b == null) return a === b
+    if (a === b) return true
+    return runCatching { a == b }.getOrElse {
+        a.manufacturer == b.manufacturer && a.model == b.model && a.version == b.version
+    }
+}
+
 /** Activity-scoped accessory discovery and Android USB permission. No ADB dependency. */
 class AccessoryController(
     private val activity: ComponentActivity,
@@ -32,7 +45,7 @@ class AccessoryController(
             when (intent.action) {
                 permissionAction -> {
                     val expected = pending ?: return
-                    if (accessory != expected) return
+                    if (!sameAccessory(accessory, expected)) return
                     pending = null
                     // Verify the OS permission and current attachment, never trust broadcast extras.
                     if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
@@ -41,7 +54,7 @@ class AccessoryController(
                 }
                 UsbManager.ACTION_USB_ACCESSORY_ATTACHED -> { denied = false; check() }
                 UsbManager.ACTION_USB_ACCESSORY_DETACHED -> {
-                    if (accessory == connected || accessory == pending) {
+                    if (sameAccessory(accessory, connected) || sameAccessory(accessory, pending)) {
                         connected = null; pending = null
                         detached()
                     }
@@ -74,7 +87,8 @@ class AccessoryController(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
     }
     private fun open(accessory: UsbAccessory) {
-        if (!enabled() || manager.accessoryList?.contains(accessory) != true || !manager.hasPermission(accessory)) return
+        if (!enabled() || manager.accessoryList?.any { sameAccessory(it, accessory) } != true
+            || !manager.hasPermission(accessory)) return
         runCatching { manager.openAccessory(accessory) ?: error("Could not open USB accessory") }
             .onSuccess { fd -> connected = accessory; ready(fd) }
             .onFailure { status(it.message ?: "USB accessory unavailable") }

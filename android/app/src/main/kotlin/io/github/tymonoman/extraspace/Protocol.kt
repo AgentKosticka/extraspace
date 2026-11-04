@@ -19,7 +19,7 @@ object Protocol {
     const val MAGIC: Int = 0x41505358
     const val HEADER_LEN: Int = 20
     const val MAX_PAYLOAD: Int = 16 * 1024 * 1024
-    const val VERSION: Int = 1
+    const val VERSION: Int = 2
 
     object Channel {
         const val CONTROL: Byte = 0
@@ -31,6 +31,8 @@ object Protocol {
     object Flags {
         const val KEYFRAME: Short = 1
         const val CODEC_CONFIG: Short = 2
+        /** More of this video frame follows; only the USB accessory bridge splits frames. */
+        const val FRAGMENT: Short = 4
     }
 
     object ControlKind {
@@ -129,15 +131,40 @@ class FrameReader(input: InputStream) {
         return FrameHeader(channel, kind, flags, length, ptsUs)
     }
 
-    /** Reads a payload into [dest], which must be at least [FrameHeader.length] long. */
-    fun readPayload(header: FrameHeader, dest: ByteArray) {
-        if (header.length > 0) stream.readFully(dest, 0, header.length)
+    /** Reads a payload into [dest] at [offset]; it must have [FrameHeader.length] bytes free there. */
+    fun readPayload(header: FrameHeader, dest: ByteArray, offset: Int = 0) {
+        if (header.length > 0) stream.readFully(dest, offset, header.length)
     }
 
     fun readPayload(header: FrameHeader): ByteArray {
         val buf = ByteArray(header.length)
         readPayload(header, buf)
         return buf
+    }
+}
+
+/**
+ * Rebuilds video frames that the host's USB accessory bridge split with
+ * [Protocol.Flags.FRAGMENT], so control frames could travel between pieces.
+ * Unsplit frames pass straight through. Not thread-safe; one per reader.
+ */
+class VideoAssembler(initialCapacity: Int = 512 * 1024) {
+    var buffer = ByteArray(initialCapacity)
+        private set
+    private var size = 0
+
+    /** Reads one piece; returns the whole frame's length on its last piece, else -1. */
+    fun read(reader: FrameReader, header: FrameHeader): Int {
+        val total = size + header.length
+        if (total > Protocol.MAX_PAYLOAD) throw ProtocolException("video frame of $total bytes is out of range")
+        if (total > buffer.size) buffer = buffer.copyOf(maxOf(total, minOf(buffer.size * 2, Protocol.MAX_PAYLOAD)))
+        reader.readPayload(header, buffer, size)
+        if (header.flags.toInt() and Protocol.Flags.FRAGMENT.toInt() != 0) {
+            size = total
+            return -1
+        }
+        size = 0
+        return total
     }
 }
 
